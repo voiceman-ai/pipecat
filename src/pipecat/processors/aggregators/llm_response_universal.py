@@ -1233,6 +1233,11 @@ class LLMAssistantAggregator(LLMContextAggregator):
                     logger.error(f"Error in aggregation correction callback: {e}")
 
             logger.debug(f"{self} push_aggregation called - self._aggregation = {aggregation}")
+
+        # The correction callback may empty the aggregation entirely (e.g. the
+        # model's whole turn was leaked tool-call syntax) — skip the message
+        # rather than committing an empty assistant turn to the context.
+        if aggregation:
             self._context.add_message({"role": "assistant", "content": aggregation})
 
         # Push context frame
