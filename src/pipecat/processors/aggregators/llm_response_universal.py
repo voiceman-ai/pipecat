@@ -213,11 +213,19 @@ class LLMAssistantAggregatorParams:
             ``add_tool_change_messages`` argument instead. Defaults to False.
         correct_aggregation_callback: Optional callback to correct corrupted
             TTS text before it's added to the conversation context.
+        interrupted_aggregation_callback: Optional callback applied to the
+            aggregation ONLY when the commit is interruption-driven (the user
+            barged in mid-response). Receives the delivered text so far —
+            possibly empty when the interruption landed before any text
+            cleared the output transport — and returns the content to commit
+            (e.g. annotated with the unsaid remainder). Returning "" commits
+            nothing. Runs after ``correct_aggregation_callback``.
     """
 
     enable_auto_context_summarization: bool = False
     auto_context_summarization_config: LLMAutoContextSummarizationConfig | None = None
     add_tool_change_messages: bool = False
+    interrupted_aggregation_callback: Callable[[str], str] | None = None
 
     # ---------------------------------------------------------------------------
     # Deprecated field names — kept for backward compatibility.
@@ -1217,21 +1225,43 @@ class LLMAssistantAggregator(LLMContextAggregator):
         if self._summarizer:
             await self._summarizer.setup(self.task_manager)
 
-    async def push_aggregation(self) -> str:
-        """Push the current assistant aggregation with timestamp."""
-        if not self._aggregation:
+    async def push_aggregation(self, *, interrupted: bool = False) -> str:
+        """Push the current assistant aggregation with timestamp.
+
+        Args:
+            interrupted: True when this commit is interruption-driven. Enables
+                the params' ``interrupted_aggregation_callback``, which may
+                produce content (e.g. an unheard-reply annotation) even when
+                no delivered text was aggregated.
+        """
+        interrupted_callback = (
+            self._params.interrupted_aggregation_callback if interrupted else None
+        )
+        had_aggregation = bool(self._aggregation)
+        if not had_aggregation and not interrupted_callback:
             return ""
 
-        aggregation = self.aggregation_string()
+        aggregation = self.aggregation_string() if had_aggregation else ""
         await self.reset()
 
-        if aggregation:
-            if self._params.correct_aggregation_callback:
-                try:
-                    aggregation = self._params.correct_aggregation_callback(aggregation)
-                except Exception as e:
-                    logger.error(f"Error in aggregation correction callback: {e}")
+        if aggregation and self._params.correct_aggregation_callback:
+            try:
+                aggregation = self._params.correct_aggregation_callback(aggregation)
+            except Exception as e:
+                logger.error(f"Error in aggregation correction callback: {e}")
 
+        if interrupted_callback:
+            try:
+                aggregation = interrupted_callback(aggregation)
+            except Exception as e:
+                logger.error(f"Error in interrupted aggregation callback: {e}")
+
+        if not had_aggregation and not aggregation:
+            # Interruption with no delivered text, and the callback declined
+            # to add anything — nothing to commit or push.
+            return ""
+
+        if aggregation:
             logger.debug(f"{self} push_aggregation called - self._aggregation = {aggregation}")
             self._context.add_message({"role": "assistant", "content": aggregation})
 
@@ -1639,7 +1669,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
         if not self._assistant_turn_start_timestamp:
             return
 
-        aggregation = await self.push_aggregation()
+        aggregation = await self.push_aggregation(interrupted=interrupted)
         if aggregation:
             # Strip turn completion markers from the transcript
             aggregation = self._maybe_strip_turn_completion_markers(aggregation)

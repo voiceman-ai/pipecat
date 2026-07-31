@@ -59,7 +59,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregator,
     LLMUserAggregatorParams,
-    UserTurnMessageAddedMessage,
     UserTurnStoppedMessage,
 )
 from pipecat.processors.frame_processor import FrameDirection
@@ -2001,7 +2000,10 @@ class TestRealtimeServiceModeAggregator(unittest.IsolatedAsyncioTestCase):
         _, pair = self._build_pair(realtime_service_mode=True)
         user, assistant = pair
 
-        user_msg_added: list[UserTurnMessageAddedMessage] = []
+        # NOTE: UserTurnMessageAddedMessage / on_user_turn_message_added do not
+        # exist in this fork's aggregator (upstream-test drift from the delta
+        # auto-merge graft); annotation loosened so the module imports.
+        user_msg_added: list = []
         assistant_msg_stopped: list[AssistantTurnStoppedMessage] = []
 
         @user.event_handler("on_user_turn_message_added")
@@ -2208,6 +2210,96 @@ class TestRealtimeServiceModeAggregator(unittest.IsolatedAsyncioTestCase):
         assistant = LLMAssistantAggregator(context, _realtime_service_mode=True)
         with self.assertRaises(RuntimeError):
             assistant._require_paired_user_aggregator()
+
+
+class TestLLMAssistantAggregatorInterruptedCommit(unittest.IsolatedAsyncioTestCase):
+    """interrupted_aggregation_callback: interruption-driven commits only."""
+
+    def _make(self, callback):
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(
+            context,
+            params=LLMAssistantAggregatorParams(interrupted_aggregation_callback=callback),
+        )
+        return context, aggregator
+
+    def _assistant_contents(self, context):
+        return [
+            m["content"]
+            for m in context.get_messages()
+            if isinstance(m, dict) and m.get("role") == "assistant"
+        ]
+
+    async def test_partial_commit_runs_callback(self):
+        seen = []
+
+        def annotate(partial: str) -> str:
+            seen.append(partial)
+            return f"{partial} [interrupted]"
+
+        context, aggregator = self._make(annotate)
+        # SleepFrame lets the queued data frames process before the system
+        # InterruptionFrame (which jumps the queue) arrives — as in a real
+        # pipeline, where delivered text precedes the barge-in.
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Delivered half"),
+            SleepFrame(),
+            InterruptionFrame(),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+        self.assertEqual(seen, ["Delivered half"])
+        self.assertEqual(self._assistant_contents(context), ["Delivered half [interrupted]"])
+
+    async def test_empty_commit_can_add_annotation(self):
+        context, aggregator = self._make(lambda partial: "[nothing was heard]")
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            SleepFrame(),
+            InterruptionFrame(),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+        self.assertEqual(self._assistant_contents(context), ["[nothing was heard]"])
+
+    async def test_empty_commit_callback_can_decline(self):
+        context, aggregator = self._make(lambda partial: "")
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            SleepFrame(),
+            InterruptionFrame(),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+        self.assertEqual(self._assistant_contents(context), [])
+
+    async def test_clean_end_does_not_run_callback(self):
+        def explode(partial: str) -> str:
+            raise AssertionError("callback must not run on a non-interrupted commit")
+
+        context, aggregator = self._make(explode)
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Full reply"),
+            LLMFullResponseEndFrame(),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+        self.assertEqual(self._assistant_contents(context), ["Full reply"])
+
+    async def test_no_callback_keeps_legacy_interrupted_behavior(self):
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(context)
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Delivered half"),
+            SleepFrame(),
+            InterruptionFrame(),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+        contents = [
+            m["content"]
+            for m in context.get_messages()
+            if isinstance(m, dict) and m.get("role") == "assistant"
+        ]
+        self.assertEqual(contents, ["Delivered half"])
 
 
 if __name__ == "__main__":

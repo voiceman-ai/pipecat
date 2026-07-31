@@ -11,6 +11,7 @@ import struct
 import uuid
 import warnings
 from abc import abstractmethod
+from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -321,6 +322,13 @@ class TTSService(AIService):
 
         self._processing_text: bool = False
         self._tts_contexts: dict[str, TTSContext] = {}
+        # Synthesized-audio accounting per context, consumed by
+        # synthesized_duration_for() (interruption-truth heard estimation).
+        # Contexts carrying exactly one utterance text are finalized into
+        # _recent_synth_durations on TTSStoppedFrame or interruption.
+        self._synth_secs_by_context: dict[str, float] = {}
+        self._synth_texts_by_context: dict[str, list[str]] = {}
+        self._recent_synth_durations: deque[tuple[str, float]] = deque(maxlen=16)
         self._streamed_text: str = ""
         self._sent_non_whitespace_in_context: bool = False
         self._text_aggregation_metrics_started: bool = False
@@ -866,8 +874,20 @@ class TTSService(AIService):
             frame: The frame to push.
             direction: The direction to push the frame.
         """
+        # Synthesized-duration accounting (see synthesized_duration_for).
+        if isinstance(frame, TTSAudioRawFrame) and frame.audio:
+            ctx = frame.context_id or self._turn_context_id
+            if ctx:
+                rate = frame.sample_rate or self.sample_rate
+                channels = frame.num_channels or 1
+                if rate:
+                    self._synth_secs_by_context[ctx] = self._synth_secs_by_context.get(
+                        ctx, 0.0
+                    ) + len(frame.audio) / (2 * rate * channels)
+
         # Clean up context when we see TTSStoppedFrame
         if isinstance(frame, TTSStoppedFrame) and frame.context_id:
+            self._finalize_synth_duration(frame.context_id)
             if frame.context_id in self._tts_contexts:
                 if self._tts_contexts[frame.context_id].push_assistant_aggregation:
                     aggregation_frame = LLMAssistantPushAggregationFrame()
@@ -898,6 +918,41 @@ class TTSService(AIService):
             frame.transport_destination = self._transport_destination
 
         await super().push_frame(frame, direction)
+
+    def _finalize_synth_duration(self, context_id: str) -> None:
+        """Move a finished context's synth accounting into the recent ring.
+
+        Only single-utterance contexts (TTSSpeakFrame lines, one-sentence
+        turns) are text-addressable; multi-sentence turns are dropped — their
+        per-utterance durations are unknowable at this layer.
+        """
+        secs = self._synth_secs_by_context.pop(context_id, None)
+        texts = self._synth_texts_by_context.pop(context_id, None)
+        if secs and texts and len(texts) == 1:
+            self._recent_synth_durations.append((" ".join(texts[0].split()), secs))
+
+    def synthesized_duration_for(self, text: str) -> float | None:
+        """Synthesized audio seconds for an utterance with exactly this text.
+
+        Consulted by the engine at interruption time to convert elapsed
+        playback into a heard-prefix estimate. In-flight contexts are checked
+        first (an interrupted utterance never saw its TTSStoppedFrame); note
+        an in-flight duration is a lower bound when synthesis itself was still
+        streaming. Returns None when the text is unknown or was part of a
+        multi-utterance context.
+        """
+        needle = " ".join((text or "").split())
+        if not needle:
+            return None
+        for ctx_id, texts in self._synth_texts_by_context.items():
+            if len(texts) == 1 and " ".join(texts[0].split()) == needle:
+                secs = self._synth_secs_by_context.get(ctx_id)
+                if secs:
+                    return secs
+        for known, secs in reversed(self._recent_synth_durations):
+            if known == needle:
+                return secs
+        return None
 
     async def _stream_audio_frames_from_iterator(
         self,
@@ -972,6 +1027,11 @@ class TTSService(AIService):
         self._llm_response_started = False
         self._streamed_text = ""
         self._text_aggregation_metrics_started = False
+        # Finalize in-flight synth accounting so heard-prefix estimation can
+        # still resolve the interrupted utterance's duration afterwards.
+        for ctx_id in list(self._synth_texts_by_context):
+            self._finalize_synth_duration(ctx_id)
+        self._synth_secs_by_context.clear()
         self._aggregated_frame_sequencer.clear()  # discard all pending slots on interruption
         self._pending_llm_response_end_frames.clear()
         await self.reset_word_timestamps()
@@ -1147,6 +1207,9 @@ class TTSService(AIService):
             append_to_context=append_tts_text_to_context,
             push_assistant_aggregation=push_assistant_aggregation,
         )
+        # Synthesized-duration accounting: remember the original utterance
+        # text so synthesized_duration_for() can resolve it by text later.
+        self._synth_texts_by_context.setdefault(context_id, []).append(text)
 
         # Apply any final text preparation (e.g., trailing space)
         prepared_text = self._prepare_text_for_tts(transformed_text)
