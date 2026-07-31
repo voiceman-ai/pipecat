@@ -7,13 +7,17 @@
 import asyncio
 import unittest
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
+from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
     DataFrame,
     EndFrame,
     Frame,
+    HeartbeatFrame,
     InterruptionFrame,
     OutputTransportMessageUrgentFrame,
+    StartFrame,
     StopFrame,
     SystemFrame,
     TextFrame,
@@ -24,8 +28,11 @@ from pipecat.processors.filters.identity_filter import IdentityFilter
 from pipecat.processors.frame_processor import (
     FrameDirection,
     FrameProcessor,
+    FrameProcessorSetup,
 )
 from pipecat.tests.utils import SleepFrame, run_test
+from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
+from pipecat.utils.frame_queue import FrameQueue
 
 
 @dataclass
@@ -472,6 +479,176 @@ class TestFrameProcessor(unittest.IsolatedAsyncioTestCase):
             expected_down_frames=expected_down_frames,
         )
         self.assertTrue(code_after_ran, "Code after broadcast_interruption() should execute")
+
+
+class TestHeartbeatSurvivesInterruptions(unittest.IsolatedAsyncioTestCase):
+    """A barge-in must not destroy the pipeline's health probe.
+
+    Regression coverage for the run-60 false-stall signal. Every FrameProcessor
+    keeps its pending non-system frames in a ``FrameQueue`` that is drained of
+    interruptible items on every ``InterruptionFrame``, and heartbeats used to be
+    interruptible. In a workload with continuous barge-in that suppressed
+    heartbeats indefinitely on a healthy pipeline, which is what the stall
+    watchdog and the admission breaker were then armed on.
+    """
+
+    def test_heartbeat_survives_frame_queue_reset(self):
+        queue = FrameQueue()
+        heartbeat = HeartbeatFrame(timestamp=0)
+        queue.put_nowait(TextFrame(text="dropped"))
+        queue.put_nowait(heartbeat)
+        queue.put_nowait(TextFrame(text="also dropped"))
+
+        self.assertTrue(queue.has_uninterruptible)
+        queue.reset()
+
+        self.assertEqual(queue.qsize(), 1)
+        self.assertIs(queue.get_nowait(), heartbeat)
+
+    async def test_queued_heartbeat_survives_an_interruption(self):
+        """A heartbeat waiting behind a slow frame is still delivered."""
+
+        class DelayTestFrameProcessor(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, TextFrame):
+                    # Sleep more than SleepFrame default so the interruption
+                    # lands while this frame is the one being processed and the
+                    # heartbeat is still waiting in the queue behind it.
+                    await asyncio.sleep(0.4)
+                await self.push_frame(frame, direction)
+
+        pipeline = Pipeline([DelayTestFrameProcessor()])
+
+        frames_to_send = [
+            TextFrame(text="slow frame the interruption will discard"),
+            HeartbeatFrame(timestamp=0),
+            SleepFrame(),
+            InterruptionFrame(),
+        ]
+        expected_down_frames = [
+            InterruptionFrame,
+            HeartbeatFrame,
+        ]
+        await run_test(
+            pipeline,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+
+    async def test_in_flight_heartbeat_does_not_block_the_process_task_cancel(self):
+        """Being uninterruptible must not make a heartbeat un-cancellable.
+
+        If the frame being processed when an interruption arrives is
+        uninterruptible, ``_start_interruption`` only drains the queue and
+        leaves the process task alone. A heartbeat must be excluded from that
+        guard: heartbeats are re-issued every period, so losing one costs
+        nothing, whereas leaving a wedged process task alive deadlocks the
+        processor for the rest of the call.
+        """
+
+        class WedgeOnHeartbeatProcessor(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, HeartbeatFrame):
+                    # Never returns: only a task cancel can recover this.
+                    await asyncio.sleep(30)
+                await self.push_frame(frame, direction)
+
+        pipeline = Pipeline([WedgeOnHeartbeatProcessor()])
+
+        frames_to_send = [
+            HeartbeatFrame(timestamp=0),
+            SleepFrame(),
+            InterruptionFrame(),
+            TextFrame(text="after the interruption"),
+        ]
+        expected_down_frames = [
+            InterruptionFrame,
+            TextFrame,
+        ]
+        # The timeout IS the assertion. If the guard regresses the process task
+        # is never cancelled and this pipeline never finishes; this repo has no
+        # global pytest timeout, so without the bound a regression would wedge
+        # CI rather than fail it.
+        await asyncio.wait_for(
+            run_test(
+                pipeline,
+                frames_to_send=frames_to_send,
+                expected_down_frames=expected_down_frames,
+            ),
+            timeout=10,
+        )
+
+
+class TestHeartbeatIgnoresProcessingPause(unittest.IsolatedAsyncioTestCase):
+    """`pause_processing_frames()` must not park the health probe.
+
+    Regression coverage for the run-60 mechanism relocated. Every TTS service
+    constructed with ``pause_frame_processing=True`` (ElevenLabs, Deepgram, Rime,
+    Azure, Fish, Groq, LMNT, Inworld, Neuphonic, Sarvam, ...) pauses on
+    ``LLMFullResponseEndFrame`` and resumes on ``BotStoppedSpeakingFrame`` — i.e.
+    for the entire utterance playout. Routing heartbeats around the output
+    transport's paced audio queue fixes nothing if they then park here for the
+    same duration: the traversal latency would once again be the playout backlog.
+    """
+
+    async def _make_processor(self):
+        processor = IdentityFilter()
+        task_manager = TaskManager()
+        task_manager.setup(TaskManagerParams(loop=asyncio.get_event_loop()))
+        await processor.setup(
+            FrameProcessorSetup(
+                clock=SystemClock(),
+                task_manager=task_manager,
+                pipeline_worker=SimpleNamespace(app_resources=None),  # type: ignore[arg-type]
+            )
+        )
+
+        pushed: list[Frame] = []
+
+        async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+            pushed.append(frame)
+
+        processor.push_frame = capture
+        await processor.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+        pushed.clear()
+        return processor, pushed
+
+    async def test_heartbeat_traverses_while_frame_processing_is_paused(self):
+        processor, pushed = await self._make_processor()
+        try:
+            await processor.pause_processing_frames()
+
+            heartbeat = HeartbeatFrame(timestamp=0)
+            await processor.queue_frame(heartbeat, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.1)
+
+            self.assertIn(heartbeat, pushed)
+        finally:
+            await processor.cleanup()
+
+    async def test_pause_still_blocks_real_work_after_a_heartbeat(self):
+        """The heartbeat exemption must not disarm the pause for other frames."""
+        processor, pushed = await self._make_processor()
+        try:
+            await processor.pause_processing_frames()
+
+            heartbeat = HeartbeatFrame(timestamp=0)
+            blocked = TextFrame(text="must wait for the resume")
+            await processor.queue_frame(heartbeat, FrameDirection.DOWNSTREAM)
+            await processor.queue_frame(blocked, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.1)
+
+            self.assertIn(heartbeat, pushed)
+            self.assertNotIn(blocked, pushed)
+
+            await processor.resume_processing_frames()
+            await asyncio.sleep(0.1)
+
+            self.assertIn(blocked, pushed)
+        finally:
+            await processor.cleanup()
 
 
 if __name__ == "__main__":

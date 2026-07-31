@@ -181,6 +181,30 @@ class PipelineWorker(BaseWorker):
 
     - on_frame_reached_upstream: Called when upstream frames reach the source
     - on_frame_reached_downstream: Called when downstream frames reach the sink
+    - on_heartbeat: Called every time a heartbeat frame completes its traversal of the
+          pipeline, with the traversal latency in seconds. This is the positive health
+          signal and the only reliable "recovered" edge for consumers that act on
+          ``on_heartbeat_timeout``. Keep the handler cheap (it fires once per
+          ``heartbeats_period_secs`` per pipeline).
+
+          Consumer contract, which matters because the whole point of this event is
+          to gate remediation:
+
+              - **A handler MUST check ``latency_secs``.** Treat a heartbeat whose
+                latency exceeds ``heartbeats_monitor_secs`` as "still unhealthy",
+                not as a recovery. A pipeline that unblocks momentarily flushes its
+                accumulated heartbeats; the monitor coalesces that backlog to a
+                single event carrying the freshest measurement, but that measurement
+                can still be far older than the monitor window.
+              - **Traversal latency is not pure scheduling delay.** Heartbeats
+                bypass the output transport's paced audio queue and are not drained
+                by an interruption, so the latency no longer tracks playout backlog
+                or barge-in cadence. They are also exempt from
+                ``pause_processing_frames()``. They do still queue behind a long
+                in-flight frame operation at each processor — most notably a
+                streamed LLM generation — so read the value as "scheduling delay
+                plus the longest in-flight per-processor operation", and size any
+                threshold above a normal generation.
     - on_heartbeat_timeout: Called when a heartbeat frame is not received within the monitor timeout.
           Fires repeatedly every ``heartbeats_monitor_secs`` for as long as the stall persists.
     - on_idle_timeout: Called when pipeline is idle beyond timeout threshold
@@ -201,6 +225,10 @@ class PipelineWorker(BaseWorker):
 
         @worker.event_handler("on_frame_reached_upstream")
         async def on_frame_reached_upstream(worker, frame):
+            ...
+
+        @worker.event_handler("on_heartbeat")
+        async def on_heartbeat(worker, latency_secs):
             ...
 
         @worker.event_handler("on_heartbeat_timeout")
@@ -506,6 +534,7 @@ class PipelineWorker(BaseWorker):
         self._reached_downstream_types: set[type[Frame]] = set()
         self._register_event_handler("on_frame_reached_upstream")
         self._register_event_handler("on_frame_reached_downstream")
+        self._register_event_handler("on_heartbeat")
         self._register_event_handler("on_heartbeat_timeout")
         self._register_event_handler("on_idle_timeout")
         self._register_event_handler("on_pipeline_started")
@@ -1241,23 +1270,58 @@ class PipelineWorker(BaseWorker):
     async def _heartbeat_monitor_handler(self):
         """Monitor heartbeat frames for processing time and timeout detection.
 
-        Logs the time each heartbeat takes to traverse the pipeline. If no
-        heartbeat arrives within ``heartbeats_monitor_secs``, logs a warning
-        and fires ``on_heartbeat_timeout``. The event fires repeatedly every
+        Logs the time each heartbeat takes to traverse the pipeline and fires
+        ``on_heartbeat`` with that traversal latency in seconds. If no heartbeat
+        arrives within ``heartbeats_monitor_secs``, logs a warning and fires
+        ``on_heartbeat_timeout``. The timeout event fires repeatedly every
         ``heartbeats_monitor_secs`` for as long as the stall persists.
+
+        ``on_heartbeat`` is the positive counterpart of ``on_heartbeat_timeout``:
+        consumers that gate remediation (aborting a call, opening an admission
+        breaker) on missed heartbeats need an explicit recovery signal, otherwise
+        they can only infer recovery from a wall clock. Keep handlers cheap — this
+        fires once per ``heartbeats_period_secs`` per pipeline.
+
+        Heartbeats are uninterruptible, so a genuinely blocked pipeline
+        accumulates them (one per period) instead of having them purged. When it
+        drains, the whole backlog arrives at once. Only the newest arrival says
+        anything about *now*, so the backlog is coalesced here and ``on_heartbeat``
+        fires once, with the freshest measurement. Consumers must still treat a
+        latency above ``heartbeats_monitor_secs`` as "not recovered" — see the
+        event documentation on :class:`PipelineWorker`.
         """
         wait_time = self._params.heartbeats_monitor_secs
         while True:
             try:
                 frame = await asyncio.wait_for(self._heartbeat_queue.get(), timeout=wait_time)
-                process_time = (self._clock.get_time() - frame.timestamp) / 1_000_000_000
-                logger.trace(f"{self}: heartbeat frame processed in {process_time} seconds")
                 self._heartbeat_queue.task_done()
             except TimeoutError:
                 logger.warning(
                     f"{self}: heartbeat frame not received for more than {wait_time} seconds"
                 )
                 await self._call_event_handler("on_heartbeat_timeout")
+                continue
+
+            # Coalesce a drained backlog: keep only the newest heartbeat, so the
+            # reported latency describes the pipeline's current state rather than
+            # replaying one stale positive edge per queued frame.
+            coalesced = 0
+            while not self._heartbeat_queue.empty():
+                frame = self._heartbeat_queue.get_nowait()
+                self._heartbeat_queue.task_done()
+                coalesced += 1
+
+            process_time = (self._clock.get_time() - frame.timestamp) / 1_000_000_000
+            logger.trace(f"{self}: heartbeat frame processed in {process_time} seconds")
+            if coalesced:
+                logger.debug(
+                    f"{self}: coalesced {coalesced} backlogged heartbeat(s); "
+                    f"reporting the newest, {process_time:.3f}s traversal"
+                )
+
+            # Dispatched outside the try above on purpose: a failure inside the
+            # heartbeat handler must never be reported as a missing heartbeat.
+            await self._call_event_handler("on_heartbeat", process_time)
 
     async def _idle_monitor_handler(self):
         """Monitor pipeline activity and detect idle conditions.

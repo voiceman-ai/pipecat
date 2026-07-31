@@ -37,6 +37,7 @@ from pipecat.frames.frames import (
     FrameProcessorPauseUrgentFrame,
     FrameProcessorResumeFrame,
     FrameProcessorResumeUrgentFrame,
+    HeartbeatFrame,
     InterruptionFrame,
     StartFrame,
     SystemFrame,
@@ -175,16 +176,21 @@ class FrameProcessorQueue(asyncio.PriorityQueue):
         return item
 
 
-# Timeout in seconds for cancelling the input frame processing task.
-# This prevents hanging if a library swallows asyncio.CancelledError.
+# CAREFUL — these are REPORTING thresholds, not bounds, and the code below is
+# written on that assumption. `TaskManager.cancel_task` cannot abandon a cancel
+# it has started: cancelling an asyncio task and awaiting it always waits for
+# the cancellation to complete (asyncio.wait_for is no exception — it cancels
+# the inner task and then waits for it before raising TimeoutError). Crossing
+# the threshold therefore logs a warning naming the blocking frame and how long
+# the cancel really took; it does NOT orphan the task or return early. A real
+# bound would let a still-running process task push stale frames into a fresh
+# turn, so it needs a generation guard that does not exist yet.
+#
+# The practical consequence, seen in production: a process task that takes 3s to
+# cancel serializes 3s of barge-in propagation, because an interruption cancels
+# it inline from the input task. Raising or lowering these numbers changes only
+# when you hear about it.
 INPUT_TASK_CANCEL_TIMEOUT_SECS = 3
-
-# Timeout in seconds for cancelling the non-system frame processing task.
-# An interruption cancels this task inline from the input task; without a
-# bound, a process task wedged in un-cancellable cleanup (e.g. an HTTP
-# stream aclose() over a dead connection) blocks the input task forever,
-# which freezes the whole pipeline — heartbeats, new turns, even CancelFrame.
-# On timeout the wedged task is orphaned and a fresh process task takes over.
 PROCESS_TASK_CANCEL_TIMEOUT_SECS = 3
 
 
@@ -874,9 +880,19 @@ class FrameProcessor(BaseObject):
     async def _start_interruption(self):
         """Start handling an interruption by cancelling current tasks."""
         try:
+            # HeartbeatFrame is uninterruptible so an interruption cannot drain
+            # in-flight heartbeats out of the process queue (that is what made
+            # the heartbeat monitor a barge-in detector rather than a health
+            # probe). It must NOT, however, protect the process task from being
+            # cancelled: a heartbeat can be the current frame while the task is
+            # parked in `pause_processing_frames()`, and taking the
+            # reset-only branch there leaves the task parked forever. Heartbeats
+            # are cheap and re-issued every period, so losing the one in flight
+            # at the instant of an interruption costs nothing.
+            current = self.__process_current_frame
             current_is_uninterruptible = isinstance(
-                self.__process_current_frame, UninterruptibleFrame
-            )
+                current, UninterruptibleFrame
+            ) and not isinstance(current, HeartbeatFrame)
             if current_is_uninterruptible:
                 # The frame currently being processed is uninterruptible, so we
                 # must not cancel it. Just flush non-uninterruptible frames from
@@ -1064,7 +1080,28 @@ class FrameProcessor(BaseObject):
 
             self.__process_current_frame = frame
 
-            if self.__should_block_frames and self.__process_event:
+            # A heartbeat is a liveness probe, not work: it carries no ordering
+            # semantics, which is the same argument that keeps it out of the
+            # output transport's paced audio queue. `pause_processing_frames()`
+            # is held for an entire utterance playout by every TTS service
+            # constructed with `pause_frame_processing=True` (they pause on
+            # LLMFullResponseEndFrame and resume on BotStoppedSpeakingFrame), so
+            # parking the probe here would make its traversal latency measure
+            # playout backlog again -- the exact defect the heartbeat routing fix
+            # removed, merely relocated from the transport to the TTS processor.
+            # The pause flag is deliberately left armed, so the next non-heartbeat
+            # frame still blocks and the ordering of real work is unchanged.
+            #
+            # Residual, deliberately not addressed here: a heartbeat that lands
+            # behind a non-heartbeat frame which is itself parked still waits for
+            # the pause to lift, and a heartbeat still queues behind a long
+            # in-flight frame operation (e.g. a streamed LLM generation). See the
+            # traversal-latency caveat on `PipelineWorker`'s `on_heartbeat`.
+            if (
+                self.__should_block_frames
+                and self.__process_event
+                and not isinstance(frame, HeartbeatFrame)
+            ):
                 logger.trace(f"{self}: frame processing paused")
                 await self.__process_event.wait()
                 self.__process_event.clear()
