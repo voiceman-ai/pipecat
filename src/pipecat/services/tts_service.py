@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     Frame,
+    HeartbeatFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMAssistantPushAggregationFrame,
@@ -833,7 +834,22 @@ class TTSService(AIService):
             await self._maybe_resume_frame_processing()
             await self.push_frame(frame, direction)
         else:
-            if direction == FrameDirection.DOWNSTREAM and not isinstance(frame, SystemFrame):
+            if (
+                direction == FrameDirection.DOWNSTREAM
+                and not isinstance(frame, SystemFrame)
+                # A HeartbeatFrame is a liveness probe, not content: it carries no
+                # ordering semantics relative to audio, which is the same argument
+                # that keeps it out of the output transport's paced audio queue and
+                # out of `pause_processing_frames()`. Serializing it here would put
+                # it behind `_handle_audio_context`, which does not return until the
+                # whole context has drained, so its traversal latency would measure
+                # utterance progress instead of pipeline health — the run-60 defect
+                # relocated one processor upstream. Heartbeats are also
+                # UninterruptibleFrames, so `_serialization_queue.reset()` no longer
+                # purges a stuck one on barge-in; it would be delivered late,
+                # carrying a stale latency, rather than dropped.
+                and not isinstance(frame, HeartbeatFrame)
+            ):
                 # Route non-system downstream frames through the serialization queue so they
                 # are emitted in the same order they arrive relative to any audio contexts that
                 # are already queued (e.g. a FooFrame sent right after a TTSSpeakFrame must

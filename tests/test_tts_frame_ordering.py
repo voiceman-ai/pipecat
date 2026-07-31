@@ -35,18 +35,22 @@ import asyncio
 import unittest
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
+from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     ControlFrame,
     DataFrame,
     Frame,
+    HeartbeatFrame,
     InterruptionFrame,
     LLMAssistantPushAggregationFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    StartFrame,
     TextFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -55,8 +59,10 @@ from pipecat.frames.frames import (
     TTSTextFrame,
     UninterruptibleFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.tts_service import TTSService
 from pipecat.tests.utils import SleepFrame, run_test
+from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
 from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregated_text
 from pipecat.utils.text.base_text_aggregator import AggregationType
 
@@ -1654,6 +1660,62 @@ async def test_tts_started_carries_append_to_context(service_factory, append_to_
     started = [f for f in frames_received[0] if isinstance(f, TTSStartedFrame)]
     assert len(started) == 1, f"Expected exactly one TTSStartedFrame, got {len(started)}"
     assert started[0].append_to_context is append_to_context
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_bypasses_the_tts_serialization_queue():
+    """A heartbeat must not be routed through the TTS serialization queue.
+
+    ``TTSService`` sends every non-system downstream frame through
+    ``_serialization_queue`` so it cannot overtake queued audio. That is right
+    for content frames and wrong for a ``HeartbeatFrame``: the serializer task
+    blocks in ``_handle_audio_context`` until the whole context drains, so a
+    heartbeat queued behind an open context measures utterance progress rather
+    than pipeline liveness — the same defect the output transport's heartbeat
+    bypass removed, merely relocated one processor upstream. Heartbeats being
+    uninterruptible also means an interruption no longer purges them from that
+    queue, so a stuck one is delivered late carrying a stale latency instead of
+    being dropped.
+
+    Asserted on the routing decision itself rather than end-to-end: the
+    end-to-end shape needs a permanently open audio context, and a pipeline in
+    that state cannot be shut down cleanly, so it would hang the suite on
+    regression instead of failing it.
+    """
+    tts = MockWebSocketPauseTTSServiceNoAudio()
+
+    task_manager = TaskManager()
+    task_manager.setup(TaskManagerParams(loop=asyncio.get_event_loop()))
+    await tts.setup(
+        FrameProcessorSetup(
+            clock=SystemClock(),
+            task_manager=task_manager,
+            pipeline_worker=SimpleNamespace(app_resources=None),  # type: ignore[arg-type]
+        )
+    )
+    try:
+        await tts.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+
+        pushed: list[Frame] = []
+
+        async def _push(frame, direction=FrameDirection.DOWNSTREAM):
+            pushed.append(frame)
+
+        tts.push_frame = _push  # type: ignore[assignment]
+
+        queued_before = tts._serialization_queue.qsize()
+        heartbeat = HeartbeatFrame(timestamp=0)
+        await tts.process_frame(heartbeat, FrameDirection.DOWNSTREAM)
+
+        assert tts._serialization_queue.qsize() == queued_before, (
+            "HeartbeatFrame was put on the TTS serialization queue, where it "
+            "waits for the current audio context to drain."
+        )
+        assert any(f is heartbeat for f in pushed), (
+            f"HeartbeatFrame was not pushed straight downstream: {pushed}"
+        )
+    finally:
+        await tts.cleanup()
 
 
 if __name__ == "__main__":

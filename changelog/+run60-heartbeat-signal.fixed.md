@@ -21,6 +21,16 @@
   processor. The pause still blocks every other frame, so the ordering of real
   work is unchanged.
 
+- Heartbeats also bypass `TTSService`'s downstream serialization queue. That
+  queue exists so a content frame cannot overtake audio already queued for an
+  utterance, and its drain task blocks in `_handle_audio_context` until the whole
+  context is exhausted — so a heartbeat put on it would again report utterance
+  progress rather than pipeline health, which is the same defect one processor
+  further upstream than the pause. It matters more now that heartbeats are
+  uninterruptible: `_serialization_queue.reset()` no longer purges a stuck one on
+  barge-in, so it would be delivered late carrying a stale latency instead of
+  being dropped.
+
 - Added an `on_heartbeat` event on `PipelineWorker`, fired with each heartbeat's
   traversal latency in seconds. It is the positive counterpart of
   `on_heartbeat_timeout`: consumers that act on missed heartbeats previously had
