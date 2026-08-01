@@ -828,6 +828,73 @@ class PipelineWorker(BaseWorker):
             logger.warning(f"{self}: pipeline flush timed out after {timeout}s")
             return False
 
+    def dump_processor_diagnostics(self, *, reason: str | None = None) -> list[dict[str, Any]]:
+        """Log and return a per-processor queue/progress snapshot.
+
+        Walks every processor in the pipeline (including compound processors
+        and the worker's own source/sink) and collects the read-only wedge
+        diagnostics from :class:`~pipecat.processors.frame_processor.FrameProcessor`:
+        input/process queue depths, seconds since the processor last accepted
+        a frame, the in-flight non-system frame (if any), and whether frame
+        processing is paused. The snapshot is emitted as a single WARNING log
+        record (token: ``processor diagnostics dump``) so a wedged pipeline —
+        e.g. a leg that froze before its first turn — is diagnosable from a
+        log dump alone.
+
+        This is purely observational: it never mutates processor state and is
+        not wired into any kill or abort decision.
+
+        Args:
+            reason: Optional free-form tag included in the log line (e.g.
+                ``"stall"``), so dumps can be correlated with whatever
+                triggered them.
+
+        Returns:
+            One dict per processor, in pipeline order, with keys
+            ``processor``, ``depth``, ``input_queue_depth``,
+            ``process_queue_depth``, ``seconds_since_last_progress``,
+            ``processing_frame`` and ``paused``.
+        """
+        entries: list[dict[str, Any]] = []
+
+        def _collect(processor: FrameProcessor, depth: int):
+            entries.append(
+                {
+                    "processor": processor.name,
+                    "depth": depth,
+                    "input_queue_depth": processor.input_queue_depth,
+                    "process_queue_depth": processor.process_queue_depth,
+                    "seconds_since_last_progress": processor.seconds_since_last_progress,
+                    "processing_frame": processor.processing_frame_name,
+                    "paused": processor.is_frame_processing_paused,
+                }
+            )
+            for p in processor.processors:
+                _collect(p, depth + 1)
+
+        _collect(self._pipeline, 0)
+
+        lines = []
+        for e in entries:
+            age = e["seconds_since_last_progress"]
+            age_str = f"{age:.1f}s ago" if age is not None else "never"
+            extras = ""
+            if e["processing_frame"]:
+                extras += f" frame={e['processing_frame']}"
+            if e["paused"]:
+                extras += " PAUSED"
+            lines.append(
+                f"{'  ' * e['depth']}{e['processor']}: "
+                f"in={e['input_queue_depth']} queued={e['process_queue_depth']} "
+                f"progress={age_str}{extras}"
+            )
+        reason_str = f" (reason: {reason})" if reason else ""
+        # A single log record keeps the dump atomic when multiple pipelines
+        # log concurrently.
+        logger.warning(f"{self}: processor diagnostics dump{reason_str}:\n" + "\n".join(lines))
+
+        return entries
+
     async def on_bus_message(self, message: BusMessage) -> None:
         """Handle outbound bus messages: TTS playback and RTVI UI translation.
 
