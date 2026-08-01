@@ -604,6 +604,160 @@ class InterruptionMarkerGate:
         return tail
 
 
+# The head of a meta-aside: a parenthesized span the model addresses to the
+# SYSTEM rather than to the caller, labelled and colon-terminated — "(Note to
+# system: … I should transition to the next stage using `transition_to_3` …)",
+# "(Note: Since I cannot actually check a database …)". The label may be
+# wrapped in Markdown emphasis, which is how the model marks it as an aside.
+# Anchored on label + colon inside a paren: a phone agent never speaks that
+# shape, in any language, so the pattern cannot swallow real speech.
+_META_ASIDE_CUE_RE = re.compile(
+    r"\(\s*\**\s*"
+    r"(?:note|nb|internal|system|meta|aside|reminder|instructions?|thought)\b"
+    r"[^)\n]{0,40}?:",
+    re.IGNORECASE,
+)
+
+
+class MetaAsideGate:
+    """Stateful stream filter that keeps model asides-to-the-system out of visible text.
+
+    A model reasoning about its own instructions sometimes writes the reasoning
+    into the reply as a labelled parenthetical — prod run 2044: Gemma-26B
+    appended ``*(Note to system: … I should transition to the next stage using
+    `transition_to_3`. The opening sentence of the next stage will be played
+    automatically.)*`` to an otherwise fine Hebrew answer. It is meta, never
+    speech, and it reaches every downstream consumer: TTS, the context
+    aggregator, and the stored transcript.
+
+    Downstream sanitizers are stateless per-chunk, so an aside split across
+    sentence-aggregated chunks is only partly removed — in run 2044 the tail
+    was stripped and the head was not, and TTS read the leftover ``<br>. *``
+    aloud as "br". Gating at the stream, before aggregation, is the only place
+    the whole span is visible at once — the same argument that made
+    :class:`ReasoningTagGate` and :class:`InterruptionMarkerGate` stateful.
+
+    Feed the marker-gated deltas through :meth:`feed`; push only what comes
+    back. A parenthesized span whose head matches the aside cue is suppressed
+    through its closing ``)``, together with the Markdown emphasis wrapping it
+    on either side. An ordinary parenthesis is released as soon as the cue is
+    ruled out. A span that never closes is suppressed to end of stream and
+    discarded at :meth:`flush` — an aside-only completion counts as an empty
+    one, so the empty-completion retry regenerates a real reply.
+    """
+
+    # Markdown emphasis the model wraps an aside in ("*(Note: …)*").
+    _WRAPPER = "*_"
+    # Chars after "(" needed before the cue can be ruled out: the longest head
+    # the pattern can match is well under this.
+    _CUE_LOOKAHEAD = 64
+
+    def __init__(self):
+        self._mode = "pass"
+        self._buf = ""
+        self.visible_text = ""
+        self.suppressed_chars = 0
+        self.suppressed_preview = ""
+
+    def _suppress(self, text: str):
+        self.suppressed_chars += len(text)
+        if len(self.suppressed_preview) < 120:
+            self.suppressed_preview += text[: 120 - len(self.suppressed_preview)]
+
+    def _wrapper_run_start(self, upto: int) -> int:
+        """Index where the emphasis run ending at ``upto`` begins."""
+        i = upto
+        while i > 0 and self._buf[i - 1] in self._WRAPPER:
+            i -= 1
+        return i
+
+    def feed(self, delta: str) -> str:
+        """Consume one visible delta; return the part safe to emit (often all of it)."""
+        if not delta:
+            return ""
+        self._buf += delta
+        out = []
+        while self._buf:
+            if self._mode == "suppress":
+                close = self._buf.find(")")
+                if close == -1:
+                    # No closer yet: the span is meta either way, so drop what
+                    # has accumulated (keeps memory bounded on a runaway span)
+                    # and keep suppressing.
+                    self._suppress(self._buf)
+                    self._buf = ""
+                    break
+                self._suppress(self._buf[: close + 1])
+                self._buf = self._buf[close + 1 :]
+                self._mode = "tail"
+                continue
+            if self._mode == "tail":
+                # Absorb the closing emphasis run (")*") so it is not left
+                # behind as an orphan marker for TTS to voice.
+                i = 0
+                while i < len(self._buf) and self._buf[i] in self._WRAPPER:
+                    i += 1
+                self._suppress(self._buf[:i])
+                self._buf = self._buf[i:]
+                if not self._buf:
+                    break  # run may still be growing — stay in tail
+                self._mode = "pass"
+                continue
+            if self._mode == "decide":
+                # The buffer starts with the aside's opening emphasis run (if
+                # any) followed by "(".
+                k = self._buf.index("(")
+                rest = self._buf[k:]
+                m = _META_ASIDE_CUE_RE.match(rest)
+                if m:
+                    self._suppress(self._buf[: k + m.end()])
+                    self._buf = self._buf[k + m.end() :]
+                    self._mode = "suppress"
+                    continue
+                if len(rest) < self._CUE_LOOKAHEAD and ")" not in rest and "\n" not in rest:
+                    break  # cue still possible — wait for more of the stream
+                # Ordinary parenthesis: release the wrapper and the "(", then
+                # keep scanning after it.
+                out.append(self._buf[: k + 1])
+                self._buf = self._buf[k + 1 :]
+                self._mode = "pass"
+                continue
+            # pass
+            i = self._buf.find("(")
+            if i != -1:
+                # An emphasis run glued to the "(" belongs to the candidate
+                # aside — hold it back until the cue is decided.
+                j = self._wrapper_run_start(i)
+                out.append(self._buf[:j])
+                self._buf = self._buf[j:]
+                self._mode = "decide"
+                continue
+            # Hold a chunk-final emphasis run: the next delta may open an
+            # aside right behind it, and committing the run now would leak the
+            # wrapper as speech.
+            hold = self._wrapper_run_start(len(self._buf))
+            out.append(self._buf[:hold])
+            self._buf = self._buf[hold:]
+            break
+        emitted = "".join(out)
+        self.visible_text += emitted
+        return emitted
+
+    def flush(self) -> str:
+        """End of stream: settle whatever is still buffered.
+
+        A held parenthesis or emphasis run turned out to be ordinary text —
+        emitted. An unclosed suppressed span, and the emphasis run trailing a
+        closed one, are aside residue — discarded.
+        """
+        tail, self._buf = self._buf, ""
+        if self._mode in ("suppress", "tail"):
+            self._suppress(tail)
+            return ""
+        self.visible_text += tail
+        return tail
+
+
 @dataclass
 class OpenAILLMSettings(LLMSettings):
     """Settings for BaseOpenAILLMService.
@@ -833,6 +987,8 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         self._reasoning_bounded_releases_total = 0
         # Cumulative InterruptionMarkerGate activity, same rationale.
         self._marker_suppressed_chars_total = 0
+        # Cumulative MetaAsideGate activity, same rationale.
+        self._aside_suppressed_chars_total = 0
 
     def create_client(
         self,
@@ -1189,6 +1345,16 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     f"parroted interruption-annotation text from run_inference output"
                 )
             content = cleaned
+        # And the same aside-to-the-system hygiene (see MetaAsideGate).
+        if content and "(" in content:
+            aside_gate = MetaAsideGate()
+            cleaned = aside_gate.feed(content) + aside_gate.flush()
+            if aside_gate.suppressed_chars:
+                logger.warning(
+                    f"{self}: suppressed {aside_gate.suppressed_chars} chars of "
+                    f"model meta-aside text from run_inference output"
+                )
+            content = cleaned
         return content
 
     # Clock read by the per-turn generation budget. Indirected through an
@@ -1240,6 +1406,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # Chained after the reasoning gate: a parroted interruption note must
         # never reach TTS, the context aggregator, or transcripts.
         marker_gate = InterruptionMarkerGate()
+        # Last in the chain: an aside the model addresses to the system rather
+        # than the caller, same "never speech, never stored" rationale.
+        aside_gate = MetaAsideGate()
 
         # Reset pending function calls when processing a new context
         self._pending_function_calls = []
@@ -1373,8 +1542,8 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                         arguments += tool_call.function.arguments
                 elif chunk.choices[0].delta.content:
                     content_buffer += chunk.choices[0].delta.content
-                    visible_delta = marker_gate.feed(
-                        reasoning_gate.feed(chunk.choices[0].delta.content)
+                    visible_delta = aside_gate.feed(
+                        marker_gate.feed(reasoning_gate.feed(chunk.choices[0].delta.content))
                     )
                     if visible_delta:
                         text_generated_signal = True
@@ -1411,15 +1580,18 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # what did we say" signal below must use the visible text, or a
         # thought-only completion counts as a spoken reply and the turn dies
         # silently.
-        gate_tail = marker_gate.feed(reasoning_gate.flush()) + marker_gate.flush()
+        gate_tail = (
+            aside_gate.feed(marker_gate.feed(reasoning_gate.flush()) + marker_gate.flush())
+            + aside_gate.flush()
+        )
         if gate_tail:
             text_generated_signal = True
             await self._push_llm_text(gate_tail)
-        # The marker gate is the last filter before push, so its visible text
+        # The aside gate is the last filter before push, so its visible text
         # is exactly what went downstream — the "did we say anything / what
         # did we say" signals below must read it, or a note-only completion
         # counts as a spoken reply and the turn dies silently.
-        visible_text = marker_gate.visible_text
+        visible_text = aside_gate.visible_text
         self._reasoning_bounded_releases_total += reasoning_gate.bounded_releases
         if reasoning_gate.suppressed_chars:
             self._reasoning_suppressed_chars_total += reasoning_gate.suppressed_chars
@@ -1437,6 +1609,14 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 f"parroted interruption-annotation text from the stream "
                 f"(starts: {marker_gate.suppressed_preview[:80]!r}; "
                 f"{self._marker_suppressed_chars_total} chars this session)"
+            )
+        if aside_gate.suppressed_chars:
+            self._aside_suppressed_chars_total += aside_gate.suppressed_chars
+            logger.warning(
+                f"{self}: suppressed {aside_gate.suppressed_chars} chars of "
+                f"model meta-aside text from the stream "
+                f"(starts: {aside_gate.suppressed_preview[:80]!r}; "
+                f"{self._aside_suppressed_chars_total} chars this session)"
             )
 
         loop_guard_tripped = self._tool_call_rounds_this_turn >= self._max_tool_call_rounds_per_turn
