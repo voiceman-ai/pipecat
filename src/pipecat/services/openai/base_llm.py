@@ -512,6 +512,98 @@ class ReasoningTagGate:
         return tail
 
 
+class InterruptionMarkerGate:
+    """Stateful stream filter that keeps parroted interruption notes out of visible text.
+
+    When a barge-in cuts a reply short, the application layer patches the
+    assistant context message with a bracketed reconciliation note —
+    ``[interrupted by the caller; the caller did NOT hear …]`` — so the model
+    knows what the caller missed. The note is context-only; it is never
+    legitimate model OUTPUT. But a model that just read one in its context can
+    parrot the pattern into its next reply (prod run 2022: Gemma-26B copied the
+    note verbatim, question and all, and TTS read "interrupted by the caller…"
+    aloud to the caller). Downstream sanitizers are stateless per-chunk, so a
+    note split across sentence-aggregated chunks slips past them — the same
+    argument that made :class:`ReasoningTagGate` stateful.
+
+    Feed the reasoning-gated deltas through :meth:`feed`; push only what comes
+    back. A span opening with ``[interrupted`` (any casing) is suppressed
+    through its closing ``]``. A chunk-final fragment that could still grow
+    into the opener (``"[interr"``) is held until decidable. A span that never
+    closes is suppressed to end of stream and discarded at :meth:`flush` —
+    annotation-shaped text is meta, never speech — so a note-only completion
+    counts as an empty one and the empty-completion retry regenerates a real
+    reply.
+    """
+
+    _OPENER = "[interrupted"
+
+    def __init__(self):
+        self._mode = "pass"
+        self._buf = ""
+        self.visible_text = ""
+        self.suppressed_chars = 0
+        self.suppressed_preview = ""
+
+    def _suppress(self, text: str):
+        self.suppressed_chars += len(text)
+        if len(self.suppressed_preview) < 120:
+            self.suppressed_preview += text[: 120 - len(self.suppressed_preview)]
+
+    def feed(self, delta: str) -> str:
+        """Consume one visible delta; return the part safe to emit (often all of it)."""
+        if not delta:
+            return ""
+        self._buf += delta
+        out = []
+        while self._buf:
+            if self._mode == "suppress":
+                close = self._buf.find("]")
+                if close == -1:
+                    # No closer yet: the span is meta text either way, so drop
+                    # what has accumulated (keeps memory bounded on a runaway
+                    # span) and keep suppressing.
+                    self._suppress(self._buf)
+                    self._buf = ""
+                    break
+                self._suppress(self._buf[: close + 1])
+                self._buf = self._buf[close + 1 :]
+                self._mode = "pass"
+                continue
+            start = self._buf.lower().find(self._OPENER)
+            if start != -1:
+                out.append(self._buf[:start])
+                self._buf = self._buf[start:]
+                self._mode = "suppress"
+                continue
+            # Hold a chunk-final fragment that could still grow into the
+            # opener ("[", "[interr", …): committing it now would leak the
+            # note's head once the next delta completes the word.
+            hold = len(self._buf)
+            i = self._buf.rfind("[")
+            if i != -1 and self._OPENER.startswith(self._buf[i:].lower()):
+                hold = i
+            out.append(self._buf[:hold])
+            self._buf = self._buf[hold:]
+            break
+        emitted = "".join(out)
+        self.visible_text += emitted
+        return emitted
+
+    def flush(self) -> str:
+        """End of stream: settle whatever is still buffered.
+
+        A held ``[``-fragment turned out to be ordinary text — emitted. An
+        unclosed suppressed span is annotation residue — discarded.
+        """
+        tail, self._buf = self._buf, ""
+        if self._mode == "suppress":
+            self._suppress(tail)
+            return ""
+        self.visible_text += tail
+        return tail
+
+
 @dataclass
 class OpenAILLMSettings(LLMSettings):
     """Settings for BaseOpenAILLMService.
@@ -739,6 +831,8 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # a genuinely empty completion and its rate was not queryable at all.
         self._reasoning_suppressed_chars_total = 0
         self._reasoning_bounded_releases_total = 0
+        # Cumulative InterruptionMarkerGate activity, same rationale.
+        self._marker_suppressed_chars_total = 0
 
     def create_client(
         self,
@@ -1085,6 +1179,16 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     f"model reasoning from run_inference output"
                 )
             content = cleaned
+        # And the same parroted-annotation hygiene (see InterruptionMarkerGate).
+        if content and "[" in content:
+            marker_gate = InterruptionMarkerGate()
+            cleaned = marker_gate.feed(content) + marker_gate.flush()
+            if marker_gate.suppressed_chars:
+                logger.warning(
+                    f"{self}: suppressed {marker_gate.suppressed_chars} chars of "
+                    f"parroted interruption-annotation text from run_inference output"
+                )
+            content = cleaned
         return content
 
     # Clock read by the per-turn generation budget. Indirected through an
@@ -1133,6 +1237,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # ``content_buffer`` stays RAW so tool-call recovery still sees a call
         # written inside a reasoning block.
         reasoning_gate = ReasoningTagGate()
+        # Chained after the reasoning gate: a parroted interruption note must
+        # never reach TTS, the context aggregator, or transcripts.
+        marker_gate = InterruptionMarkerGate()
 
         # Reset pending function calls when processing a new context
         self._pending_function_calls = []
@@ -1266,7 +1373,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                         arguments += tool_call.function.arguments
                 elif chunk.choices[0].delta.content:
                     content_buffer += chunk.choices[0].delta.content
-                    visible_delta = reasoning_gate.feed(chunk.choices[0].delta.content)
+                    visible_delta = marker_gate.feed(
+                        reasoning_gate.feed(chunk.choices[0].delta.content)
+                    )
                     if visible_delta:
                         text_generated_signal = True
                         await self._push_llm_text(visible_delta)
@@ -1302,11 +1411,15 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # what did we say" signal below must use the visible text, or a
         # thought-only completion counts as a spoken reply and the turn dies
         # silently.
-        gate_tail = reasoning_gate.flush()
+        gate_tail = marker_gate.feed(reasoning_gate.flush()) + marker_gate.flush()
         if gate_tail:
             text_generated_signal = True
             await self._push_llm_text(gate_tail)
-        visible_text = reasoning_gate.visible_text
+        # The marker gate is the last filter before push, so its visible text
+        # is exactly what went downstream — the "did we say anything / what
+        # did we say" signals below must read it, or a note-only completion
+        # counts as a spoken reply and the turn dies silently.
+        visible_text = marker_gate.visible_text
         self._reasoning_bounded_releases_total += reasoning_gate.bounded_releases
         if reasoning_gate.suppressed_chars:
             self._reasoning_suppressed_chars_total += reasoning_gate.suppressed_chars
@@ -1316,6 +1429,14 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 f"(starts: {reasoning_gate.suppressed_preview[:80]!r}; "
                 f"{self._reasoning_suppressed_chars_total} chars / "
                 f"{self._reasoning_bounded_releases_total} bounded releases this session)"
+            )
+        if marker_gate.suppressed_chars:
+            self._marker_suppressed_chars_total += marker_gate.suppressed_chars
+            logger.warning(
+                f"{self}: suppressed {marker_gate.suppressed_chars} chars of "
+                f"parroted interruption-annotation text from the stream "
+                f"(starts: {marker_gate.suppressed_preview[:80]!r}; "
+                f"{self._marker_suppressed_chars_total} chars this session)"
             )
 
         loop_guard_tripped = self._tool_call_rounds_this_turn >= self._max_tool_call_rounds_per_turn
