@@ -1094,15 +1094,22 @@ class FrameProcessor(BaseObject):
 
     @property
     def seconds_since_last_progress(self) -> float | None:
-        """Seconds since this processor last accepted a frame for processing.
+        """Seconds since this processor last accepted a non-system frame.
 
         The stamp is taken when a frame *enters* processing, so a processor
         stuck inside a single frame ages here just like one that stopped
         receiving frames; combine with the queue depths and
         `processing_frame_name` to tell the two apart.
 
+        System frames and heartbeats do NOT refresh the stamp: system frames
+        are handled by the input task (which keeps running while the process
+        task is wedged) and heartbeats are liveness probes, so counting either
+        as progress would hide exactly the wedge this property exists to
+        expose.
+
         Returns:
-            The age in seconds, or None if no frame was ever processed.
+            The age in seconds, or None if no non-system frame was ever
+            processed.
         """
         if self.__last_progress_time == 0.0:
             return None
@@ -1196,8 +1203,15 @@ class FrameProcessor(BaseObject):
     ):
         # Progress stamp for `seconds_since_last_progress`. Taken at entry so a
         # processor wedged inside this frame keeps aging instead of looking
-        # fresh forever.
-        self.__last_progress_time = time.monotonic()
+        # fresh forever. System frames are excluded: __process_frame is also
+        # called from the input task, and a live call keeps delivering system
+        # frames (e.g. InputAudioRawFrame) even while the process task is
+        # wedged inside one non-system frame — stamping them would read
+        # "fresh" during exactly the wedge this diagnostic exists to expose.
+        # Heartbeats are excluded for the same reason: they are liveness
+        # probes, not work.
+        if not isinstance(frame, (SystemFrame, HeartbeatFrame)):
+            self.__last_progress_time = time.monotonic()
         try:
             await self._call_event_handler("on_before_process_frame", frame)
 
