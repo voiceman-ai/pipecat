@@ -512,6 +512,281 @@ class ReasoningTagGate:
         return tail
 
 
+def _append_ephemeral_user_note(params: dict, note: str) -> None:
+    """Attach a request-only instruction to ``params["messages"]``.
+
+    Merged into a trailing plain user turn (as a copy — the message dict may be
+    shared with the live context) rather than appended beside it:
+    strict-alternation chat templates (gemma3 pythonic) reject two consecutive
+    plain user turns with HTTP 400, and the Speaches 400-recovery then rebuilds
+    the request from the raw context — silently dropping the note it was meant
+    to carry. Appended as its own user message only when the history doesn't
+    end in a plain user turn.
+    """
+    messages = list(params.get("messages") or [])
+    last = messages[-1] if messages else None
+    if (
+        isinstance(last, dict)
+        and last.get("role") == "user"
+        and isinstance(last.get("content"), str)
+    ):
+        messages[-1] = {**last, "content": f"{last['content']}\n\n{note}"}
+    else:
+        messages.append({"role": "user", "content": note})
+    params["messages"] = messages
+
+
+class InterruptionMarkerGate:
+    """Stateful stream filter that keeps parroted interruption notes out of visible text.
+
+    When a barge-in cuts a reply short, the application layer patches the
+    assistant context message with a bracketed reconciliation note —
+    ``[interrupted by the caller; the caller did NOT hear …]`` — so the model
+    knows what the caller missed. The note is context-only; it is never
+    legitimate model OUTPUT. But a model that just read one in its context can
+    parrot the pattern into its next reply (prod run 2022: Gemma-26B copied the
+    note verbatim, question and all, and TTS read "interrupted by the caller…"
+    aloud to the caller). Downstream sanitizers are stateless per-chunk, so a
+    note split across sentence-aggregated chunks slips past them — the same
+    argument that made :class:`ReasoningTagGate` stateful.
+
+    Feed the reasoning-gated deltas through :meth:`feed`; push only what comes
+    back. A span opening with ``[interrupted`` (any casing) is suppressed
+    through its closing ``]``. A chunk-final fragment that could still grow
+    into the opener (``"[interr"``) is held until decidable. A span that never
+    closes is suppressed to end of stream and discarded at :meth:`flush` —
+    annotation-shaped text is meta, never speech — so a note-only completion
+    counts as an empty one and the empty-completion retry regenerates a real
+    reply. A completion that kept visible text but lost its QUESTION to the
+    gate (``suppressed_has_question``) is retried once the same way — see the
+    question-swallowed retry in ``_process_context``.
+    """
+
+    _OPENER = "[interrupted"
+
+    def __init__(self):
+        self._mode = "pass"
+        self._buf = ""
+        self.visible_text = ""
+        self.suppressed_chars = 0
+        self.suppressed_preview = ""
+        self.suppressed_has_question = False
+
+    def _suppress(self, text: str):
+        self.suppressed_chars += len(text)
+        if "?" in text:
+            self.suppressed_has_question = True
+        if len(self.suppressed_preview) < 120:
+            self.suppressed_preview += text[: 120 - len(self.suppressed_preview)]
+
+    def feed(self, delta: str) -> str:
+        """Consume one visible delta; return the part safe to emit (often all of it)."""
+        if not delta:
+            return ""
+        self._buf += delta
+        out = []
+        while self._buf:
+            if self._mode == "suppress":
+                close = self._buf.find("]")
+                if close == -1:
+                    # No closer yet: the span is meta text either way, so drop
+                    # what has accumulated (keeps memory bounded on a runaway
+                    # span) and keep suppressing.
+                    self._suppress(self._buf)
+                    self._buf = ""
+                    break
+                self._suppress(self._buf[: close + 1])
+                self._buf = self._buf[close + 1 :]
+                self._mode = "pass"
+                continue
+            start = self._buf.lower().find(self._OPENER)
+            if start != -1:
+                out.append(self._buf[:start])
+                self._buf = self._buf[start:]
+                self._mode = "suppress"
+                continue
+            # Hold a chunk-final fragment that could still grow into the
+            # opener ("[", "[interr", …): committing it now would leak the
+            # note's head once the next delta completes the word.
+            hold = len(self._buf)
+            i = self._buf.rfind("[")
+            if i != -1 and self._OPENER.startswith(self._buf[i:].lower()):
+                hold = i
+            out.append(self._buf[:hold])
+            self._buf = self._buf[hold:]
+            break
+        emitted = "".join(out)
+        self.visible_text += emitted
+        return emitted
+
+    def flush(self) -> str:
+        """End of stream: settle whatever is still buffered.
+
+        A held ``[``-fragment turned out to be ordinary text — emitted. An
+        unclosed suppressed span is annotation residue — discarded.
+        """
+        tail, self._buf = self._buf, ""
+        if self._mode == "suppress":
+            self._suppress(tail)
+            return ""
+        self.visible_text += tail
+        return tail
+
+
+# The head of a meta-aside: a parenthesized span the model addresses to the
+# SYSTEM rather than to the caller, labelled and colon-terminated — "(Note to
+# system: … I should transition to the next stage using `transition_to_3` …)",
+# "(Note: Since I cannot actually check a database …)". The label may be
+# wrapped in Markdown emphasis, which is how the model marks it as an aside.
+# Anchored on label + colon inside a paren: a phone agent never speaks that
+# shape, in any language, so the pattern cannot swallow real speech.
+_META_ASIDE_CUE_RE = re.compile(
+    r"\(\s*\**\s*"
+    r"(?:note|nb|internal|system|meta|aside|reminder|instructions?|thought)\b"
+    r"[^)\n]{0,40}?:",
+    re.IGNORECASE,
+)
+
+
+class MetaAsideGate:
+    """Stateful stream filter that keeps model asides-to-the-system out of visible text.
+
+    A model reasoning about its own instructions sometimes writes the reasoning
+    into the reply as a labelled parenthetical — prod run 2044: Gemma-26B
+    appended ``*(Note to system: … I should transition to the next stage using
+    `transition_to_3`. The opening sentence of the next stage will be played
+    automatically.)*`` to an otherwise fine Hebrew answer. It is meta, never
+    speech, and it reaches every downstream consumer: TTS, the context
+    aggregator, and the stored transcript.
+
+    Downstream sanitizers are stateless per-chunk, so an aside split across
+    sentence-aggregated chunks is only partly removed — in run 2044 the tail
+    was stripped and the head was not, and TTS read the leftover ``<br>. *``
+    aloud as "br". Gating at the stream, before aggregation, is the only place
+    the whole span is visible at once — the same argument that made
+    :class:`ReasoningTagGate` and :class:`InterruptionMarkerGate` stateful.
+
+    Feed the marker-gated deltas through :meth:`feed`; push only what comes
+    back. A parenthesized span whose head matches the aside cue is suppressed
+    through its closing ``)``, together with the Markdown emphasis wrapping it
+    on either side. An ordinary parenthesis is released as soon as the cue is
+    ruled out. A span that never closes is suppressed to end of stream and
+    discarded at :meth:`flush` — an aside-only completion counts as an empty
+    one, so the empty-completion retry regenerates a real reply.
+    """
+
+    # Markdown emphasis the model wraps an aside in ("*(Note: …)*").
+    _WRAPPER = "*_"
+    # Chars after "(" needed before the cue can be ruled out: the longest head
+    # the pattern can match is well under this.
+    _CUE_LOOKAHEAD = 64
+
+    def __init__(self):
+        self._mode = "pass"
+        self._buf = ""
+        self.visible_text = ""
+        self.suppressed_chars = 0
+        self.suppressed_preview = ""
+
+    def _suppress(self, text: str):
+        self.suppressed_chars += len(text)
+        if len(self.suppressed_preview) < 120:
+            self.suppressed_preview += text[: 120 - len(self.suppressed_preview)]
+
+    def _wrapper_run_start(self, upto: int) -> int:
+        """Index where the emphasis run ending at ``upto`` begins."""
+        i = upto
+        while i > 0 and self._buf[i - 1] in self._WRAPPER:
+            i -= 1
+        return i
+
+    def feed(self, delta: str) -> str:
+        """Consume one visible delta; return the part safe to emit (often all of it)."""
+        if not delta:
+            return ""
+        self._buf += delta
+        out = []
+        while self._buf:
+            if self._mode == "suppress":
+                close = self._buf.find(")")
+                if close == -1:
+                    # No closer yet: the span is meta either way, so drop what
+                    # has accumulated (keeps memory bounded on a runaway span)
+                    # and keep suppressing.
+                    self._suppress(self._buf)
+                    self._buf = ""
+                    break
+                self._suppress(self._buf[: close + 1])
+                self._buf = self._buf[close + 1 :]
+                self._mode = "tail"
+                continue
+            if self._mode == "tail":
+                # Absorb the closing emphasis run (")*") so it is not left
+                # behind as an orphan marker for TTS to voice.
+                i = 0
+                while i < len(self._buf) and self._buf[i] in self._WRAPPER:
+                    i += 1
+                self._suppress(self._buf[:i])
+                self._buf = self._buf[i:]
+                if not self._buf:
+                    break  # run may still be growing — stay in tail
+                self._mode = "pass"
+                continue
+            if self._mode == "decide":
+                # The buffer starts with the aside's opening emphasis run (if
+                # any) followed by "(".
+                k = self._buf.index("(")
+                rest = self._buf[k:]
+                m = _META_ASIDE_CUE_RE.match(rest)
+                if m:
+                    self._suppress(self._buf[: k + m.end()])
+                    self._buf = self._buf[k + m.end() :]
+                    self._mode = "suppress"
+                    continue
+                if len(rest) < self._CUE_LOOKAHEAD and ")" not in rest and "\n" not in rest:
+                    break  # cue still possible — wait for more of the stream
+                # Ordinary parenthesis: release the wrapper and the "(", then
+                # keep scanning after it.
+                out.append(self._buf[: k + 1])
+                self._buf = self._buf[k + 1 :]
+                self._mode = "pass"
+                continue
+            # pass
+            i = self._buf.find("(")
+            if i != -1:
+                # An emphasis run glued to the "(" belongs to the candidate
+                # aside — hold it back until the cue is decided.
+                j = self._wrapper_run_start(i)
+                out.append(self._buf[:j])
+                self._buf = self._buf[j:]
+                self._mode = "decide"
+                continue
+            # Hold a chunk-final emphasis run: the next delta may open an
+            # aside right behind it, and committing the run now would leak the
+            # wrapper as speech.
+            hold = self._wrapper_run_start(len(self._buf))
+            out.append(self._buf[:hold])
+            self._buf = self._buf[hold:]
+            break
+        emitted = "".join(out)
+        self.visible_text += emitted
+        return emitted
+
+    def flush(self) -> str:
+        """End of stream: settle whatever is still buffered.
+
+        A held parenthesis or emphasis run turned out to be ordinary text —
+        emitted. An unclosed suppressed span, and the emphasis run trailing a
+        closed one, are aside residue — discarded.
+        """
+        tail, self._buf = self._buf, ""
+        if self._mode in ("suppress", "tail"):
+            self._suppress(tail)
+            return ""
+        self.visible_text += tail
+        return tail
+
+
 @dataclass
 class OpenAILLMSettings(LLMSettings):
     """Settings for BaseOpenAILLMService.
@@ -739,6 +1014,10 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # a genuinely empty completion and its rate was not queryable at all.
         self._reasoning_suppressed_chars_total = 0
         self._reasoning_bounded_releases_total = 0
+        # Cumulative InterruptionMarkerGate activity, same rationale.
+        self._marker_suppressed_chars_total = 0
+        # Cumulative MetaAsideGate activity, same rationale.
+        self._aside_suppressed_chars_total = 0
 
     def create_client(
         self,
@@ -937,9 +1216,43 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 "instructions or internal state, no English unless the "
                 "conversation is in English.)"
             )
-            params["messages"] = list(params.get("messages") or []) + [
-                {"role": "user", "content": nudge}
-            ]
+            _append_ephemeral_user_note(params, nudge)
+
+        # One-shot correction armed by the question-swallowed retry (and by an
+        # empty retry whose discarded note carried a question): the previous
+        # completion wrapped its real content in interruption-note notation, so
+        # the retry must be TOLD what survived and to continue in plain words —
+        # the identical context otherwise tends to reproduce the identical note
+        # (runs 2137/2139). Request-only like the nudge above, and consumed
+        # here so it can never outlive the request it was armed for. Written
+        # WITHOUT brackets so the correction itself never becomes parroting
+        # bait for the very gate that made it necessary.
+        correction_heard = getattr(self, "_marker_correction_pending", None)
+        if correction_heard is not None:
+            self._marker_correction_pending = None
+            if correction_heard:
+                correction = (
+                    "(Internal correction, invisible to the caller. Do not "
+                    "mention it or apologize for it. Part of your last reply "
+                    "copied the internal interruption-note format, so it was "
+                    "discarded and never spoken aloud. The caller has heard "
+                    f"only: “{correction_heard}”. Continue from exactly there "
+                    "without repeating those words: say the missing part in "
+                    "plain spoken words in the conversation's language, and if "
+                    "you owe the caller a question, ask it now, briefly and "
+                    "naturally. Never use square-bracket notation in a reply.)"
+                )
+            else:
+                correction = (
+                    "(Internal correction, invisible to the caller. Do not "
+                    "mention it or apologize for it. Your last reply was only "
+                    "internal interruption-note text, so it was discarded and "
+                    "never spoken aloud. Reply to the caller again in plain "
+                    "spoken words in the conversation's language, and if you "
+                    "owe the caller a question, ask it now, briefly and "
+                    "naturally. Never use square-bracket notation in a reply.)"
+                )
+            _append_ephemeral_user_note(params, correction)
 
         async def _create():
             # One reconnect retry: a transient connection blip otherwise kills
@@ -1085,6 +1398,26 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     f"model reasoning from run_inference output"
                 )
             content = cleaned
+        # And the same parroted-annotation hygiene (see InterruptionMarkerGate).
+        if content and "[" in content:
+            marker_gate = InterruptionMarkerGate()
+            cleaned = marker_gate.feed(content) + marker_gate.flush()
+            if marker_gate.suppressed_chars:
+                logger.warning(
+                    f"{self}: suppressed {marker_gate.suppressed_chars} chars of "
+                    f"parroted interruption-annotation text from run_inference output"
+                )
+            content = cleaned
+        # And the same aside-to-the-system hygiene (see MetaAsideGate).
+        if content and "(" in content:
+            aside_gate = MetaAsideGate()
+            cleaned = aside_gate.feed(content) + aside_gate.flush()
+            if aside_gate.suppressed_chars:
+                logger.warning(
+                    f"{self}: suppressed {aside_gate.suppressed_chars} chars of "
+                    f"model meta-aside text from run_inference output"
+                )
+            content = cleaned
         return content
 
     # Clock read by the per-turn generation budget. Indirected through an
@@ -1108,12 +1441,15 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
     @traced_llm
     async def _process_context(self, context: LLMContext):
         # Stamp the wall-clock budget for this turn's whole retry ladder on the
-        # outermost generation only; the recursive empty-completion retries below
-        # re-enter this method and must share one deadline. Three retry layers
-        # (empty-completion recursion, the connection retry, and the SDK's own
-        # max_retries) otherwise multiply into minutes of dead air on a degraded
-        # server.
-        if getattr(self, "_empty_retry_depth", 0) == 0:
+        # outermost generation only; the recursive empty-completion and
+        # question-swallowed retries below re-enter this method and must share
+        # one deadline. Three retry layers (retry recursion, the connection
+        # retry, and the SDK's own max_retries) otherwise multiply into
+        # minutes of dead air on a degraded server.
+        if (
+            getattr(self, "_empty_retry_depth", 0) == 0
+            and getattr(self, "_marker_question_retry_depth", 0) == 0
+        ):
             self._turn_generation_deadline = (
                 self._generation_clock() + EMPTY_RETRY_TOTAL_BUDGET_SECS
             )
@@ -1133,6 +1469,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # ``content_buffer`` stays RAW so tool-call recovery still sees a call
         # written inside a reasoning block.
         reasoning_gate = ReasoningTagGate()
+        # Chained after the reasoning gate: a parroted interruption note must
+        # never reach TTS, the context aggregator, or transcripts.
+        marker_gate = InterruptionMarkerGate()
+        # Last in the chain: an aside the model addresses to the system rather
+        # than the caller, same "never speech, never stored" rationale.
+        aside_gate = MetaAsideGate()
 
         # Reset pending function calls when processing a new context
         self._pending_function_calls = []
@@ -1266,7 +1608,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                         arguments += tool_call.function.arguments
                 elif chunk.choices[0].delta.content:
                     content_buffer += chunk.choices[0].delta.content
-                    visible_delta = reasoning_gate.feed(chunk.choices[0].delta.content)
+                    visible_delta = aside_gate.feed(
+                        marker_gate.feed(reasoning_gate.feed(chunk.choices[0].delta.content))
+                    )
                     if visible_delta:
                         text_generated_signal = True
                         await self._push_llm_text(visible_delta)
@@ -1302,11 +1646,18 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # what did we say" signal below must use the visible text, or a
         # thought-only completion counts as a spoken reply and the turn dies
         # silently.
-        gate_tail = reasoning_gate.flush()
+        gate_tail = (
+            aside_gate.feed(marker_gate.feed(reasoning_gate.flush()) + marker_gate.flush())
+            + aside_gate.flush()
+        )
         if gate_tail:
             text_generated_signal = True
             await self._push_llm_text(gate_tail)
-        visible_text = reasoning_gate.visible_text
+        # The aside gate is the last filter before push, so its visible text
+        # is exactly what went downstream — the "did we say anything / what
+        # did we say" signals below must read it, or a note-only completion
+        # counts as a spoken reply and the turn dies silently.
+        visible_text = aside_gate.visible_text
         self._reasoning_bounded_releases_total += reasoning_gate.bounded_releases
         if reasoning_gate.suppressed_chars:
             self._reasoning_suppressed_chars_total += reasoning_gate.suppressed_chars
@@ -1316,6 +1667,22 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 f"(starts: {reasoning_gate.suppressed_preview[:80]!r}; "
                 f"{self._reasoning_suppressed_chars_total} chars / "
                 f"{self._reasoning_bounded_releases_total} bounded releases this session)"
+            )
+        if marker_gate.suppressed_chars:
+            self._marker_suppressed_chars_total += marker_gate.suppressed_chars
+            logger.warning(
+                f"{self}: suppressed {marker_gate.suppressed_chars} chars of "
+                f"parroted interruption-annotation text from the stream "
+                f"(starts: {marker_gate.suppressed_preview[:80]!r}; "
+                f"{self._marker_suppressed_chars_total} chars this session)"
+            )
+        if aside_gate.suppressed_chars:
+            self._aside_suppressed_chars_total += aside_gate.suppressed_chars
+            logger.warning(
+                f"{self}: suppressed {aside_gate.suppressed_chars} chars of "
+                f"model meta-aside text from the stream "
+                f"(starts: {aside_gate.suppressed_preview[:80]!r}; "
+                f"{self._aside_suppressed_chars_total} chars this session)"
             )
 
         loop_guard_tripped = self._tool_call_rounds_this_turn >= self._max_tool_call_rounds_per_turn
@@ -1353,6 +1720,13 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             budget_left = self._generation_budget_remaining()
             if depth < MAX_EMPTY_COMPLETION_RETRIES and budget_left > 0:
                 self._empty_retry_depth = depth + 1
+                if marker_gate.suppressed_has_question:
+                    # The note-only completion carried a question inside the
+                    # discarded note: aim the retry with the correction
+                    # instead of re-rolling blind — the same context tends to
+                    # reproduce the same note (runs 2137/2139 regenerated it
+                    # verbatim).
+                    self._marker_correction_pending = ""
                 try:
                     logger.warning(
                         f"{self}: empty completion (no visible text, no tool calls) — "
@@ -1362,6 +1736,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     await self._process_context(context)
                 finally:
                     self._empty_retry_depth -= 1
+                    self._marker_correction_pending = None
                 return
             if depth < MAX_EMPTY_COMPLETION_RETRIES:
                 # Stopped by the clock rather than the attempt count. Logged
@@ -1372,6 +1747,50 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     f"{depth + 1} attempt(s) in {EMPTY_RETRY_TOTAL_BUDGET_SECS:.1f}s; "
                     f"giving up on this turn"
                 )
+
+        # QUESTION-SWALLOWED RETRY: the marker gate stripped a parroted
+        # interruption note that carried a question, and the visible remainder
+        # asks nothing — the caller gets a bare acknowledgment and the flow
+        # dead-ends (prod runs 2137/2139: "סבבה, הבנתי" with the survey's next
+        # question inside the discarded note, twice in a row, until the caller
+        # hung up). The model's INTENT was right each time; only the envelope
+        # was fatal. So run one corrective retry under an ephemeral request-only
+        # instruction (same mechanism as the final empty-retry nudge): the
+        # already-pushed prefix has been spoken and stays, and the retry is told
+        # to continue from it — its output arrives downstream as the turn's next
+        # sentence. No tool call exempts the turn: a transition delivers the
+        # destination's opening deterministically, so nothing is owed here.
+        if (
+            not function_name
+            and not recovered
+            and visible_text.strip()
+            and "?" not in visible_text
+            and marker_gate.suppressed_has_question
+        ):
+            depth = getattr(self, "_marker_question_retry_depth", 0)
+            budget_left = self._generation_budget_remaining()
+            if depth < 1 and budget_left > 0:
+                self._marker_question_retry_depth = depth + 1
+                self._marker_correction_pending = visible_text.strip()[-160:]
+                try:
+                    logger.warning(
+                        f"{self}: marker gate swallowed this turn's question "
+                        f"(kept: {visible_text.strip()[-60:]!r}) — one corrective "
+                        f"retry ({budget_left:.1f}s of budget left)"
+                    )
+                    await self._process_context(context)
+                finally:
+                    self._marker_question_retry_depth = depth
+                    self._marker_correction_pending = None
+                return
+            logger.warning(
+                f"{self}: marker gate swallowed this turn's question — "
+                + (
+                    "correction already retried once; leaving the reply as spoken"
+                    if depth >= 1
+                    else "generation budget exhausted; leaving the reply as spoken"
+                )
+            )
 
         # What the caller actually HEARS this turn. For a recovered leaked call
         # this is the visible text minus the call syntax — the raw form ends

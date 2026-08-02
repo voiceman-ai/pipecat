@@ -15,7 +15,7 @@ import asyncio
 import json
 import warnings
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -126,6 +126,14 @@ class LLMUserAggregatorParams:
             The aggregator will emit an `on_user_turn_idle` event when the user
             has been idle (not speaking) for this duration. Set to 0 to disable
             idle detection.
+        should_suppress_inference: Optional async callback consulted after a
+            user aggregation has been committed to the context and before the
+            ``LLMContextFrame`` that kicks inference is pushed. Called with the
+            aggregation string; returning True suppresses the inference
+            dispatch for that aggregation (the context keeps the user message).
+            Lets applications hold the LLM response while, e.g., a scripted
+            opening line is still being delivered. Errors are contained and
+            treated as "do not suppress". Defaults to None (never suppress).
         vad_analyzer: Voice Activity Detection analyzer instance.
         filter_incomplete_user_turns: [DEPRECATED] Use
             ``user_turn_strategies=FilterIncompleteUserTurnStrategies()``
@@ -159,6 +167,7 @@ class LLMUserAggregatorParams:
     vad_analyzer: VADAnalyzer | None = None
     filter_incomplete_user_turns: bool = False
     user_turn_completion_config: UserTurnCompletionConfig | None = None
+    should_suppress_inference: Callable[[str], Awaitable[bool]] | None = None
 
     def __post_init__(self):
         if self.filter_incomplete_user_turns:
@@ -745,9 +754,23 @@ class LLMUserAggregator(LLMContextAggregator):
         aggregation = self.aggregation_string()
         await self.reset()
         self._context.add_message({"role": self.role, "content": aggregation})
+        if await self._should_suppress_inference(aggregation):
+            return aggregation
         await self.push_context_frame()
 
         return aggregation
+
+    async def _should_suppress_inference(self, aggregation: str) -> bool:
+        """Consult the configured inference gate; errors mean "do not suppress"."""
+        if self._params.should_suppress_inference is None:
+            return False
+        try:
+            if await self._params.should_suppress_inference(aggregation):
+                logger.debug(f"{self}: inference suppressed for user aggregation")
+                return True
+        except Exception as e:
+            logger.exception(f"{self}: should_suppress_inference callback failed: {e}")
+        return False
 
     async def _start(self, frame: StartFrame):
         if self._vad_controller:

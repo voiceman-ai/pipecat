@@ -29,6 +29,10 @@ from pipecat.utils.deprecation import deprecated
 # see past the awaiting wrappers to the library call that is actually blocking.
 _CANCEL_STACK_FRAME_LIMIT = 8
 
+# Once a task blows past its cancel-timeout threshold, re-deliver the
+# cancellation this often until it actually dies (see cancel_task).
+_SLOW_CANCEL_RECANCEL_INTERVAL_SECS = 1.0
+
 
 def _describe_blocked_frames(task: asyncio.Task) -> str:
     """Summarize where a task is suspended, for cancel-timeout diagnostics.
@@ -267,22 +271,28 @@ class TaskManager(BaseTaskManager):
         completion or failure.
 
         Note:
-            ``timeout`` is a REPORTING threshold, not a bound. Cancelling an
+            ``timeout`` is a grace threshold, not a bound. Cancelling an
             asyncio task and then awaiting it always waits for the cancellation
             to actually complete — ``asyncio.wait_for`` is no exception, it
             cancels the inner task and then waits for it before raising
-            ``TimeoutError``. So a task that is slow to cancel still blocks its
-            canceller for as long as it takes; passing a timeout only means a
-            warning is emitted, carrying the stack the task was blocked in at the
-            moment the threshold was crossed. Turning this into a real bound
-            means letting a still-running task be orphaned, which needs a
-            generation guard on the frames it may still push — deliberately not
-            done here.
+            ``TimeoutError``. Within the threshold the task gets one delivery
+            and unbounded time to run its cleanup. Past it, a warning is
+            emitted (carrying the stack the task is blocked in) and the
+            cancellation is RE-DELIVERED periodically until the task dies:
+            ``Task.cancel()`` raises ``CancelledError`` at exactly one await
+            point, and intermediate layers can absorb it (anyio/httpcore
+            cancel scopes are known to), leaving a zombie parked at a later
+            await that no longer has a cancellation to receive — prod run 1931
+            wedged a live pipeline for 53s exactly this way. Re-delivery
+            reaps such zombies at their next await. The overall wait is still
+            unbounded: a task stuck in sync code off the event loop cannot be
+            reaped by any number of cancels.
 
         Args:
             task: The task to be cancelled.
-            timeout: Optional threshold in seconds. Exceeding it logs a warning
-                naming where the task is blocked; it does not abandon the wait.
+            timeout: Optional grace threshold in seconds. Exceeding it logs a
+                warning naming where the task is blocked and switches to
+                periodic re-cancellation; it does not abandon the wait.
         """
         name = task.get_name()
         task.cancel()
@@ -302,6 +312,9 @@ class TaskManager(BaseTaskManager):
                         f"{timeout}s (still waiting); blocked at: "
                         f"{_describe_blocked_frames(task)}"
                     )
+                while not task.done():
+                    task.cancel()
+                    await asyncio.wait({task}, timeout=_SLOW_CANCEL_RECANCEL_INTERVAL_SECS)
             await task
         except asyncio.CancelledError:
             # Here are sure the task is cancelled properly.
