@@ -512,6 +512,30 @@ class ReasoningTagGate:
         return tail
 
 
+def _append_ephemeral_user_note(params: dict, note: str) -> None:
+    """Attach a request-only instruction to ``params["messages"]``.
+
+    Merged into a trailing plain user turn (as a copy — the message dict may be
+    shared with the live context) rather than appended beside it:
+    strict-alternation chat templates (gemma3 pythonic) reject two consecutive
+    plain user turns with HTTP 400, and the Speaches 400-recovery then rebuilds
+    the request from the raw context — silently dropping the note it was meant
+    to carry. Appended as its own user message only when the history doesn't
+    end in a plain user turn.
+    """
+    messages = list(params.get("messages") or [])
+    last = messages[-1] if messages else None
+    if (
+        isinstance(last, dict)
+        and last.get("role") == "user"
+        and isinstance(last.get("content"), str)
+    ):
+        messages[-1] = {**last, "content": f"{last['content']}\n\n{note}"}
+    else:
+        messages.append({"role": "user", "content": note})
+    params["messages"] = messages
+
+
 class InterruptionMarkerGate:
     """Stateful stream filter that keeps parroted interruption notes out of visible text.
 
@@ -533,7 +557,9 @@ class InterruptionMarkerGate:
     closes is suppressed to end of stream and discarded at :meth:`flush` —
     annotation-shaped text is meta, never speech — so a note-only completion
     counts as an empty one and the empty-completion retry regenerates a real
-    reply.
+    reply. A completion that kept visible text but lost its QUESTION to the
+    gate (``suppressed_has_question``) is retried once the same way — see the
+    question-swallowed retry in ``_process_context``.
     """
 
     _OPENER = "[interrupted"
@@ -544,9 +570,12 @@ class InterruptionMarkerGate:
         self.visible_text = ""
         self.suppressed_chars = 0
         self.suppressed_preview = ""
+        self.suppressed_has_question = False
 
     def _suppress(self, text: str):
         self.suppressed_chars += len(text)
+        if "?" in text:
+            self.suppressed_has_question = True
         if len(self.suppressed_preview) < 120:
             self.suppressed_preview += text[: 120 - len(self.suppressed_preview)]
 
@@ -1187,9 +1216,43 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 "instructions or internal state, no English unless the "
                 "conversation is in English.)"
             )
-            params["messages"] = list(params.get("messages") or []) + [
-                {"role": "user", "content": nudge}
-            ]
+            _append_ephemeral_user_note(params, nudge)
+
+        # One-shot correction armed by the question-swallowed retry (and by an
+        # empty retry whose discarded note carried a question): the previous
+        # completion wrapped its real content in interruption-note notation, so
+        # the retry must be TOLD what survived and to continue in plain words —
+        # the identical context otherwise tends to reproduce the identical note
+        # (runs 2137/2139). Request-only like the nudge above, and consumed
+        # here so it can never outlive the request it was armed for. Written
+        # WITHOUT brackets so the correction itself never becomes parroting
+        # bait for the very gate that made it necessary.
+        correction_heard = getattr(self, "_marker_correction_pending", None)
+        if correction_heard is not None:
+            self._marker_correction_pending = None
+            if correction_heard:
+                correction = (
+                    "(Internal correction, invisible to the caller. Do not "
+                    "mention it or apologize for it. Part of your last reply "
+                    "copied the internal interruption-note format, so it was "
+                    "discarded and never spoken aloud. The caller has heard "
+                    f"only: “{correction_heard}”. Continue from exactly there "
+                    "without repeating those words: say the missing part in "
+                    "plain spoken words in the conversation's language, and if "
+                    "you owe the caller a question, ask it now, briefly and "
+                    "naturally. Never use square-bracket notation in a reply.)"
+                )
+            else:
+                correction = (
+                    "(Internal correction, invisible to the caller. Do not "
+                    "mention it or apologize for it. Your last reply was only "
+                    "internal interruption-note text, so it was discarded and "
+                    "never spoken aloud. Reply to the caller again in plain "
+                    "spoken words in the conversation's language, and if you "
+                    "owe the caller a question, ask it now, briefly and "
+                    "naturally. Never use square-bracket notation in a reply.)"
+                )
+            _append_ephemeral_user_note(params, correction)
 
         async def _create():
             # One reconnect retry: a transient connection blip otherwise kills
@@ -1378,12 +1441,15 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
     @traced_llm
     async def _process_context(self, context: LLMContext):
         # Stamp the wall-clock budget for this turn's whole retry ladder on the
-        # outermost generation only; the recursive empty-completion retries below
-        # re-enter this method and must share one deadline. Three retry layers
-        # (empty-completion recursion, the connection retry, and the SDK's own
-        # max_retries) otherwise multiply into minutes of dead air on a degraded
-        # server.
-        if getattr(self, "_empty_retry_depth", 0) == 0:
+        # outermost generation only; the recursive empty-completion and
+        # question-swallowed retries below re-enter this method and must share
+        # one deadline. Three retry layers (retry recursion, the connection
+        # retry, and the SDK's own max_retries) otherwise multiply into
+        # minutes of dead air on a degraded server.
+        if (
+            getattr(self, "_empty_retry_depth", 0) == 0
+            and getattr(self, "_marker_question_retry_depth", 0) == 0
+        ):
             self._turn_generation_deadline = (
                 self._generation_clock() + EMPTY_RETRY_TOTAL_BUDGET_SECS
             )
@@ -1654,6 +1720,13 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             budget_left = self._generation_budget_remaining()
             if depth < MAX_EMPTY_COMPLETION_RETRIES and budget_left > 0:
                 self._empty_retry_depth = depth + 1
+                if marker_gate.suppressed_has_question:
+                    # The note-only completion carried a question inside the
+                    # discarded note: aim the retry with the correction
+                    # instead of re-rolling blind — the same context tends to
+                    # reproduce the same note (runs 2137/2139 regenerated it
+                    # verbatim).
+                    self._marker_correction_pending = ""
                 try:
                     logger.warning(
                         f"{self}: empty completion (no visible text, no tool calls) — "
@@ -1663,6 +1736,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     await self._process_context(context)
                 finally:
                     self._empty_retry_depth -= 1
+                    self._marker_correction_pending = None
                 return
             if depth < MAX_EMPTY_COMPLETION_RETRIES:
                 # Stopped by the clock rather than the attempt count. Logged
@@ -1673,6 +1747,50 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     f"{depth + 1} attempt(s) in {EMPTY_RETRY_TOTAL_BUDGET_SECS:.1f}s; "
                     f"giving up on this turn"
                 )
+
+        # QUESTION-SWALLOWED RETRY: the marker gate stripped a parroted
+        # interruption note that carried a question, and the visible remainder
+        # asks nothing — the caller gets a bare acknowledgment and the flow
+        # dead-ends (prod runs 2137/2139: "סבבה, הבנתי" with the survey's next
+        # question inside the discarded note, twice in a row, until the caller
+        # hung up). The model's INTENT was right each time; only the envelope
+        # was fatal. So run one corrective retry under an ephemeral request-only
+        # instruction (same mechanism as the final empty-retry nudge): the
+        # already-pushed prefix has been spoken and stays, and the retry is told
+        # to continue from it — its output arrives downstream as the turn's next
+        # sentence. No tool call exempts the turn: a transition delivers the
+        # destination's opening deterministically, so nothing is owed here.
+        if (
+            not function_name
+            and not recovered
+            and visible_text.strip()
+            and "?" not in visible_text
+            and marker_gate.suppressed_has_question
+        ):
+            depth = getattr(self, "_marker_question_retry_depth", 0)
+            budget_left = self._generation_budget_remaining()
+            if depth < 1 and budget_left > 0:
+                self._marker_question_retry_depth = depth + 1
+                self._marker_correction_pending = visible_text.strip()[-160:]
+                try:
+                    logger.warning(
+                        f"{self}: marker gate swallowed this turn's question "
+                        f"(kept: {visible_text.strip()[-60:]!r}) — one corrective "
+                        f"retry ({budget_left:.1f}s of budget left)"
+                    )
+                    await self._process_context(context)
+                finally:
+                    self._marker_question_retry_depth = depth
+                    self._marker_correction_pending = None
+                return
+            logger.warning(
+                f"{self}: marker gate swallowed this turn's question — "
+                + (
+                    "correction already retried once; leaving the reply as spoken"
+                    if depth >= 1
+                    else "generation budget exhausted; leaving the reply as spoken"
+                )
+            )
 
         # What the caller actually HEARS this turn. For a recovered leaked call
         # this is the visible text minus the call syntax — the raw form ends

@@ -146,3 +146,33 @@ class TestSplitInvariance:
             out, suppressed = run_stream(chunks)
             assert out == expected_visible, f"split size {size}"
             assert suppressed == len(RUN_2022_NOTE)
+
+
+class TestSuppressedHasQuestion:
+    """The flag the question-swallowed retry keys on (runs 2137/2139)."""
+
+    def test_note_with_a_question_sets_the_flag(self):
+        gate = InterruptionMarkerGate()
+        gate.feed("סבבה, הבנתי. —\n")
+        gate.feed(RUN_2022_NOTE)
+        gate.flush()
+        assert gate.suppressed_has_question
+
+    def test_flag_survives_a_question_mark_split_across_chunks(self):
+        gate = InterruptionMarkerGate()
+        for c in ['[interrupted by the caller; unheard: "עד חמש', "?", '"]']:
+            gate.feed(c)
+        gate.flush()
+        assert gate.suppressed_has_question
+
+    def test_note_without_a_question_leaves_the_flag_unset(self):
+        gate = InterruptionMarkerGate()
+        gate.feed('[interrupted by the caller; the caller did NOT hear: "תודה"]')
+        gate.flush()
+        assert not gate.suppressed_has_question
+
+    def test_visible_question_never_sets_the_flag(self):
+        gate = InterruptionMarkerGate()
+        gate.feed("מה שלומך היום?")
+        gate.flush()
+        assert not gate.suppressed_has_question
