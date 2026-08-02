@@ -120,6 +120,9 @@ class TTSService(AIService):
         on_disconnected: Called when disconnected from the TTS service.
         on_connection_error: Called when a connection to the TTS service error occurs.
         on_tts_request: Called before a TTS request is made, with the context ID and text.
+        on_tts_zero_audio: Called when a context completes with text sent for
+            synthesis but zero audio bytes produced, with the context ID and
+            the number of characters that were sent.
 
     Example::
 
@@ -138,6 +141,10 @@ class TTSService(AIService):
         @tts.event_handler("on_tts_request")
         async def on_tts_request(tts: TTSService, context_id: str, text: str):
             logger.debug(f"TTS request: {context_id} - {text}")
+
+        @tts.event_handler("on_tts_zero_audio")
+        async def on_tts_zero_audio(tts: TTSService, context_id: str, chars_sent: int):
+            logger.warning(f"TTS returned no audio: {context_id} ({chars_sent} chars)")
     """
 
     _settings: TTSSettings
@@ -386,6 +393,11 @@ class TTSService(AIService):
         self._register_event_handler("on_disconnected")
         self._register_event_handler("on_connection_error")
         self._register_event_handler("on_tts_request")
+        self._register_event_handler("on_tts_zero_audio")
+
+        # Number of completed contexts that had text sent for synthesis but
+        # produced zero audio bytes (see _maybe_flag_zero_audio_context).
+        self._zero_audio_context_count: int = 0
 
         # Whether the TTS process is currently yielding audio frames synchronously.
         self._is_yielding_frames_synchronously = False
@@ -875,7 +887,16 @@ class TTSService(AIService):
             direction: The direction to push the frame.
         """
         # Synthesized-duration accounting (see synthesized_duration_for).
-        if isinstance(frame, TTSAudioRawFrame) and frame.audio:
+        # Post-stop silence padding is excluded: it is padding, not synthesis,
+        # and carries no context_id — accounting it under _turn_context_id
+        # would re-create a _synth_secs_by_context entry after finalization
+        # popped it, masking a later genuinely-zero-audio context that
+        # resolves to the same id (see _maybe_flag_zero_audio_context).
+        if (
+            isinstance(frame, TTSAudioRawFrame)
+            and frame.audio
+            and not getattr(frame, "_is_tts_silence_padding", False)
+        ):
             ctx = frame.context_id or self._turn_context_id
             if ctx:
                 rate = frame.sample_rate or self.sample_rate
@@ -887,6 +908,8 @@ class TTSService(AIService):
 
         # Clean up context when we see TTSStoppedFrame
         if isinstance(frame, TTSStoppedFrame) and frame.context_id:
+            # Must run before _finalize_synth_duration pops the accounting.
+            await self._maybe_flag_zero_audio_context(frame.context_id)
             self._finalize_synth_duration(frame.context_id)
             if frame.context_id in self._tts_contexts:
                 if self._tts_contexts[frame.context_id].push_assistant_aggregation:
@@ -912,12 +935,66 @@ class TTSService(AIService):
                 num_channels=1,
             )
             silence_frame.transport_destination = self._transport_destination
+            # Marker so the synth accounting above skips this padding frame.
+            silence_frame._is_tts_silence_padding = True
             await self.push_frame(silence_frame)
 
         if isinstance(frame, (TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame, TTSTextFrame)):
             frame.transport_destination = self._transport_destination
 
         await super().push_frame(frame, direction)
+
+    @property
+    def zero_audio_context_count(self) -> int:
+        """Number of completed contexts that produced zero audio bytes.
+
+        Only counts contexts where text was actually sent for synthesis (see
+        ``on_tts_zero_audio``); interrupted contexts are excluded because their
+        accounting is finalized before a ``TTSStoppedFrame`` flows through.
+
+        Returns:
+            The running count for this service instance.
+        """
+        return self._zero_audio_context_count
+
+    async def _maybe_flag_zero_audio_context(self, context_id: str) -> None:
+        """Flag a context that completed without producing any audio.
+
+        Called from ``push_frame`` when a ``TTSStoppedFrame`` for ``context_id``
+        goes by, i.e. when the provider (or the audio-context timeout) declared
+        the context finished. If text was sent for synthesis for this context
+        but no non-empty ``TTSAudioRawFrame`` was ever accounted against it, the
+        provider returned nothing and the "utterance" was pure silence — emit a
+        distinct WARNING (token: ``TTS_ZERO_AUDIO``) and fire
+        ``on_tts_zero_audio`` so applications can count these per leg.
+
+        Detection relies on the synthesized-duration accounting in
+        ``push_frame``, which attributes audio via ``frame.context_id`` (or the
+        turn context as fallback) — the same precondition
+        ``synthesized_duration_for`` already has.
+
+        This is deliberately NOT an ErrorFrame: the pipeline is healthy and the
+        turn completed; only the synthesis result was empty. Barge-in cannot
+        false-positive here: interruption finalizes the accounting without a
+        ``TTSStoppedFrame`` ever reaching this check.
+        """
+        texts = self._synth_texts_by_context.get(context_id)
+        if not texts:
+            # Nothing was sent to the provider for this context (or it was
+            # already finalized by an interruption) — nothing to flag.
+            return
+        if self._synth_secs_by_context.get(context_id, 0.0) > 0.0:
+            return
+
+        self._zero_audio_context_count += 1
+        chars_sent = sum(len(t) for t in texts)
+        logger.warning(
+            f"{self} TTS_ZERO_AUDIO: context {context_id} completed with zero audio bytes "
+            f"({len(texts)} utterance(s), {chars_sent} chars sent for synthesis) — the "
+            f"provider accepted the text but returned no audio, so this turn played silence "
+            f"(count for this service: {self._zero_audio_context_count})"
+        )
+        await self._call_event_handler("on_tts_zero_audio", context_id, chars_sent)
 
     def _finalize_synth_duration(self, context_id: str) -> None:
         """Move a finished context's synth accounting into the recent ring.

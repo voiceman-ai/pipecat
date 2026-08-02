@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import time
 import traceback
 import warnings
 from collections.abc import Awaitable, Callable
@@ -176,22 +177,32 @@ class FrameProcessorQueue(asyncio.PriorityQueue):
         return item
 
 
-# CAREFUL — these are REPORTING thresholds, not bounds, and the code below is
-# written on that assumption. `TaskManager.cancel_task` cannot abandon a cancel
-# it has started: cancelling an asyncio task and awaiting it always waits for
-# the cancellation to complete (asyncio.wait_for is no exception — it cancels
-# the inner task and then waits for it before raising TimeoutError). Crossing
-# the threshold therefore logs a warning naming the blocking frame and how long
-# the cancel really took; it does NOT orphan the task or return early. A real
-# bound would let a still-running process task push stale frames into a fresh
-# turn, so it needs a generation guard that does not exist yet.
+# CAREFUL — these are grace thresholds, not bounds. `TaskManager.cancel_task`
+# cannot abandon a cancel it has started: cancelling an asyncio task and
+# awaiting it always waits for the cancellation to complete (asyncio.wait_for
+# is no exception — it cancels the inner task and then waits for it before
+# raising TimeoutError). Crossing the threshold logs a warning naming the
+# blocking frame and switches to periodic re-cancellation (a single
+# CancelledError can be absorbed by intermediate layers, leaving a zombie a
+# later cancel still reaps), but the wait itself stays unbounded.
 #
 # The practical consequence, seen in production: a process task that takes 3s to
 # cancel serializes 3s of barge-in propagation, because an interruption cancels
-# it inline from the input task. Raising or lowering these numbers changes only
-# when you hear about it.
+# it inline from the input task. The interruption path therefore does NOT use
+# these: it bounds its inline wait with PROCESS_TASK_ORPHAN_TIMEOUT_SECS and
+# ORPHANS a task that will not die (see `_start_interruption`), so a wedged
+# cancel can no longer freeze the pipeline (prod run 1931: an absorbed cancel
+# blocked the input task for 53s and the call went silent).
 INPUT_TASK_CANCEL_TIMEOUT_SECS = 3
 PROCESS_TASK_CANCEL_TIMEOUT_SECS = 3
+
+# How long an interruption waits inline for the process task to cancel before
+# orphaning it and continuing on a fresh task. Generous next to a normal
+# cancel (sub-millisecond) yet short enough that a barge-in never freezes the
+# pipeline behind a wedged cancel. An orphaned task is barred from the frame
+# flow — its pushes are dropped and it exits at its next loop turn — and a
+# background reaper keeps re-cancelling it until it dies.
+PROCESS_TASK_ORPHAN_TIMEOUT_SECS = 1.0
 
 
 class FrameProcessor(BaseObject):
@@ -291,6 +302,22 @@ class FrameProcessor(BaseObject):
         self.__process_event: asyncio.Event | None = None
         self.__process_frame_task: asyncio.Task | None = None
         self.__process_current_frame: Frame | None = None
+
+        # Read-only diagnostics (see the `input_queue_depth`,
+        # `process_queue_depth` and `seconds_since_last_progress` properties).
+        # Monotonic time at which __process_frame last accepted a frame, or 0.0
+        # if this processor has never processed one. Deliberately NOT wired
+        # into any kill/abort decision: a wedged-before-first-turn leg must be
+        # diagnosable from a log dump without changing pipeline behavior.
+        self.__last_progress_time: float = 0.0
+
+        # Process tasks an interruption gave up on cancelling (see
+        # `_start_interruption`). Membership bars a task from the frame flow:
+        # `push_frame` drops its pushes and the handler loop exits instead of
+        # consuming queued frames. Entries are removed when the background
+        # reaper finally kills the task, so the set stays empty in healthy
+        # operation.
+        self.__orphaned_process_tasks: set[asyncio.Task] = set()
 
         # Frame processor events.
         self._register_event_handler("on_before_process_frame", sync=True)
@@ -750,6 +777,13 @@ class FrameProcessor(BaseObject):
             frame: The frame to push.
             direction: The direction to push the frame.
         """
+        # An orphaned process task may still be unwinding an in-flight frame
+        # (see __interrupt_process_task); the interruption already flushed
+        # everything it produced, so anything more it pushes is stale.
+        if self.__orphaned_process_tasks and asyncio.current_task() in self.__orphaned_process_tasks:
+            logger.debug(f"{self}: dropping {frame.name} pushed by an orphaned process task")
+            return
+
         if not self._check_started(frame):
             return
 
@@ -904,10 +938,11 @@ class FrameProcessor(BaseObject):
                 # was skipped when the queue contained an uninterruptible frame,
                 # which caused slow non-uninterruptible frames to block
                 # interruptions. Uninterruptible queued frames are safe here
-                # because __create_process_task calls __reset_process_queue
-                # internally, which always preserves them.
-                await self.__cancel_process_task()
-                self.__create_process_task()
+                # because both the fresh-task and orphan paths preserve them.
+                # Bounded: this runs inline on the input task, so a cancel that
+                # never completes must not freeze the pipeline — past the bound
+                # the old task is orphaned and a fresh one takes over.
+                await self.__interrupt_process_task()
         except Exception as e:
             await self.push_error(
                 error_msg=f"Uncaught exception handling _start_interruption: {e}",
@@ -1021,15 +1056,162 @@ class FrameProcessor(BaseObject):
         """
         return self.__process_queue.has_frame(frame_type)
 
+    #
+    # Read-only wedge diagnostics.
+    #
+    # These properties exist so a stuck pipeline can be diagnosed from a log
+    # dump (see `PipelineWorker.dump_processor_diagnostics()`): a processor
+    # whose queues grow while `seconds_since_last_progress` ages is wedged; a
+    # stale processor with empty queues simply has no traffic. None of these
+    # feed kill or abort decisions.
+    #
+
+    @property
+    def input_queue_depth(self) -> int:
+        """Number of frames waiting in this processor's input queue.
+
+        The input queue holds every queued frame (system and non-system) that
+        has not yet been dispatched by the input task. Always 0 in direct
+        mode, where frames bypass the queues entirely.
+
+        Returns:
+            The number of undispatched frames. Read-only diagnostic.
+        """
+        return self.__input_queue.qsize()
+
+    @property
+    def process_queue_depth(self) -> int:
+        """Number of non-system frames waiting in the process queue.
+
+        These frames were dispatched by the input task and are waiting for the
+        process task to pick them up (e.g. because a frame is still being
+        processed, or processing is paused).
+
+        Returns:
+            The number of waiting non-system frames. Read-only diagnostic.
+        """
+        return self.__process_queue.qsize() if self.__process_queue else 0
+
+    @property
+    def seconds_since_last_progress(self) -> float | None:
+        """Seconds since this processor last accepted a non-system frame.
+
+        The stamp is taken when a frame *enters* processing, so a processor
+        stuck inside a single frame ages here just like one that stopped
+        receiving frames; combine with the queue depths and
+        `processing_frame_name` to tell the two apart.
+
+        System frames and heartbeats do NOT refresh the stamp: system frames
+        are handled by the input task (which keeps running while the process
+        task is wedged) and heartbeats are liveness probes, so counting either
+        as progress would hide exactly the wedge this property exists to
+        expose.
+
+        Returns:
+            The age in seconds, or None if no non-system frame was ever
+            processed.
+        """
+        if self.__last_progress_time == 0.0:
+            return None
+        return time.monotonic() - self.__last_progress_time
+
+    @property
+    def processing_frame_name(self) -> str | None:
+        """Name of the non-system frame currently held by the process task.
+
+        Non-None while a frame is being processed or is parked behind
+        `pause_processing_frames()` — i.e. this names the culprit frame when a
+        processor is wedged mid-frame. System frames (processed by the input
+        task) are not tracked here.
+
+        Returns:
+            The in-flight frame's name, or None when the process task is idle.
+        """
+        frame = self.__process_current_frame
+        return frame.name if frame else None
+
+    @property
+    def is_frame_processing_paused(self) -> bool:
+        """Whether non-system frame processing is currently paused.
+
+        True between `pause_processing_frames()` and
+        `resume_processing_frames()`. A processor that stays paused forever
+        (e.g. a TTS service whose resume signal never arrived) reads as True
+        here with a growing `process_queue_depth`.
+
+        Returns:
+            True if the process task is blocked by a pause. Read-only diagnostic.
+        """
+        return self.__should_block_frames
+
     async def __cancel_process_task(self):
         """Cancel the non-system frame processing task."""
         if self.__process_frame_task:
             await self.cancel_task(self.__process_frame_task, PROCESS_TASK_CANCEL_TIMEOUT_SECS)
             self.__process_frame_task = None
 
+    async def __interrupt_process_task(self):
+        """Replace the process task for an interruption, orphaning a stuck one.
+
+        Runs inline on the input task, so the wait for the old task is bounded
+        by ``PROCESS_TASK_ORPHAN_TIMEOUT_SECS``. A task still alive past the
+        bound (typically a ``CancelledError`` absorbed inside library
+        internals — prod run 1931 froze a pipeline for 53s waiting on one) is
+        orphaned instead of awaited: it is barred from the frame flow (pushes
+        dropped, handler loop exits), the process queue is replaced so it can
+        never consume another frame, and a background reaper keeps
+        re-cancelling it until it dies. Queued uninterruptible frames survive
+        onto the replacement queue.
+        """
+        task = self.__process_frame_task
+        if task:
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=PROCESS_TASK_ORPHAN_TIMEOUT_SECS)
+            if done:
+                # Consume the outcome (normally the CancelledError) with the
+                # usual bookkeeping; the task is done, so this returns at once.
+                await self.cancel_task(task)
+            else:
+                logger.warning(
+                    f"{task.get_name()}: process task did not cancel within "
+                    f"{PROCESS_TASK_ORPHAN_TIMEOUT_SECS}s of an interruption — "
+                    f"orphaning it and continuing on a fresh task"
+                )
+                self.__orphaned_process_tasks.add(task)
+                # The handler re-reads the queue attribute each loop turn, so
+                # replace the queue: if the zombie ever loops again it exits at
+                # the orphan check, and if it is parked in get() it starves on
+                # the old queue object. Uninterruptible frames move over.
+                old_queue = self.__process_queue
+                self.__process_queue = FrameQueue(frame_getter=lambda item: item[0])
+                old_queue.reset()
+                while not old_queue.empty():
+                    self.__process_queue.put_nowait(old_queue.get_nowait())
+                self.create_task(self.__reap_orphaned_process_task(task))
+            self.__process_frame_task = None
+        self.__create_process_task()
+
+    async def __reap_orphaned_process_task(self, task: asyncio.Task):
+        """Cancel an orphaned process task until it actually dies."""
+        try:
+            await self.cancel_task(task, PROCESS_TASK_CANCEL_TIMEOUT_SECS)
+        finally:
+            self.__orphaned_process_tasks.discard(task)
+
     async def __process_frame(
         self, frame: Frame, direction: FrameDirection, callback: FrameCallback | None
     ):
+        # Progress stamp for `seconds_since_last_progress`. Taken at entry so a
+        # processor wedged inside this frame keeps aging instead of looking
+        # fresh forever. System frames are excluded: __process_frame is also
+        # called from the input task, and a live call keeps delivering system
+        # frames (e.g. InputAudioRawFrame) even while the process task is
+        # wedged inside one non-system frame — stamping them would read
+        # "fresh" during exactly the wedge this diagnostic exists to expose.
+        # Heartbeats are excluded for the same reason: they are liveness
+        # probes, not work.
+        if not isinstance(frame, (SystemFrame, HeartbeatFrame)):
+            self.__last_progress_time = time.monotonic()
         try:
             await self._call_event_handler("on_before_process_frame", frame)
 
@@ -1074,6 +1256,16 @@ class FrameProcessor(BaseObject):
     async def __process_frame_task_handler(self):
         """Handle non-system frames from the process queue."""
         while True:
+            # An orphaned task (an interruption gave up waiting for its cancel
+            # — see __interrupt_process_task) must exit here rather than touch
+            # the queue: a fresh task owns the frame flow now.
+            if (
+                self.__orphaned_process_tasks
+                and asyncio.current_task() in self.__orphaned_process_tasks
+            ):
+                logger.debug(f"{self}: orphaned process task exiting")
+                return
+
             self.__process_current_frame = None
 
             (frame, direction, callback) = await self.__process_queue.get()
