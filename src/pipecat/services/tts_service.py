@@ -887,7 +887,16 @@ class TTSService(AIService):
             direction: The direction to push the frame.
         """
         # Synthesized-duration accounting (see synthesized_duration_for).
-        if isinstance(frame, TTSAudioRawFrame) and frame.audio:
+        # Post-stop silence padding is excluded: it is padding, not synthesis,
+        # and carries no context_id — accounting it under _turn_context_id
+        # would re-create a _synth_secs_by_context entry after finalization
+        # popped it, masking a later genuinely-zero-audio context that
+        # resolves to the same id (see _maybe_flag_zero_audio_context).
+        if (
+            isinstance(frame, TTSAudioRawFrame)
+            and frame.audio
+            and not getattr(frame, "_is_tts_silence_padding", False)
+        ):
             ctx = frame.context_id or self._turn_context_id
             if ctx:
                 rate = frame.sample_rate or self.sample_rate
@@ -926,6 +935,8 @@ class TTSService(AIService):
                 num_channels=1,
             )
             silence_frame.transport_destination = self._transport_destination
+            # Marker so the synth accounting above skips this padding frame.
+            silence_frame._is_tts_silence_padding = True
             await self.push_frame(silence_frame)
 
         if isinstance(frame, (TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame, TTSTextFrame)):
