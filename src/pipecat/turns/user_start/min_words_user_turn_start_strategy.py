@@ -44,9 +44,16 @@ class MinWordsUserTurnStartStrategy(BaseUserTurnStartStrategy):
         self._bot_speaking = False
 
     async def reset(self):
-        """Reset the strategy to its initial state."""
+        """Reset per-turn state.
+
+        ``_bot_speaking`` is deliberately preserved: the turn controller resets
+        every start strategy whenever any turn opens, and no new
+        ``BotStartedSpeakingFrame`` arrives mid-utterance — clearing the flag
+        here collapsed the word gate to 1 for the rest of the bot's utterance.
+        The flag only tracks bot speech and is maintained solely by the
+        bot-started/stopped handlers.
+        """
         await super().reset()
-        self._bot_speaking = False
 
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         """Process an incoming frame to detect the start of a user turn.

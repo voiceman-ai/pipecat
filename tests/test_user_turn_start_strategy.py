@@ -506,5 +506,208 @@ class TestExternalUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(should_start)
 
 
+class TestMinWordsResetPreservesBotState(unittest.IsolatedAsyncioTestCase):
+    """``reset()`` must not collapse the word gate mid-utterance.
+
+    The controller resets every start strategy whenever any turn opens, and no
+    new ``BotStartedSpeakingFrame`` arrives mid-utterance — so a reset that
+    cleared ``_bot_speaking`` silently turned ``min_words=N`` into
+    ``min_words=1`` for the rest of the bot's utterance.
+    """
+
+    async def test_reset_preserves_bot_speaking(self):
+        strategy = MinWordsUserTurnStartStrategy(min_words=3)
+        starts = []
+
+        @strategy.event_handler("on_user_turn_started")
+        async def on_user_turn_started(strategy, params):
+            starts.append(params)
+
+        await strategy.process_frame(BotStartedSpeakingFrame())
+        await strategy.reset()
+
+        self.assertTrue(strategy._bot_speaking)
+
+        # One word while the bot still speaks must NOT open the turn.
+        await strategy.process_frame(
+            InterimTranscriptionFrame(text="כן", user_id="u", timestamp="")
+        )
+        self.assertEqual(starts, [])
+
+        # Three words still do.
+        await strategy.process_frame(
+            InterimTranscriptionFrame(text="רגע יש לי", user_id="u", timestamp="")
+        )
+        self.assertEqual(len(starts), 1)
+
+    async def test_reset_after_bot_stopped_keeps_single_word_start(self):
+        strategy = MinWordsUserTurnStartStrategy(min_words=3)
+        starts = []
+
+        @strategy.event_handler("on_user_turn_started")
+        async def on_user_turn_started(strategy, params):
+            starts.append(params)
+
+        await strategy.process_frame(BotStartedSpeakingFrame())
+        await strategy.process_frame(BotStoppedSpeakingFrame())
+        await strategy.reset()
+
+        await strategy.process_frame(
+            TranscriptionFrame(text="כן", user_id="u", timestamp="")
+        )
+        self.assertEqual(len(starts), 1)
+
+
+DEBOUNCE_SECS = 0.05
+PAST_DEBOUNCE = DEBOUNCE_SECS + 0.05
+
+
+class TestBargeInDebounce(unittest.IsolatedAsyncioTestCase):
+    """``extra_voiced_secs``: a barge-in must sustain before it is honored."""
+
+    def _build(self, extra_voiced_secs: float = DEBOUNCE_SECS, **kwargs):
+        strategy = VADUserTurnStartStrategy(
+            extra_voiced_secs=extra_voiced_secs, **kwargs
+        )
+        starts = []
+
+        @strategy.event_handler("on_user_turn_started")
+        async def on_user_turn_started(strategy, params):
+            starts.append(params)
+
+        return strategy, starts
+
+    async def test_zero_hold_is_unchanged(self):
+        strategy, starts = self._build(extra_voiced_secs=0.0)
+
+        await strategy.process_frame(BotStartedSpeakingFrame())
+        result = await strategy.process_frame(VADUserStartedSpeakingFrame())
+
+        self.assertEqual(result, ProcessFrameResult.STOP)
+        self.assertEqual(len(starts), 1)
+
+    async def test_onset_is_held_not_honored_immediately(self):
+        strategy, starts = self._build()
+
+        await strategy.process_frame(BotStartedSpeakingFrame())
+        result = await strategy.process_frame(VADUserStartedSpeakingFrame())
+
+        self.assertEqual(result, ProcessFrameResult.CONTINUE)
+        self.assertEqual(starts, [])
+        self.assertIsNotNone(strategy._debounce_at)
+
+    async def test_sustained_onset_is_honored_after_the_hold(self):
+        strategy, starts = self._build()
+
+        await strategy.process_frame(BotStartedSpeakingFrame())
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await asyncio.sleep(PAST_DEBOUNCE)
+        result = await strategy.process_frame(audio_tick())
+
+        self.assertEqual(len(starts), 1)
+        # The frame that ticked the clock is not ours to consume.
+        self.assertEqual(result, ProcessFrameResult.CONTINUE)
+
+    async def test_short_burst_never_interrupts(self):
+        """The filter working: cough/backchannel ends before the hold elapses."""
+        strategy, starts = self._build()
+
+        await strategy.process_frame(BotStartedSpeakingFrame())
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(PAST_DEBOUNCE)
+        await strategy.process_frame(audio_tick())
+
+        self.assertEqual(starts, [])
+        self.assertEqual(strategy.false_starts, 1)
+
+    async def test_bot_stopping_releases_the_hold_as_a_turn(self):
+        """Delay a barge-in, never lose the user turn."""
+        strategy, starts = self._build()
+
+        await strategy.process_frame(BotStartedSpeakingFrame())
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(BotStoppedSpeakingFrame())
+
+        self.assertEqual(len(starts), 1)
+        self.assertIsNone(strategy._debounce_at)
+
+    async def test_bot_idle_onset_is_instant(self):
+        """The hold only applies to barge-ins, never to normal turn-taking."""
+        strategy, starts = self._build()
+
+        result = await strategy.process_frame(VADUserStartedSpeakingFrame())
+
+        self.assertEqual(result, ProcessFrameResult.STOP)
+        self.assertEqual(len(starts), 1)
+
+    async def test_reset_clears_a_pending_hold_but_keeps_bot_state(self):
+        strategy, starts = self._build()
+
+        await strategy.process_frame(BotStartedSpeakingFrame())
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.reset()
+
+        self.assertIsNone(strategy._debounce_at)
+        self.assertTrue(strategy._bot_speaking)
+
+
+class TestConfirmWordsMode(unittest.IsolatedAsyncioTestCase):
+    """``confirm_words``: while the bot speaks, only words open the turn."""
+
+    def _build(self):
+        strategy = VADUserTurnStartStrategy(confirm_words=True)
+        starts = []
+
+        @strategy.event_handler("on_user_turn_started")
+        async def on_user_turn_started(strategy, params):
+            starts.append(params)
+
+        return strategy, starts
+
+    async def test_vad_never_opens_the_turn_while_bot_speaks(self):
+        strategy, starts = self._build()
+
+        await strategy.process_frame(BotStartedSpeakingFrame())
+        result = await strategy.process_frame(VADUserStartedSpeakingFrame())
+
+        self.assertEqual(result, ProcessFrameResult.CONTINUE)
+        self.assertEqual(starts, [])
+        # Nothing pending either: words own the decision entirely.
+        self.assertIsNone(strategy._debounce_at)
+        self.assertIsNone(strategy._deferred_at)
+
+    async def test_vad_still_opens_the_turn_while_bot_is_silent(self):
+        strategy, starts = self._build()
+
+        result = await strategy.process_frame(VADUserStartedSpeakingFrame())
+
+        self.assertEqual(result, ProcessFrameResult.STOP)
+        self.assertEqual(len(starts), 1)
+
+    async def test_min_words_behind_it_still_interrupts(self):
+        """The controller walks past the VAD strategy to MinWords, which fires."""
+        vad, vad_starts = self._build()
+        min_words = MinWordsUserTurnStartStrategy(min_words=2)
+        mw_starts = []
+
+        @min_words.event_handler("on_user_turn_started")
+        async def on_user_turn_started(strategy, params):
+            mw_starts.append(params)
+
+        for s in (vad, min_words):
+            await s.process_frame(BotStartedSpeakingFrame())
+
+        self.assertEqual(
+            await vad.process_frame(VADUserStartedSpeakingFrame()),
+            ProcessFrameResult.CONTINUE,
+        )
+        await min_words.process_frame(
+            InterimTranscriptionFrame(text="רגע רגע", user_id="u", timestamp="")
+        )
+        self.assertEqual(vad_starts, [])
+        self.assertEqual(len(mw_starts), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
