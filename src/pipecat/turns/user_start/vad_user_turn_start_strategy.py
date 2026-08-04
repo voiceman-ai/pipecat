@@ -34,6 +34,16 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
     off. The veto only ever delays or drops the VAD-driven turn start; it never
     mutes audio and never blocks another start strategy from opening the turn.
 
+    Two additional gates apply only while the bot is speaking (turn-taking
+    while the bot is silent is never delayed):
+
+    - ``extra_voiced_secs`` requires the onset to *sustain* that much longer
+      before it is honored as a barge-in. A burst that ends before the hold
+      elapses (cough, backchannel the VAD caught) never interrupts at all.
+    - ``confirm_words`` hands the barge-in decision to the transcript-driven
+      strategies behind this one entirely: VAD alone never cuts the bot off,
+      words do.
+
     """
 
     def __init__(
@@ -41,6 +51,8 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
         *,
         barge_in_gate: Callable[[], bool] | None = None,
         defer_max_secs: float = 1.2,
+        extra_voiced_secs: float = 0.0,
+        confirm_words: bool = False,
         **kwargs,
     ):
         """Initialize the VAD user turn start strategy.
@@ -55,11 +67,23 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
             defer_max_secs: How long a deferral may stand before the gate is
                 consulted again. Not a deadline after which the turn starts
                 unconditionally — see :meth:`_resolve_deferral`.
+            extra_voiced_secs: Additional sustained-voice time, beyond the VAD
+                analyzer's own ``start_secs``, required before a VAD onset is
+                honored as a barge-in while the bot is speaking. ``0.0`` (the
+                default) keeps the historical instant behaviour. Ends of speech
+                and end of the bot utterance both resolve a pending hold — the
+                former by dropping it, the latter by opening the turn.
+            confirm_words: When True, a VAD onset never opens the turn while
+                the bot is speaking; only a transcript-driven strategy (e.g.
+                min-words) may. VAD keeps opening turns instantly while the bot
+                is silent.
             **kwargs: Additional keyword arguments.
         """
         super().__init__(**kwargs)
         self._barge_in_gate = barge_in_gate
         self._defer_max_secs = defer_max_secs
+        self._extra_voiced_secs = extra_voiced_secs
+        self._confirm_words = confirm_words
 
         # Bot speech state. Tracked here (rather than read from the controller)
         # because deferral is only ever legitimate while the bot has something
@@ -69,6 +93,14 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
         # Monotonic timestamp of the pending deferral, or None when no VAD
         # onset is currently being held back.
         self._deferred_at: float | None = None
+
+        # Monotonic timestamp of the pending sustain-hold (extra_voiced_secs),
+        # or None when no onset is being debounced.
+        self._debounce_at: float | None = None
+
+        # Onsets that ended before the sustain-hold elapsed, i.e. barge-ins
+        # this strategy filtered out. Exposed for tests and diagnostics.
+        self.false_starts = 0
 
         # Set once a deferral has survived its re-consultation: the gate is warm
         # and still says "far", so this bot utterance is protected to its end.
@@ -89,6 +121,7 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
         """
         await super().reset()
         self._deferred_at = None
+        self._debounce_at = None
 
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         """Process an incoming frame to detect user turn start.
@@ -117,6 +150,15 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
             # the span ended, find the gate cold ("not far" by fail-open) and
             # open a user turn out of nowhere, a full second after silence.
             self._deferred_at = None
+            if self._debounce_at is not None:
+                # The onset ended before the sustain-hold elapsed: this is the
+                # filter working — a burst too short to be a real barge-in.
+                self._debounce_at = None
+                self.false_starts += 1
+                logger.debug(
+                    f"{self} dropping barge-in: onset ended before sustaining "
+                    f"{self._extra_voiced_secs:.2f}s"
+                )
             return ProcessFrameResult.CONTINUE
 
         # Any other frame is just a clock tick. The user aggregator forwards
@@ -125,11 +167,21 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
         # this strategy having to own a timer task.
         if self._deferred_at is not None:
             return await self._maybe_resolve_deferral()
+        if self._debounce_at is not None:
+            return await self._maybe_resolve_debounce()
 
         return ProcessFrameResult.CONTINUE
 
     async def _handle_vad_user_started_speaking(self) -> ProcessFrameResult:
-        """Start the user turn, unless the onset is vetoed as far-field."""
+        """Start the user turn, unless a bot-speaking gate holds it back."""
+        if self._bot_speaking and self._confirm_words:
+            # Words decide barge-in on this pipeline. CONTINUE without
+            # triggering (see the far-field comment below for why triggering
+            # with interruptions disabled is not an option) — the min-words
+            # strategy behind us opens the turn on transcribed words.
+            logger.debug(f"{self} leaving barge-in to the word-confirm strategy")
+            return ProcessFrameResult.CONTINUE
+
         if self._bot_speaking and self._gate_says_far():
             # CONTINUE *without* triggering is the entire design. Triggering
             # with interruptions disabled would still flip the controller's
@@ -146,7 +198,19 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
                 )
             return ProcessFrameResult.CONTINUE
 
+        if self._bot_speaking and self._extra_voiced_secs > 0:
+            # Near-field (or ungated) onset while the bot speaks: require it to
+            # sustain before it counts as a barge-in. Re-arm only if no hold is
+            # already pending — VAD may re-fire within one span.
+            if self._debounce_at is None:
+                self._debounce_at = time.monotonic()
+                logger.debug(
+                    f"{self} holding barge-in for {self._extra_voiced_secs:.2f}s of sustained voice"
+                )
+            return ProcessFrameResult.CONTINUE
+
         self._deferred_at = None
+        self._debounce_at = None
         await self.trigger_user_turn_started()
         return ProcessFrameResult.STOP
 
@@ -155,12 +219,13 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
         self._bot_speaking = False
         self._holding_utterance = False
 
-        if self._deferred_at is not None:
-            # The bot finished on its own, so the deferral did its job. Open the
+        if self._deferred_at is not None or self._debounce_at is not None:
+            # The bot finished on its own, so the hold did its job. Open the
             # turn now rather than dropping it: this strategy is only allowed to
             # delay a barge-in, never to lose a user turn that today's code
             # would have created.
             self._deferred_at = None
+            self._debounce_at = None
             await self.trigger_user_turn_started()
 
         # Always CONTINUE, even after triggering. BotStoppedSpeakingFrame is
@@ -200,6 +265,25 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
         # CONTINUE rather than STOP: the turn is already open, and this frame is
         # not ours to consume — it is whatever ordinary frame happened to tick
         # the clock.
+        return ProcessFrameResult.CONTINUE
+
+    async def _maybe_resolve_debounce(self) -> ProcessFrameResult:
+        """Honor the barge-in once the onset has sustained extra_voiced_secs.
+
+        Reaching here means no ``VADUserStoppedSpeakingFrame`` arrived since the
+        onset — the caller is still talking, so this is a real barge-in that we
+        are honoring ``extra_voiced_secs`` late.
+        """
+        debounce_at = self._debounce_at
+        if debounce_at is None or (time.monotonic() - debounce_at) < self._extra_voiced_secs:
+            return ProcessFrameResult.CONTINUE
+
+        self._debounce_at = None
+        logger.debug(f"{self} releasing barge-in: onset sustained past the hold")
+        await self.trigger_user_turn_started()
+
+        # CONTINUE rather than STOP: the frame that ticked the clock is not
+        # ours to consume (same as deferral resolution above).
         return ProcessFrameResult.CONTINUE
 
     def _gate_says_far(self) -> bool:
