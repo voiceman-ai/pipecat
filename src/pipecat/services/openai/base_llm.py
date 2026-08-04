@@ -551,18 +551,20 @@ class InterruptionMarkerGate:
     argument that made :class:`ReasoningTagGate` stateful.
 
     Feed the reasoning-gated deltas through :meth:`feed`; push only what comes
-    back. A span opening with ``[interrupted`` (any casing) is suppressed
+    back. A span opening with any of the known note openers — ``[interrupted``
+    in any casing, or the Hebrew shapes a Hebrew-emitting model parrots the
+    same pattern into (``[נקטע``, ``[קטיעה``, ``[הופסק``) — is suppressed
     through its closing ``]``. A chunk-final fragment that could still grow
-    into the opener (``"[interr"``) is held until decidable. A span that never
-    closes is suppressed to end of stream and discarded at :meth:`flush` —
-    annotation-shaped text is meta, never speech — so a note-only completion
-    counts as an empty one and the empty-completion retry regenerates a real
-    reply. A completion that kept visible text but lost its QUESTION to the
-    gate (``suppressed_has_question``) is retried once the same way — see the
-    question-swallowed retry in ``_process_context``.
+    into an opener (``"[interr"``, ``"[נק"``) is held until decidable. A span
+    that never closes is suppressed to end of stream and discarded at
+    :meth:`flush` — annotation-shaped text is meta, never speech — so a
+    note-only completion counts as an empty one and the empty-completion retry
+    regenerates a real reply. A completion that kept visible text but lost its
+    QUESTION to the gate (``suppressed_has_question``) is retried once the same
+    way — see the question-swallowed retry in ``_process_context``.
     """
 
-    _OPENER = "[interrupted"
+    _OPENERS = ("[interrupted", "[נקטע", "[קטיעה", "[הופסק")
 
     def __init__(self):
         self._mode = "pass"
@@ -599,18 +601,22 @@ class InterruptionMarkerGate:
                 self._buf = self._buf[close + 1 :]
                 self._mode = "pass"
                 continue
-            start = self._buf.lower().find(self._OPENER)
+            lowered = self._buf.lower()
+            start = min(
+                (s for s in (lowered.find(o) for o in self._OPENERS) if s != -1),
+                default=-1,
+            )
             if start != -1:
                 out.append(self._buf[:start])
                 self._buf = self._buf[start:]
                 self._mode = "suppress"
                 continue
-            # Hold a chunk-final fragment that could still grow into the
-            # opener ("[", "[interr", …): committing it now would leak the
-            # note's head once the next delta completes the word.
+            # Hold a chunk-final fragment that could still grow into an
+            # opener ("[", "[interr", "[נק", …): committing it now would leak
+            # the note's head once the next delta completes the word.
             hold = len(self._buf)
             i = self._buf.rfind("[")
-            if i != -1 and self._OPENER.startswith(self._buf[i:].lower()):
+            if i != -1 and any(o.startswith(lowered[i:]) for o in self._OPENERS):
                 hold = i
             out.append(self._buf[:hold])
             self._buf = self._buf[hold:]
@@ -642,7 +648,8 @@ class InterruptionMarkerGate:
 # shape, in any language, so the pattern cannot swallow real speech.
 _META_ASIDE_CUE_RE = re.compile(
     r"\(\s*\**\s*"
-    r"(?:note|nb|internal|system|meta|aside|reminder|instructions?|thought)\b"
+    r"(?:note|nb|internal|system|meta|aside|reminder|instructions?|thought"
+    r"|הערה|הערת|פנימי|מערכת|תזכורת|הוראות|הוראה|מחשבה)\b"
     r"[^)\n]{0,40}?:",
     re.IGNORECASE,
 )

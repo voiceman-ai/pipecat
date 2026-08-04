@@ -142,3 +142,35 @@ class TestSuppression:
     def test_speech_after_an_aside_still_streams(self):
         out, _ = run_stream(["היי. (Note: meta.) ", "איך אפשר לעזור?"])
         assert out == "היי.  איך אפשר לעזור?"
+
+
+class TestHebrewAsides:
+    """Hebrew-labelled asides are the same leak in the platform's own language."""
+
+    def test_hebrew_system_note_is_suppressed(self):
+        out, _ = run_stream(["בסדר גמור. *(הערה למערכת: יש לעבור לשלב הבא)*"])
+        assert out == "בסדר גמור. "
+
+    def test_hebrew_plain_note_is_suppressed(self):
+        out, _ = run_stream(["(הערה: המתקשר נשמע מהוסס) נמשיך?"])
+        assert out.strip() == "נמשיך?"
+
+    def test_hebrew_thought_label_is_suppressed(self):
+        out, _ = run_stream(["טוב. (מחשבה: כדאי לעבור לשאלה הבאה עכשיו)"])
+        assert out == "טוב. "
+
+    def test_hebrew_aside_split_across_chunks(self):
+        out, _ = run_stream(["כן. *(הער", "ה למערכת: לעבור לשלב 3)* אז נתקדם."])
+        assert out == "כן.  אז נתקדם."
+
+    def test_ordinary_hebrew_parens_pass(self):
+        out, suppressed = run_stream(["זה עולה (בערך) שישים שקלים"])
+        assert out == "זה עולה (בערך) שישים שקלים"
+        assert suppressed == 0
+
+    def test_hebrew_parens_with_late_colon_pass(self):
+        # A paren whose head is not a meta label must stream even with a colon
+        # later in the sentence.
+        out, suppressed = run_stream(["(כמו שאמרתי: נדבר מחר) בסדר?"])
+        assert out == "(כמו שאמרתי: נדבר מחר) בסדר?"
+        assert suppressed == 0

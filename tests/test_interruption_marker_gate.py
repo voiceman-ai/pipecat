@@ -176,3 +176,46 @@ class TestSuppressedHasQuestion:
         gate.feed("מה שלומך היום?")
         gate.flush()
         assert not gate.suppressed_has_question
+
+
+class TestHebrewOpeners:
+    """A Hebrew-emitting model parrots the note in Hebrew; the gate must catch it."""
+
+    def test_hebrew_note_is_suppressed_whole(self):
+        out, suppressed = run_stream(
+            ['סבבה. [נקטע על ידי המתקשר; המתקשר לא שמע את ההמשך: "מה דעתך?"]']
+        )
+        assert out == "סבבה. "
+        assert suppressed > 0
+
+    def test_hebrew_note_split_across_chunks(self):
+        out, _ = run_stream(["בסדר. [נק", "טע על ידי המתקשר: ", 'ההמשך"] נמשיך.'])
+        assert out == "בסדר.  נמשיך."
+
+    def test_hebrew_feminine_inflection_matches_by_prefix(self):
+        out, _ = run_stream(["רגע. [נקטעה השיחה על ידי המתקשר] טוב."])
+        assert out == "רגע.  טוב."
+
+    def test_hebrew_interruption_word_variant(self):
+        out, _ = run_stream(['[קטיעה: המתקשר לא שמע: "שאלה?"]'])
+        assert out == ""
+
+    def test_unclosed_hebrew_note_discarded_at_flush(self):
+        gate = InterruptionMarkerGate()
+        emitted = gate.feed("[הופסק על ידי המתקשר; ההמשך שלא נשמע")
+        emitted += gate.flush()
+        assert emitted == ""
+        assert gate.suppressed_chars > 0
+
+    def test_ordinary_hebrew_bracket_sharing_a_prefix_survives(self):
+        # "[נושא חשוב]" shares the "[נ" head with "[נקטע": it may be held one
+        # delta, but must come out untouched.
+        out, suppressed = run_stream(["זה [נו", "שא חשוב] בעיניי"])
+        assert out == "זה [נושא חשוב] בעיניי"
+        assert suppressed == 0
+
+    def test_hebrew_question_swallowed_sets_the_flag(self):
+        gate = InterruptionMarkerGate()
+        gate.feed('כן. [נקטע: "מה המספר שלך?"]')
+        gate.flush()
+        assert gate.suppressed_has_question
