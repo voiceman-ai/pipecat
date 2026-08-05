@@ -1328,6 +1328,16 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         params.update(self._settings.extra)
 
+        # `extra` outlives the request that justified it: a routing node parks
+        # tool_choice="required" there, and the next completion built through
+        # here may carry NO tools at all (run_inference — extraction/realign/
+        # attribution — and any node whose function list is empty). OpenAI
+        # tolerates the orphan tool_choice; Google's OpenAI-compat endpoint
+        # 400s the whole request ("When using `tool_choice`, `tools` must be
+        # set"), silently killing the extraction. No tools → no tool_choice.
+        if not params.get("tools"):
+            params.pop("tool_choice", None)
+
         return params
 
     async def run_inference(
