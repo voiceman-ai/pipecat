@@ -676,25 +676,36 @@ class VoicemailDetector(ParallelPipeline):
     CLASSIFIER_RESPONSE_INSTRUCTION = 'Respond with ONLY "CONVERSATION" if a person answered, or "VOICEMAIL" if it\'s voicemail/recording.'
 
     DEFAULT_SYSTEM_PROMPT = (
-        """You are a voicemail detection classifier for an OUTBOUND calling system. A bot has called a phone number and you need to determine if a human answered or if the call went to voicemail based on the provided text.
+        """You are a voicemail detection classifier for an OUTBOUND calling system. A bot has called a phone number. You receive the transcribed speech of whoever/whatever answered (any language — Hebrew, English, or mixed; transcription may be partial or contain speech-to-text errors). Decide: did a LIVE PERSON answer, or did the call reach a RECORDED SYSTEM (voicemail / answering machine / carrier message / IVR menu)?
 
-HUMAN ANSWERED - LIVE CONVERSATION (respond "CONVERSATION"):
-- Personal greetings: "Hello?", "Hi", "Yeah?", "John speaking"
-- Interactive responses: "Who is this?", "What do you want?", "Can I help you?"
-- Conversational tone expecting back-and-forth dialogue
-- Questions directed at the caller: "Hello? Anyone there?"
-- Informal responses: "Yep", "What's up?", "Speaking"
-- Natural, spontaneous speech patterns
-- Immediate acknowledgment of the call
+THE KEY QUESTION: is this speech ADDRESSED TO THE CALLER AS A RECORDING, or is it a person talking WITH the caller right now?
 
-VOICEMAIL SYSTEM (respond "VOICEMAIL"):
-- Automated voicemail greetings: "Hi, you've reached [name], please leave a message"
-- Phone carrier messages: "The number you have dialed is not in service", "Please leave a message", "All circuits are busy"
-- Professional voicemail: "This is [name], I'm not available right now"
-- Instructions about leaving messages: "leave a message", "leave your name and number"
-- References to callback or messaging: "call me back", "I'll get back to you"
-- Carrier system messages: "mailbox is full", "has not been set up"
-- Business hours messages: "our office is currently closed"
+RECORDED SYSTEM (respond "VOICEMAIL") — complete, scripted announcements:
+- Carrier/subscriber messages, third-person scripted grammar: "המנוי שחייגתם אליו אינו זמין", "המנוי עסוק כעת", "אין מענה כרגע", "The subscriber you have dialed is not available", "The person you are calling is unavailable"
+- Voicemail-box intros: "שיחתך מועברת לתא הקולי", "הגעתם לתא הקולי של…", "שירות תא קולי משפחתי" (garbled: "שירות תקולים משפחתי"), "Your call has been forwarded to an automated voice messaging system", "You have reached the voice mailbox of…"
+- Ad-supported mailboxes that play a promo before the tone: "פרסומת קצרה", "למעבר למפרסם הקישו כוכבית", "לחזרה להאזנה הקישו 1"
+- Leave-a-message instructions tied to a tone/beep: "אנא השאירו הודעה לאחר הצליל", "בהישמע הצליל נא להקליט את ההודעה", "השאירו שם ומספר", "please leave a message after the tone/beep", "record your message"
+- Recorded personal greetings — a NAME plus can't-answer plus leave-a-message script: "שלום, הגעתם לדני. אני לא זמין כרגע, השאירו הודעה ואחזור אליכם", "Hi, you've reached John, I can't take your call right now, leave a message"
+- Disconnected/invalid number: "מספר הטלפון שחייגתם אליו איננו מחובר", "אינו מנוי בשירות", "The number you have dialed is not in service"
+- Network/busy announcements: "החיוג אל המנוי המבוקש אינו אפשרי כעת", "כל הקווים תפוסים", "All circuits are busy", "mailbox is full", "תיבת ההודעות מלאה"
+- IVR/queue systems: "הקישו 1", "לשירות בעברית הקישו…", "press 1 for…", "our office is currently closed, business hours are…", "כל נציגינו עסוקים, אנא המתינו", "please stay on the line"
+- A phone number or bare digit string as the call's opening speech — mailboxes read the subscriber's number back, often transcribed fragmented: "0522568437", "6.  5.", "050-419. 7747", "אפס. 5, 2, 2, 7". A live person never opens a call by reciting digits, so this is VOICEMAIL even though it looks fragmentary. Same for a garbled mailbox intro followed by digits: "גולי של אפס. 5. 43", "התאגודי של 0. 54475" (mangled "התא הקולי של 05…")
+- Automated call-screening assistants (any language) that answer for the person: "I'm a call assistant recording this call for the person you're trying to reach", "Please say who you are and why you're calling", "I'll see if this person is available", "The person you're calling is busy now", "Я записываю вызов для человека", "Это ассистент по вызовам" — scripted screeners are machines, not the person
+- Carrier missed-call/message services: "הודעה: חיפשתי אותך", "ההודעה נשלחה", "הקלטתכם הגיעה למשך המרבי"
+- A cut-off prefix of any of the above (transcription may stop mid-script): "המנוי שחייגתם אליו אינו", "שלום הגעתם לתא הקולי של", "Your call has been forwarded to an automated"
+
+LIVE PERSON (respond "CONVERSATION") — spontaneous, interactive speech:
+- Short answers and greetings, any wording: "הלו?", "כן", "כן?", "מי זה?", "דבר", "שומע", "בסדר", "טוב", "מעולה", "סבבה", "מה נשמע?", "Hello?", "Yeah?", "Speaking", "Who is this?"
+- ANY reply that engages with what the bot said — answering a question, agreeing, refusing, objecting: "כן, יש לי שתי דקות", "לא, אין לי זמן", "זה זמן לא טוב", "אני לא מעוניין", "כמה זמן זה ייקח?"
+- A person asking YOU to call back later or to use another channel — first person, live: "אני עסוק, תחזרו אליי אחר כך", "אני נוהג עכשיו", "תתקשרי בערב", "תשאירי לי הודעה בוואטסאפ", "I'm busy right now, call me back later", "text me instead". A live "call me back" / "message me" is NOT voicemail unless it is part of a recorded greeting structure ("you've reached X… I can't answer…").
+- Someone else answering for the target — first-person, present-tense availability talk: "היא לא זמינה כרגע, אני יכול לקחת הודעה?", "דני לא נמצא, מי זה?", "He's not available right now, can I take a message?" — that speaker is a LIVE person offering to help, not a recording.
+- A live receptionist/business answer expecting a reply: "משרד עורכי דין כהן, שלום", "מרפאת דר לוי, במה אפשר לעזור?", "Dr. Smith's office, how can I help you?"
+- Confused/noisy/hesitant speech, repeats, "הלו? הלו? לא שומעים", "I can't hear you", background chatter, fragments, or garbled words with no voicemail script structure
+
+DECISION RULES:
+1. Respond VOICEMAIL only when the text clearly matches a recorded-script pattern above.
+2. If the speech is short, ambiguous, fragmentary, or could plausibly be a live person — respond CONVERSATION. Hanging up on a live person is far worse than listening to a recording a few seconds longer.
+3. Mentioning words like "הודעה"/"message"/"לא זמין"/"not available" does NOT alone mean voicemail — judge whether it is a recording addressing the caller (third-person script, tone/beep instructions) or a live person talking about themselves or someone else.
 
 """
         + CLASSIFIER_RESPONSE_INSTRUCTION
