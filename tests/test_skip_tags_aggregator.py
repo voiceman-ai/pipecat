@@ -20,14 +20,15 @@ class TestSkipTagsAggregator(unittest.IsolatedAsyncioTestCase):
         text = "Hello Pipecat!"
         results = [agg async for agg in self.aggregator.aggregate(text)]
 
-        # Should still be waiting for lookahead after "!"
-        self.assertEqual(len(results), 0)
-
-        # Flush to get the pending sentence
-        result = await self.aggregator.flush()
-        self.assertEqual(result.text, "Hello Pipecat!")
-        self.assertEqual(result.type, "sentence")
+        # Fast-opener: the first chunk of a turn is emitted immediately on a
+        # strong ender ("!"), no lookahead needed.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].text, "Hello Pipecat!")
+        self.assertEqual(results[0].type, "sentence")
         self.assertEqual(self.aggregator.text.text, "")
+
+        # Nothing left pending after the immediate emit
+        self.assertIsNone(await self.aggregator.flush())
 
     async def test_basic_tags(self):
         await self.aggregator.reset()

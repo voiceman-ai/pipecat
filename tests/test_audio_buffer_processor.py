@@ -201,17 +201,20 @@ class TestSilenceInjectionGuards(unittest.IsolatedAsyncioTestCase):
           1. User sends 4 bytes  (bot not speaking → normal sync, no-op since bot is at 0)
           2. Bot starts speaking
           3. User sends 4 more bytes  (bot speaking → sync skipped; bot stays at 0)
-          4. Bot sends 4 bytes of known audio
+          4. Bot sends known audio
 
-        Expected final bot track (8 bytes total after _align_track_buffers at flush):
-          [bot_audio][silence_padding]  ← audio first, silence only at the end
+        Expected final bot track: bot audio at the very start. The first 20 ms of
+        a new utterance are faded in, so the audio payload is longer than the fade
+        window and the byte-exact check targets the unfaded remainder.
 
         With the bug the bot track would be:
           [silence_injected_mid_stream][bot_audio]  ← silence inserted before the audio
         """
         p = await _make_processor()
 
-        bot_audio = b"\xaa\xbb\xcc\xdd"
+        # 1000 bytes ≈ 31 ms at 16 kHz mono — longer than the 20 ms fade-in window.
+        fade_bytes = int(16000 * 0.020) * 2
+        bot_audio = b"\xaa\xbb\xcc\xdd" * 250
 
         await p.process_frame(
             InputAudioRawFrame(audio=b"\x01\x02\x03\x04", sample_rate=16000, num_channels=1),
@@ -230,9 +233,11 @@ class TestSilenceInjectionGuards(unittest.IsolatedAsyncioTestCase):
         _, bot_track = await _capture_track_audio(p)
         await p.cleanup()
 
-        # Audio must appear at the beginning of the bot track (not after injected silence).
-        self.assertEqual(bot_track[:4], bot_audio)
-        self.assertEqual(bot_track[4:], b"\x00" * 4)
+        # Audio must occupy the beginning of the bot track (not sit after injected
+        # silence). The first 20 ms are faded in, so compare the unfaded remainder
+        # at its expected position.
+        self.assertEqual(len(bot_track), len(bot_audio))
+        self.assertEqual(bot_track[fade_bytes : len(bot_audio)], bot_audio[fade_bytes:])
 
     async def test_no_silence_injected_into_user_buffer_while_user_speaking(self):
         """User audio must appear at the start of the user track, not after mid-stream silence.
@@ -415,7 +420,9 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
     async def test_silence_proportional_to_mute_gap(self):
         """A 1-second mute gap must insert ~1 second of silence before the new audio."""
         p = await _make_processor()
-        audio = b"\x01\x02\x03\x04"
+        # 1000 bytes ≈ 31 ms — longer than the 20 ms fade-in applied after a gap.
+        audio = b"\x01\x02\x03\x04" * 250
+        fade_bytes = int(16000 * 0.020) * 2
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             p._last_user_buffer_update_time = 0.0
@@ -427,8 +434,10 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(p._user_audio_buffer), expected_silence + len(audio))
         # Silence prefix.
         self.assertEqual(bytes(p._user_audio_buffer[:expected_silence]), b"\x00" * expected_silence)
-        # Audio at the end.
-        self.assertEqual(bytes(p._user_audio_buffer[-len(audio) :]), audio)
+        # Audio at the end; its first 20 ms are faded in, so compare the unfaded tail.
+        self.assertEqual(
+            bytes(p._user_audio_buffer[-(len(audio) - fade_bytes) :]), audio[fade_bytes:]
+        )
         await p.cleanup()
 
     async def test_two_utterances_separated_by_mute_have_silence_gap(self):
@@ -439,7 +448,9 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
         one continuous utterance.
         """
         p = await _make_processor()
-        utterance = b"\x11\x22\x33\x44"
+        # 1000 bytes ≈ 31 ms — longer than the 20 ms crossfade at silence boundaries.
+        utterance = b"\x11\x22\x33\x44" * 250
+        fade_bytes = int(16000 * 0.020) * 2
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             # Utterance 1 is already in the buffer at t=0.
@@ -453,11 +464,18 @@ class TestMuteGapSilenceInsertion(unittest.IsolatedAsyncioTestCase):
 
         # Must be longer than both utterances back-to-back (the bug).
         self.assertGreater(len(p._user_audio_buffer), len(utterance) * 2)
-        # Utterance 1 at the start.
-        self.assertEqual(bytes(p._user_audio_buffer[: len(utterance)]), utterance)
-        # Utterance 2 at the end.
-        self.assertEqual(bytes(p._user_audio_buffer[-len(utterance) :]), utterance)
-        # Everything in between must be silence.
+        # Utterance 1 at the start; its last 20 ms are faded out before the gap,
+        # so compare the unfaded head.
+        self.assertEqual(
+            bytes(p._user_audio_buffer[: len(utterance) - fade_bytes]),
+            utterance[: len(utterance) - fade_bytes],
+        )
+        # Utterance 2 at the end; its first 20 ms are faded in after the gap,
+        # so compare the unfaded tail.
+        self.assertEqual(
+            bytes(p._user_audio_buffer[-(len(utterance) - fade_bytes) :]), utterance[fade_bytes:]
+        )
+        # Everything between the two utterances must be silence.
         silence_region = bytes(p._user_audio_buffer[len(utterance) : -len(utterance)])
         self.assertTrue(all(b == 0 for b in silence_region))
         await p.cleanup()
@@ -635,7 +653,9 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
     async def test_silence_proportional_to_idle_gap(self):
         """A 1-second idle gap must insert ~1 second of silence before the new audio."""
         p = await _make_processor()
-        audio = b"\x01\x02\x03\x04"
+        # 1000 bytes ≈ 31 ms — longer than the 20 ms fade-in applied after a gap.
+        audio = b"\x01\x02\x03\x04" * 250
+        fade_bytes = int(16000 * 0.020) * 2
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             p._last_bot_buffer_update_time = 0.0
@@ -647,8 +667,10 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(p._bot_audio_buffer), expected_silence + len(audio))
         # Silence prefix.
         self.assertEqual(bytes(p._bot_audio_buffer[:expected_silence]), b"\x00" * expected_silence)
-        # Audio at the end.
-        self.assertEqual(bytes(p._bot_audio_buffer[-len(audio) :]), audio)
+        # Audio at the end; its first 20 ms are faded in, so compare the unfaded tail.
+        self.assertEqual(
+            bytes(p._bot_audio_buffer[-(len(audio) - fade_bytes) :]), audio[fade_bytes:]
+        )
         await p.cleanup()
 
     async def test_two_utterances_separated_by_pause_have_silence_gap(self):
@@ -660,7 +682,9 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
         in the recording.
         """
         p = await _make_processor()
-        utterance = b"\x11\x22\x33\x44"
+        # 1000 bytes ≈ 31 ms — longer than the 20 ms crossfade at silence boundaries.
+        utterance = b"\x11\x22\x33\x44" * 250
+        fade_bytes = int(16000 * 0.020) * 2
 
         with patch("pipecat.processors.audio.audio_buffer_processor.time") as mock_time:
             # Utterance 1 is already in the buffer at t=0.
@@ -674,11 +698,18 @@ class TestBotSilenceGapInsertion(unittest.IsolatedAsyncioTestCase):
 
         # Must be longer than both utterances back-to-back (the bug).
         self.assertGreater(len(p._bot_audio_buffer), len(utterance) * 2)
-        # Utterance 1 at the start.
-        self.assertEqual(bytes(p._bot_audio_buffer[: len(utterance)]), utterance)
-        # Utterance 2 at the end.
-        self.assertEqual(bytes(p._bot_audio_buffer[-len(utterance) :]), utterance)
-        # Everything in between must be silence.
+        # Utterance 1 at the start; its last 20 ms are faded out before the gap,
+        # so compare the unfaded head.
+        self.assertEqual(
+            bytes(p._bot_audio_buffer[: len(utterance) - fade_bytes]),
+            utterance[: len(utterance) - fade_bytes],
+        )
+        # Utterance 2 at the end; its first 20 ms are faded in after the gap,
+        # so compare the unfaded tail.
+        self.assertEqual(
+            bytes(p._bot_audio_buffer[-(len(utterance) - fade_bytes) :]), utterance[fade_bytes:]
+        )
+        # Everything between the two utterances must be silence.
         silence_region = bytes(p._bot_audio_buffer[len(utterance) : -len(utterance)])
         self.assertTrue(all(b == 0 for b in silence_region))
         await p.cleanup()

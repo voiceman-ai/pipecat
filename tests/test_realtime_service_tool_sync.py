@@ -153,7 +153,10 @@ class TestGeminiLiveServiceToolSync(_ServiceToolSyncTests, unittest.IsolatedAsyn
 
 class TestAWSNovaSonicServiceToolSync(_ServiceToolSyncTests, unittest.IsolatedAsyncioTestCase):
     def _service(self, tools):
-        mod = pytest.importorskip("pipecat.services.aws.nova_sonic.llm")
+        # The module re-raises a missing optional dependency (e.g.
+        # aws_sdk_bedrock_runtime) as a plain ImportError, which importorskip
+        # doesn't treat as skippable by default — widen it.
+        mod = pytest.importorskip("pipecat.services.aws.nova_sonic.llm", exc_type=ImportError)
         return mod.AWSNovaSonicLLMService(
             secret_access_key="test", access_key_id="test", region="us-east-1", tools=tools
         )

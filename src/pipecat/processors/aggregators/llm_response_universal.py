@@ -144,7 +144,7 @@ class LLMUserAggregatorParams:
 
             .. deprecated:: 1.2.0
                 Use ``user_turn_strategies=FilterIncompleteUserTurnStrategies()``
-                instead. Will be removed in version 2.0.0.
+                instead. Will be removed in 2.0.0.
 
         user_turn_completion_config: [DEPRECATED] Configuration for turn
             completion behavior including custom instructions, timeouts, and
@@ -155,7 +155,7 @@ class LLMUserAggregatorParams:
             .. deprecated:: 1.2.0
                 Pass the config directly to
                 ``FilterIncompleteUserTurnStrategies(config=...)`` instead.
-                Will be removed in version 2.0.0.
+                Will be removed in 2.0.0.
     """
 
     add_tool_change_messages: bool = False
@@ -401,8 +401,14 @@ class LLMContextAggregator(FrameProcessor):
         if not self._add_tool_change_messages:
             return
 
-        def _names(tools: ToolsSchema | NotGiven) -> set[str]:
+        def _names(tools: ToolsSchema | list | NotGiven) -> set[str]:
             if not is_given(tools):
+                return set()
+            # The frame may carry a plain list (direct functions / FunctionSchema
+            # objects, or provider-native dicts) — normalize before diffing.
+            tools = LLMContext._normalize_and_validate_tools(tools, allow_provider_tools=True)
+            if not isinstance(tools, ToolsSchema):
+                # Provider-native tools (or an empty set) — nothing standard to diff.
                 return set()
             return {s.name for s in tools.standard_tools}
 

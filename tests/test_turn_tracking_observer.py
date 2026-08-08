@@ -196,12 +196,13 @@ class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
             observers=[turn_observer],
         )
 
-        # Verify turn events - should see Turn 1 interrupted
+        # Verify turn events - should see Turn 1 interrupted. Turn 2 stays open:
+        # pipeline end (EndFrame) deliberately does not flush the active turn,
+        # so observability tools don't get floating spans.
         expected_events = [
             "Turn 1 started",
             "Turn 1 ended (interrupted: True)",  # First turn was interrupted
             "Turn 2 started",  # New turn started after interruption
-            "Turn 2 ended (interrupted: True)",  # Second turn ends due to EndFrame
         ]
         self.assertEqual(turn_events, expected_events)
         self.assertEqual(turn_observer._turn_count, 2)
@@ -261,9 +262,15 @@ class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn_events, expected_events)
         self.assertEqual(turn_observer._turn_count, 1)
 
-    async def test_cancel_frame_flushes_active_turn(self):
-        """Test that CancelFrame properly flushes an active turn."""
-        # Create observer with a long timeout to ensure CancelFrame is what ends the turn
+    async def test_cancel_frame_keeps_active_turn_open(self):
+        """CancelFrame must not flush the active turn.
+
+        Pipeline end/cancel deliberately leaves the turn open (only cancelling
+        the end-turn timer): observers see the End/Cancel frame first, and
+        ending the turn there would clear the current context prematurely,
+        leaving floating spans in observability tools.
+        """
+        # Create observer with a long timeout so nothing else could end the turn
         turn_observer = TurnTrackingObserver(turn_end_timeout_secs=5.0)
 
         # Create identity filter (passes all frames through)
@@ -304,13 +311,13 @@ class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
             send_end_frame=False,  # Don't send EndFrame since we're testing CancelFrame
         )
 
-        # Verify that the turn was ended due to CancelFrame (marked as interrupted)
+        # Verify the turn is still open: CancelFrame must not end it
         expected_events = [
             "Turn 1 started",
-            "Turn 1 ended (interrupted: True)",  # Should be interrupted due to CancelFrame
         ]
         self.assertEqual(turn_events, expected_events)
         self.assertEqual(turn_observer._turn_count, 1)
+        self.assertTrue(turn_observer._is_turn_active)
 
     async def test_end_frame_with_no_active_turn(self):
         """Test that EndFrame doesn't cause issues when no turn is active."""

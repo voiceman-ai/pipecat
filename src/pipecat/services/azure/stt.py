@@ -12,7 +12,7 @@ Speech SDK for real-time audio transcription.
 
 import asyncio
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from loguru import logger
@@ -27,7 +27,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
 )
 from pipecat.services.azure.common import language_to_azure_language
-from pipecat.services.settings import STTSettings, assert_given
+from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, assert_given
 from pipecat.services.stt_latency import AZURE_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
@@ -37,6 +37,7 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 try:
     from azure.cognitiveservices.speech import (
         CancellationReason,
+        ProfanityOption,
         ResultReason,
         SpeechConfig,
         SpeechRecognizer,
@@ -52,11 +53,27 @@ except ModuleNotFoundError as e:
     raise ImportError(f"Missing module: {e}") from e
 
 
+# Accepted values for the ``profanity`` setting, mapped to Azure SDK options.
+# A dict (rather than an enum annotation) so an out-of-range value fails fast
+# with a KeyError at apply time instead of silently keeping the SDK default.
+_PROFANITY_OPTIONS: dict[str, "ProfanityOption"] = {
+    "raw": ProfanityOption.Raw,
+    "masked": ProfanityOption.Masked,
+    "removed": ProfanityOption.Removed,
+}
+
+
 @dataclass
 class AzureSTTSettings(STTSettings):
-    """Settings for AzureSTTService."""
+    """Settings for AzureSTTService.
 
-    pass
+    Parameters:
+        profanity: How Azure treats profanity in transcripts: ``"raw"``,
+            ``"masked"``, or ``"removed"``. ``None`` keeps the Azure SDK
+            default (masked).
+    """
+
+    profanity: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class AzureSTTService(STTService):
@@ -109,6 +126,7 @@ class AzureSTTService(STTService):
         default_settings = self.Settings(
             model=None,
             language=Language.EN_US,
+            profanity=None,
         )
 
         # 2. Apply direct init arg overrides (deprecated)
@@ -156,8 +174,21 @@ class AzureSTTService(STTService):
         if endpoint_id:
             self._speech_config.endpoint_id = endpoint_id
 
+        self._apply_profanity_setting()
+
         self._audio_stream = None
         self._speech_recognizer = None
+
+    def _apply_profanity_setting(self) -> None:
+        """Wire the ``profanity`` setting through to the speech config.
+
+        No-op when the setting is ``None`` (keep the Azure SDK default).
+        Raises ``KeyError`` on an out-of-range value so misconfiguration
+        fails fast instead of silently keeping the default.
+        """
+        profanity = assert_given(self._settings.profanity)
+        if profanity is not None:
+            self._speech_config.set_profanity(_PROFANITY_OPTIONS[profanity])
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate performance metrics.
@@ -179,16 +210,19 @@ class AzureSTTService(STTService):
         return language_to_azure_language(language)
 
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
-        """Apply a settings delta and reconnect if language changed."""
+        """Apply a settings delta and reconnect if the speech config changed."""
         changed = await super()._update_settings(delta)
 
         if "language" in changed:
             self._speech_config.speech_recognition_language = assert_given(
                 self._settings.language
             ) or language_to_azure_language(Language.EN_US)
-            if self._audio_stream:
-                await self._disconnect()
-                await self._connect()
+        if "profanity" in changed:
+            self._apply_profanity_setting()
+        # SpeechConfig changes only take effect on a new recognizer.
+        if changed.keys() & {"language", "profanity"} and self._audio_stream:
+            await self._disconnect()
+            await self._connect()
 
         return changed
 
@@ -292,12 +326,16 @@ class AzureSTTService(STTService):
                 "Language | None",
                 getattr(event.result, "language", None) or assert_given(self._settings.language),
             )
+            # RecognizedSpeech is Azure's final recognition for an utterance, so
+            # mark the frame finalized — downstream user-turn stop strategies
+            # take their fast-path on it.
             frame = TranscriptionFrame(
                 event.result.text,
                 self._user_id,
                 time_now_iso8601(),
                 language,
                 result=event,
+                finalized=True,
             )
             asyncio.run_coroutine_threadsafe(
                 self._handle_transcription(event.result.text, True, language), self.get_event_loop()

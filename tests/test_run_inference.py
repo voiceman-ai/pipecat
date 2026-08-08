@@ -84,7 +84,8 @@ async def test_openai_run_inference_with_llm_context():
             service_tier=OPENAI_NOT_GIVEN,
             messages=test_messages,
             tools=OPENAI_NOT_GIVEN,
-            tool_choice=OPENAI_NOT_GIVEN,
+            # No tools in this request, so tool_choice is dropped entirely —
+            # some OpenAI-compatible endpoints 400 on an orphan tool_choice.
             # Out-of-band inference is non-streaming, so the client's
             # conversational read timeout would bound total generation rather
             # than time-to-first-byte. It carries its own, looser bound instead.

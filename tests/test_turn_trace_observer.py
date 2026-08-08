@@ -106,6 +106,10 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
         """Return finished spans with the given name."""
         return [s for s in self._exporter.get_finished_spans() if s.name == name]
 
+    def _get_turn_spans(self):
+        """Return finished turn spans (named "turn-<n>", one per turn)."""
+        return [s for s in self._exporter.get_finished_spans() if s.name.startswith("turn-")]
+
     async def test_conversation_span_created_on_start_frame(self):
         """Test that a conversation span is created when StartFrame is observed."""
         _, _, trace_observer, _ = self._create_observers(conversation_id="test-conv")
@@ -179,7 +183,7 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
             observers=self._all_observers(trace_observer),
         )
 
-        turn_spans = self._get_spans_by_name("turn")
+        turn_spans = self._get_turn_spans()
         self.assertEqual(len(turn_spans), 2)
         turn_numbers = {s.attributes["turn.number"] for s in turn_spans}
         self.assertEqual(turn_numbers, {1, 2})
@@ -215,7 +219,7 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
         trace_observer.end_conversation_tracing()
 
         conv_spans = self._get_spans_by_name("conversation")
-        turn_spans = self._get_spans_by_name("turn")
+        turn_spans = self._get_turn_spans()
         self.assertEqual(len(conv_spans), 1)
         self.assertEqual(len(turn_spans), 1)
 
@@ -255,7 +259,7 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
         # End conversation to flush remaining spans
         trace_observer.end_conversation_tracing()
 
-        turn_spans = self._get_spans_by_name("turn")
+        turn_spans = self._get_turn_spans()
         self.assertGreaterEqual(len(turn_spans), 1)
         # First turn should be interrupted
         interrupted_turns = [s for s in turn_spans if s.attributes.get("turn.was_interrupted")]
@@ -428,7 +432,7 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conv_ids, {"conv-a", "conv-b"})
 
         # Turn spans should be children of their own conversation span, not cross-linked
-        turn_spans = self._get_spans_by_name("turn")
+        turn_spans = self._get_turn_spans()
         conv_span_map = {s.context.span_id: s.attributes["conversation.id"] for s in conv_spans}
         for turn_span in turn_spans:
             parent_id = turn_span.parent.span_id
@@ -458,7 +462,7 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(trace_observer._conversation_span)
 
         # Check span attributes
-        turn_spans = self._get_spans_by_name("turn")
+        turn_spans = self._get_turn_spans()
         self.assertEqual(len(turn_spans), 1)
         self.assertTrue(turn_spans[0].attributes["turn.was_interrupted"])
         self.assertTrue(turn_spans[0].attributes["turn.ended_by_conversation_end"])

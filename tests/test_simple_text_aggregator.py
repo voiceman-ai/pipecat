@@ -27,14 +27,15 @@ class TestSimpleTextAggregator(unittest.IsolatedAsyncioTestCase):
         text = "Hello Pipecat!"
         results = [agg async for agg in self.aggregator.aggregate(text)]
 
-        # No complete sentences yet (waiting for lookahead after "!")
-        assert len(results) == 0
-
-        # Flush to get the pending sentence
-        aggregate = await self.aggregator.flush()
-        assert aggregate.text == "Hello Pipecat!"
-        assert aggregate.type == "sentence"
+        # Fast-opener: the first chunk of a turn is emitted immediately on a
+        # strong ender ("!"), no lookahead needed.
+        assert len(results) == 1
+        assert results[0].text == "Hello Pipecat!"
+        assert results[0].type == "sentence"
         assert self.aggregator.text.text == ""
+
+        # Nothing left pending after the immediate emit
+        assert await self.aggregator.flush() is None
 
     async def test_multiple_sentences(self):
         text = "Hello Pipecat! How are you?"

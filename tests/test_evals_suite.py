@@ -37,7 +37,9 @@ suite:
 class TestEvalManifestLoad(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self._tmp.name)
+        # Resolve symlinks (macOS tempdirs live under /var -> /private/var) so
+        # comparisons against the loader's resolved paths hold on every OS.
+        self.base = Path(self._tmp.name).resolve()
         self.manifest_path = self.base / "manifest.yaml"
         self.manifest_path.write_text(MANIFEST)
 

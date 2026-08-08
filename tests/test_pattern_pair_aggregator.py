@@ -49,17 +49,16 @@ class TestPatternPairAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_args.full_match, "<test>pattern content</test>")
         self.assertEqual(call_args.text, "pattern content")
 
-        # No results yet (waiting for lookahead after "!")
-        self.assertEqual(len(results), 0)
-
-        # Next sentence should provide the lookahead and trigger the previous sentence
-        async for result in self.aggregator.aggregate(" This is another sentence."):
-            results.append(result)
-
-        # First result should be "Hello !" triggered by the space lookahead
+        # Fast-opener: the first chunk of a turn is emitted immediately on a
+        # strong ender ("!"), no lookahead needed.
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].text, "Hello !")
         self.assertEqual(results[0].type, "sentence")
+
+        # The next sentence ends with "." (weak ender) and stays pending
+        async for result in self.aggregator.aggregate(" This is another sentence."):
+            results.append(result)
+        self.assertEqual(len(results), 1)
 
         # Now flush to get the remaining sentence
         result = await self.aggregator.flush()
@@ -150,12 +149,13 @@ class TestPatternPairAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emphasis_match.type, "emphasis")
         self.assertEqual(emphasis_match.text, "very")
 
-        # With lookahead, we need to flush to get the final sentence
-        self.assertEqual(len(results), 0)  # Waiting for lookahead after "!"
+        # Fast-opener: the first chunk of a turn is emitted immediately on a
+        # strong ender ("!"). Voice pattern removed, emphasis pattern kept.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].text, "Hello  I am <em>very</em> excited to meet you!")
 
-        result = await self.aggregator.flush()
-        # Voice pattern should be removed, emphasis pattern should remain
-        self.assertEqual(result.text, "Hello  I am <em>very</em> excited to meet you!")
+        # Nothing left pending after the immediate emit
+        self.assertIsNone(await self.aggregator.flush())
 
         # Buffer should be empty
         self.assertEqual(self.aggregator.text.text, "")
