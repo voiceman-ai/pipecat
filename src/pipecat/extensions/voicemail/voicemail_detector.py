@@ -287,6 +287,30 @@ class ClassifierUpstreamGate(FrameProcessor):
         self._gate_open = False
 
 
+def classify_verdict(full_response: str) -> str | None:
+    """Map a raw classifier LLM response to a voicemail verdict.
+
+    The precedence is load-bearing: "CONVERSATION" is checked before
+    "VOICEMAIL", so a response containing both resolves to conversation
+    (hanging up on a live person is worse than listening to a recording).
+    Offline evals must use this exact function rather than reimplementing
+    the match so they measure what production does.
+
+    Args:
+        full_response: The complete aggregated response text from the LLM.
+
+    Returns:
+        "conversation" or "voicemail", or None when the response contains
+        neither marker (e.g. the LLM was interrupted mid-response).
+    """
+    response = full_response.upper()
+    if "CONVERSATION" in response:
+        return "conversation"
+    if "VOICEMAIL" in response:
+        return "voicemail"
+    return None
+
+
 class ClassificationProcessor(FrameProcessor):
     """Processor that handles LLM classification responses and triggers events.
 
@@ -381,10 +405,10 @@ class ClassificationProcessor(FrameProcessor):
         if self._decision_made:
             return
 
-        response = full_response.upper()
+        verdict = classify_verdict(full_response)
         logger.debug(f"{self}: Classifying response: '{full_response}'")
 
-        if "CONVERSATION" in response:
+        if verdict == "conversation":
             # Human answered - continue normal conversation flow
             self._decision_made = True
             logger.info(f"{self}: CONVERSATION detected")
@@ -392,7 +416,7 @@ class ClassificationProcessor(FrameProcessor):
             await self._conversation_notifier.notify()  # Release buffered TTS frames
             await self._call_event_handler("on_conversation_detected")
 
-        elif "VOICEMAIL" in response:
+        elif verdict == "voicemail":
             # Voicemail detected - trigger voicemail handling
             self._decision_made = True
             self._voicemail_detected = True
