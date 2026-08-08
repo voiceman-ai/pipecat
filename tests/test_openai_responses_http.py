@@ -86,12 +86,15 @@ class TestHttpTokenUsageMetrics:
         """Native OpenAI responses (detail objects present) pass through unchanged."""
         service = _make_service()
 
+        # construct() skips validation so the test tracks whatever required
+        # fields the installed SDK version adds (e.g. cache_write_tokens);
+        # the handler only reads cached_tokens/reasoning_tokens.
         usage = ResponseUsage(
             input_tokens=100,
             output_tokens=50,
             total_tokens=150,
-            input_tokens_details=InputTokensDetails(cached_tokens=20),
-            output_tokens_details=OutputTokensDetails(reasoning_tokens=10),
+            input_tokens_details=InputTokensDetails.construct(cached_tokens=20),
+            output_tokens_details=OutputTokensDetails.construct(reasoning_tokens=10),
         )
         await _run(service, _completed_event(usage))
 
