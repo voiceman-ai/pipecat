@@ -294,6 +294,24 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
         Returns:
             The LLM's response as a string, or None if no response is generated.
         """
+        result, _ = await self.run_inference_with_usage(
+            context, max_tokens=max_tokens, system_instruction=system_instruction
+        )
+        return result
+
+    async def run_inference_with_usage(
+        self,
+        context: LLMContext,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+    ) -> tuple[str | None, LLMTokenUsage | None]:
+        """Run a one-shot inference and return the response with its token usage.
+
+        See :meth:`LLMService.run_inference_with_usage`. Anthropic's raw
+        ``input_tokens`` EXCLUDES cache read/creation tokens; the returned
+        ``prompt_tokens`` are normalized to include them (cache counts stay
+        broken out in their own fields).
+        """
         messages = []
         system = NOT_GIVEN
         tools = []
@@ -332,7 +350,22 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
         # LLM completion
         response = await self._client.beta.messages.create(**params)
 
-        return next((block.text for block in response.content if hasattr(block, "text")), None)
+        usage = None
+        if response.usage:
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cache_creation = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            prompt_tokens = (response.usage.input_tokens or 0) + cache_read + cache_creation
+            completion_tokens = response.usage.output_tokens or 0
+            usage = LLMTokenUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                cache_read_input_tokens=cache_read,
+                cache_creation_input_tokens=cache_creation,
+            )
+
+        text = next((block.text for block in response.content if hasattr(block, "text")), None)
+        return text, usage
 
     def _get_llm_invocation_params(self, context: LLMContext) -> AnthropicLLMInvocationParams:
         adapter = self.get_llm_adapter()

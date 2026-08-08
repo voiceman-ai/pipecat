@@ -287,6 +287,23 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
         Returns:
             The LLM's response as a string, or None if no response is generated.
         """
+        result, _ = await self.run_inference_with_usage(
+            context, max_tokens=max_tokens, system_instruction=system_instruction
+        )
+        return result
+
+    async def run_inference_with_usage(
+        self,
+        context: LLMContext,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+    ) -> tuple[str | None, LLMTokenUsage | None]:
+        """Run a one-shot inference and return the response with its token usage.
+
+        See :meth:`LLMService.run_inference_with_usage` (the Responses API's
+        ``input_tokens`` already include cached tokens, so no normalization is
+        needed). Always uses the HTTP client regardless of transport variant.
+        """
         adapter = self.get_llm_adapter()
         effective_instruction = system_instruction or assert_given(
             self._settings.system_instruction
@@ -305,7 +322,21 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
 
         response = await self._client.responses.create(**params)
 
-        return response.output_text
+        usage = None
+        # getattr: OpenAI-compatible endpoints don't all report usage.
+        raw_usage = getattr(response, "usage", None)
+        if raw_usage:
+            input_details = getattr(raw_usage, "input_tokens_details", None)
+            output_details = getattr(raw_usage, "output_tokens_details", None)
+            usage = LLMTokenUsage(
+                prompt_tokens=raw_usage.input_tokens or 0,
+                completion_tokens=raw_usage.output_tokens or 0,
+                total_tokens=raw_usage.total_tokens or 0,
+                cache_read_input_tokens=getattr(input_details, "cached_tokens", None),
+                reasoning_tokens=getattr(output_details, "reasoning_tokens", None),
+            )
+
+        return response.output_text, usage
 
     def _process_function_calls(
         self,

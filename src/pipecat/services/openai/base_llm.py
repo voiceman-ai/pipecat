@@ -1364,6 +1364,24 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         Returns:
             The LLM's response as a string, or None if no response is generated.
         """
+        result, _ = await self.run_inference_with_usage(
+            context, max_tokens=max_tokens, system_instruction=system_instruction
+        )
+        return result
+
+    async def run_inference_with_usage(
+        self,
+        context: LLMContext,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+    ) -> tuple[str | None, LLMTokenUsage | None]:
+        """Run a one-shot inference and return the response with its token usage.
+
+        See :meth:`LLMService.run_inference_with_usage` (OpenAI's
+        ``prompt_tokens`` already include cached tokens, so no normalization is
+        needed) and :meth:`run_inference` for the timeout and output-hygiene
+        semantics of this path.
+        """
         effective_instruction = system_instruction or self._settings.system_instruction
         adapter = self.get_llm_adapter()
         invocation_params = adapter.get_llm_invocation_params(
@@ -1398,6 +1416,20 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         # LLM completion
         response = await self._client.chat.completions.create(**params)
+
+        usage = None
+        # getattr: OpenAI-compatible endpoints don't all report usage.
+        raw_usage = getattr(response, "usage", None)
+        if raw_usage:
+            prompt_details = getattr(raw_usage, "prompt_tokens_details", None)
+            completion_details = getattr(raw_usage, "completion_tokens_details", None)
+            usage = LLMTokenUsage(
+                prompt_tokens=raw_usage.prompt_tokens,
+                completion_tokens=raw_usage.completion_tokens,
+                total_tokens=raw_usage.total_tokens,
+                cache_read_input_tokens=getattr(prompt_details, "cached_tokens", None),
+                reasoning_tokens=getattr(completion_details, "reasoning_tokens", None),
+            )
 
         content = response.choices[0].message.content
         # Same reasoning hygiene as the streaming path: a thinking model can
@@ -1435,7 +1467,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     f"model meta-aside text from run_inference output"
                 )
             content = cleaned
-        return content
+        return content, usage
 
     # Clock read by the per-turn generation budget. Indirected through an
     # overridable attribute so a test can inject a fake clock without

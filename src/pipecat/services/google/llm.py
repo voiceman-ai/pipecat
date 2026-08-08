@@ -306,6 +306,23 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         Returns:
             The LLM's response as a string, or None if no response is generated.
         """
+        result, _ = await self.run_inference_with_usage(
+            context, max_tokens=max_tokens, system_instruction=system_instruction
+        )
+        return result
+
+    async def run_inference_with_usage(
+        self,
+        context: LLMContext,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+    ) -> tuple[str | None, LLMTokenUsage | None]:
+        """Run a one-shot inference and return the response with its token usage.
+
+        See :meth:`LLMService.run_inference_with_usage`. Reported
+        ``completion_tokens`` include thinking tokens (Gemini bills them at the
+        output rate); they are also broken out in ``reasoning_tokens``.
+        """
         messages = []
         system = []
         tools = []
@@ -336,13 +353,27 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             config=generation_config,
         )
 
+        usage = None
+        if response.usage_metadata:
+            um = response.usage_metadata
+            prompt_tokens = um.prompt_token_count or 0
+            thoughts_tokens = um.thoughts_token_count or 0
+            completion_tokens = (um.candidates_token_count or 0) + thoughts_tokens
+            usage = LLMTokenUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=um.total_token_count or (prompt_tokens + completion_tokens),
+                cache_read_input_tokens=um.cached_content_token_count or 0,
+                reasoning_tokens=thoughts_tokens,
+            )
+
         # Extract text from response
         if response.candidates and response.candidates[0].content:
             for part in response.candidates[0].content.parts:
                 if part.text:
-                    return part.text
+                    return part.text, usage
 
-        return None
+        return None, usage
 
     def _build_generation_params(
         self,

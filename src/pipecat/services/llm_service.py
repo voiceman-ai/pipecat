@@ -60,6 +60,7 @@ from pipecat.processors.aggregators.llm_context import (
     LLMSpecificMessage,
     is_given,
 )
+from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_service import AIService
 from pipecat.services.settings import LLMSettings, assert_given
@@ -386,6 +387,43 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             The LLM's response as a string, or None if no response is generated.
         """
         raise NotImplementedError(f"run_inference() not supported by {self.__class__.__name__}")
+
+    async def run_inference_with_usage(
+        self,
+        context: LLMContext,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+    ) -> tuple[str | None, LLMTokenUsage | None]:
+        """Like :meth:`run_inference`, but also returns provider-reported token usage.
+
+        Services that can surface usage override this method (and implement
+        :meth:`run_inference` as a delegate to it). The base implementation
+        delegates the other way — calling :meth:`run_inference` and returning
+        ``None`` usage — so subclasses that only override :meth:`run_inference`
+        keep working with callers of either method.
+
+        Usage normalization: overrides must report ``prompt_tokens`` INCLUSIVE
+        of any cache read/creation tokens (which are additionally broken out in
+        their own fields), even when the provider's raw response excludes them
+        (Anthropic, Bedrock), so consumers can price any provider's usage with
+        the same arithmetic.
+
+        Args:
+            context: The LLM context containing conversation history.
+            max_tokens: Optional maximum number of tokens to generate. If provided,
+                overrides the service's default max_tokens/max_completion_tokens setting.
+            system_instruction: Optional system instruction to use for this inference.
+                If provided, overrides any system instruction in the context.
+
+        Returns:
+            Tuple of the LLM's response (or None if no response was generated)
+            and the token usage the provider reported for it (or None when the
+            service doesn't surface usage).
+        """
+        result = await self.run_inference(
+            context, max_tokens=max_tokens, system_instruction=system_instruction
+        )
+        return result, None
 
     def service_metadata_frame(self) -> LLMServiceMetadataFrame:
         """The metadata frame this LLM service broadcasts at start.

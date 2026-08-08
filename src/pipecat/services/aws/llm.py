@@ -289,6 +289,24 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
         Returns:
             The LLM's response as a string, or None if no response is generated.
         """
+        result, _ = await self.run_inference_with_usage(
+            context, max_tokens=max_tokens, system_instruction=system_instruction
+        )
+        return result
+
+    async def run_inference_with_usage(
+        self,
+        context: LLMContext,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+    ) -> tuple[str | None, LLMTokenUsage | None]:
+        """Run a one-shot inference and return the response with its token usage.
+
+        See :meth:`LLMService.run_inference_with_usage`. Bedrock's raw
+        ``inputTokens`` EXCLUDES cache read/write tokens; the returned
+        ``prompt_tokens`` are normalized to include them (cache counts stay
+        broken out in their own fields).
+        """
         messages = []
         system = []
         effective_instruction = system_instruction or assert_given(
@@ -326,6 +344,21 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
             # Call Bedrock without streaming
             response = await client.converse(**request_params)
 
+            usage = None
+            raw_usage = response.get("usage") or {}
+            if raw_usage:
+                cache_read = raw_usage.get("cacheReadInputTokens") or 0
+                cache_creation = raw_usage.get("cacheWriteInputTokens") or 0
+                prompt_tokens = (raw_usage.get("inputTokens") or 0) + cache_read + cache_creation
+                completion_tokens = raw_usage.get("outputTokens") or 0
+                usage = LLMTokenUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                    cache_read_input_tokens=cache_read,
+                    cache_creation_input_tokens=cache_creation,
+                )
+
             # Extract the response text
             if (
                 "output" in response
@@ -336,11 +369,11 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
                 if isinstance(content, list):
                     for item in content:
                         if item.get("text"):
-                            return item["text"]
+                            return item["text"], usage
                 elif isinstance(content, str):
-                    return content
+                    return content, usage
 
-            return None
+            return None, usage
 
     async def _create_converse_stream(self, client, request_params):
         """Create converse stream with optional timeout and retry.

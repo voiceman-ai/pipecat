@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,6 +19,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.aws.llm import AWSBedrockLLMService
 from pipecat.services.google.llm import GoogleLLMService
+from pipecat.services.llm_service import LLMService
 from pipecat.services.openai.base_llm import INFERENCE_TIMEOUT_SECS
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.responses.llm import (
@@ -974,3 +976,233 @@ async def test_openai_responses_http_run_inference_system_instruction_param_with
             {"role": "developer", "content": "Summarize the conversation"}
         ]
         assert "instructions" not in call_kwargs
+
+
+# --- run_inference_with_usage: the usage-reporting seam -----------------------
+#
+# Every provider must report prompt_tokens INCLUSIVE of cache read/creation
+# tokens (see LLMService.run_inference_with_usage), so consumers can price any
+# provider's usage with the same arithmetic. These tests pin the per-provider
+# normalization.
+
+
+def _mocked_openai_service():
+    with patch.object(OpenAILLMService, "create_client"):
+        service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4"))
+    service._client = AsyncMock()
+    mock_adapter = MagicMock()
+    mock_adapter.get_llm_invocation_params.return_value = OpenAILLMInvocationParams(
+        messages=[], tools=OPENAI_NOT_GIVEN, tool_choice=OPENAI_NOT_GIVEN
+    )
+    service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+    return service
+
+
+@pytest.mark.asyncio
+async def test_openai_run_inference_with_usage():
+    """Chat-completions usage passes through (prompt already cache-inclusive)."""
+    service = _mocked_openai_service()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = "hi"
+    mock_response.usage = SimpleNamespace(
+        prompt_tokens=1000,
+        completion_tokens=50,
+        total_tokens=1050,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=800),
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=10),
+    )
+    service._client.chat.completions.create.return_value = mock_response
+
+    text, usage = await service.run_inference_with_usage(MagicMock(spec=LLMContext))
+
+    assert text == "hi"
+    assert usage.prompt_tokens == 1000
+    assert usage.completion_tokens == 50
+    assert usage.total_tokens == 1050
+    assert usage.cache_read_input_tokens == 800
+    assert usage.reasoning_tokens == 10
+
+
+@pytest.mark.asyncio
+async def test_anthropic_run_inference_with_usage_normalizes_cache_tokens():
+    """Anthropic input_tokens EXCLUDE cache fields; the seam adds them back."""
+    service = AnthropicLLMService(
+        api_key="test-key",
+        settings=AnthropicLLMService.Settings(model="claude-3-sonnet-20240229"),
+    )
+    service._client = AsyncMock()
+    mock_adapter = MagicMock()
+    mock_adapter.get_llm_invocation_params.return_value = AnthropicLLMInvocationParams(
+        messages=[{"role": "user", "content": "hi"}], system="sys", tools=[]
+    )
+    service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock()]
+    mock_response.content[0].text = "hello"
+    mock_response.usage = SimpleNamespace(
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_input_tokens=800,
+        cache_creation_input_tokens=200,
+    )
+    service._client.beta.messages.create.return_value = mock_response
+
+    text, usage = await service.run_inference_with_usage(MagicMock(spec=LLMContext))
+
+    assert text == "hello"
+    assert usage.prompt_tokens == 1100  # 100 + 800 + 200
+    assert usage.completion_tokens == 50
+    assert usage.total_tokens == 1150
+    assert usage.cache_read_input_tokens == 800
+    assert usage.cache_creation_input_tokens == 200
+
+
+@pytest.mark.asyncio
+async def test_google_run_inference_with_usage_includes_thoughts():
+    """Gemini thinking tokens bill at the output rate → folded into completion."""
+    service = GoogleLLMService(
+        api_key="test-key", settings=GoogleLLMService.Settings(model="gemini-2.0-flash")
+    )
+    service._client = AsyncMock()
+    mock_adapter = MagicMock()
+    mock_adapter.get_llm_invocation_params.return_value = GeminiLLMInvocationParams(
+        messages=[{"role": "user", "content": "hi"}],
+        system_instruction="sys",
+        tools=NotGiven(),
+    )
+    service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+
+    mock_response = MagicMock()
+    mock_response.candidates = [MagicMock()]
+    mock_response.candidates[0].content = MagicMock()
+    mock_response.candidates[0].content.parts = [MagicMock()]
+    mock_response.candidates[0].content.parts[0].text = "hello"
+    mock_response.usage_metadata = SimpleNamespace(
+        prompt_token_count=500,
+        candidates_token_count=40,
+        thoughts_token_count=60,
+        total_token_count=600,
+        cached_content_token_count=200,
+    )
+    service._client.aio = AsyncMock()
+    service._client.aio.models = AsyncMock()
+    service._client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+    text, usage = await service.run_inference_with_usage(MagicMock(spec=LLMContext))
+
+    assert text == "hello"
+    assert usage.prompt_tokens == 500
+    assert usage.completion_tokens == 100  # 40 candidates + 60 thoughts
+    assert usage.total_tokens == 600
+    assert usage.cache_read_input_tokens == 200
+    assert usage.reasoning_tokens == 60
+
+
+@pytest.mark.asyncio
+async def test_aws_bedrock_run_inference_with_usage_normalizes_cache_tokens():
+    """Bedrock inputTokens EXCLUDE cache read/write; the seam adds them back."""
+    service = AWSBedrockLLMService(
+        settings=AWSBedrockLLMService.Settings(
+            model="anthropic.claude-3-sonnet-20240229-v1:0"
+        )
+    )
+    mock_adapter = MagicMock()
+    mock_adapter.get_llm_invocation_params.return_value = AWSBedrockLLMInvocationParams(
+        messages=[{"role": "user", "content": [{"text": "hi"}]}],
+        system=[{"text": "sys"}],
+        tools=[],
+        tool_choice=None,
+    )
+    service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+
+    mock_client = AsyncMock()
+    mock_client.converse.return_value = {
+        "output": {"message": {"content": [{"text": "hello"}]}},
+        "usage": {
+            "inputTokens": 100,
+            "outputTokens": 25,
+            "cacheReadInputTokens": 300,
+            "cacheWriteInputTokens": 50,
+        },
+    }
+    mock_context_manager = AsyncMock()
+    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(service._aws_session, "create_client", return_value=mock_context_manager):
+        text, usage = await service.run_inference_with_usage(MagicMock(spec=LLMContext))
+
+    assert text == "hello"
+    assert usage.prompt_tokens == 450  # 100 + 300 + 50
+    assert usage.completion_tokens == 25
+    assert usage.total_tokens == 475
+    assert usage.cache_read_input_tokens == 300
+    assert usage.cache_creation_input_tokens == 50
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_run_inference_with_usage():
+    """Responses-API usage passes through (input already cache-inclusive)."""
+    with patch.object(OpenAIResponsesLLMService, "_create_client"):
+        service = OpenAIResponsesLLMService(
+            settings=OpenAIResponsesLLMService.Settings(
+                model="gpt-4.1", system_instruction="sys"
+            ),
+        )
+        service._client = AsyncMock()
+
+        mock_response = MagicMock()
+        mock_response.output_text = "hello"
+        mock_response.usage = SimpleNamespace(
+            input_tokens=700,
+            output_tokens=30,
+            total_tokens=730,
+            input_tokens_details=SimpleNamespace(cached_tokens=600),
+            output_tokens_details=SimpleNamespace(reasoning_tokens=5),
+        )
+        service._client.responses.create = AsyncMock(return_value=mock_response)
+
+        context = LLMContext(messages=[{"role": "user", "content": "hi"}])
+        text, usage = await service.run_inference_with_usage(context)
+
+    assert text == "hello"
+    assert usage.prompt_tokens == 700
+    assert usage.completion_tokens == 30
+    assert usage.total_tokens == 730
+    assert usage.cache_read_input_tokens == 600
+    assert usage.reasoning_tokens == 5
+
+
+@pytest.mark.asyncio
+async def test_run_inference_with_usage_base_delegates_to_run_inference():
+    """Subclasses that only override run_inference still serve the usage seam."""
+    service = _mocked_openai_service()
+    service.run_inference = AsyncMock(return_value="just text")
+
+    text, usage = await LLMService.run_inference_with_usage(
+        service, MagicMock(spec=LLMContext)
+    )
+
+    assert text == "just text"
+    assert usage is None
+    service.run_inference.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_inference_delegates_to_run_inference_with_usage():
+    """run_inference is a thin delegate: one client call, same text."""
+    service = _mocked_openai_service()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = "hi"
+    mock_response.usage = None
+    service._client.chat.completions.create.return_value = mock_response
+
+    result = await service.run_inference(MagicMock(spec=LLMContext))
+
+    assert result == "hi"
+    service._client.chat.completions.create.assert_called_once()
