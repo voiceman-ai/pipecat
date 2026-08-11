@@ -39,8 +39,6 @@ from pipecat.frames.frames import (
     LLMMessagesAppendFrame,
     LLMSetToolsFrame,
     LLMTextFrame,
-    ProposedUserStartedSpeakingFrame,
-    ProposedUserStoppedSpeakingFrame,
     StartFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -203,20 +201,26 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
     bidirectional audio and text interactions. Supports function calling, conversation
     management, and real-time transcription.
 
-    Proposes turn boundaries from OpenAI's server-side VAD events as
-    ``ProposedUserStartedSpeakingFrame`` / ``ProposedUserStoppedSpeakingFrame``.
-    ``ExternalUserTurnStartStrategy`` / ``ExternalUserTurnStopStrategy`` resolve
-    those proposals into ``UserStartedSpeakingFrame`` /
-    ``UserStoppedSpeakingFrame`` — and own the interruption broadcast, which
-    this service no longer does itself — so pipeline processors that depend on
-    those frames (RTVI client speech events, ``TurnTrackingObserver``,
-    ``AudioBufferProcessor`` turn recording, ``UserIdleController``, user mute
-    strategies, voicemail detector) keep working.
+    Turn boundaries come from OpenAI's server-side VAD events. Unlike upstream,
+    which proposes them as ``ProposedUserStartedSpeakingFrame`` /
+    ``ProposedUserStoppedSpeakingFrame`` and advertises
+    ``ExternalUserTurnStrategies`` through ``service_metadata_frame()``, this
+    fork broadcasts ``UserStartedSpeakingFrame`` / ``UserStoppedSpeakingFrame``
+    directly and calls ``broadcast_interruption()`` itself. Both halves of that
+    upstream mechanism are deliberately absent here: the consumer always passes
+    its own strategies via ``LLMUserAggregatorParams(user_turn_strategies=...)``,
+    so the advertisement would be discarded anyway, and
+    ``is_realtime_service=True`` would additionally defer context writes and
+    null out ``UserTurnStoppedMessage.content``.
 
-    Unlike upstream, this fork does not advertise those strategies through
-    ``service_metadata_frame()``: pass them explicitly via
-    ``LLMUserAggregatorParams(user_turn_strategies=...)``. See the
-    ``examples/realtime/realtime-openai.py`` example.
+    Emitting the real frames directly means turn boundaries are announced at
+    the provider's VAD edge, ungated by transcription, and every processor that
+    depends on them (RTVI client speech events, ``TurnTrackingObserver``,
+    ``AudioBufferProcessor`` turn recording, ``UserIdleController``, user mute
+    strategies, voicemail detector) sees them at that instant.
+    ``ExternalUserTurnStartStrategy`` / ``ExternalUserTurnStopStrategy`` land on
+    their *adopt* path for this service: they take the decision without
+    re-announcing it and without a second interruption broadcast.
 
     If you wire local VAD (``LLMUserAggregatorParams.vad_analyzer``) on
     top of this service, disable OpenAI's server-side turn detection
@@ -1084,12 +1088,13 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
 
     async def _handle_evt_speech_started(self, evt):
         await self._truncate_current_audio_response()
-        await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
+        await self.broadcast_frame(UserStartedSpeakingFrame)
+        await self.broadcast_interruption()
 
     async def _handle_evt_speech_stopped(self, evt):
         await self.start_ttfb_metrics()
         await self.start_processing_metrics()
-        await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
+        await self.broadcast_frame(UserStoppedSpeakingFrame)
 
     async def _maybe_handle_evt_retrieve_conversation_item_error(self, evt: events.ErrorEvent):
         """Maybe handle an error event related to retrieving a conversation item.

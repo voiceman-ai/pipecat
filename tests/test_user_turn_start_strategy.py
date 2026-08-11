@@ -576,16 +576,21 @@ class TestBaseUserTurnStartStrategyDeprecations(unittest.IsolatedAsyncioTestCase
         self.assertTrue(captured[0].enable_user_speaking_frames)
 
 
-class TestMinWordsResetPreservesBotState(unittest.IsolatedAsyncioTestCase):
-    """``reset()`` must not collapse the word gate mid-utterance.
+class TestMinWordsTurnStartPreservesBotState(unittest.IsolatedAsyncioTestCase):
+    """The turn-start callback must not collapse the word gate mid-utterance.
 
-    The controller resets every start strategy whenever any turn opens, and no
-    new ``BotStartedSpeakingFrame`` arrives mid-utterance — so a reset that
-    cleared ``_bot_speaking`` silently turned ``min_words=N`` into
-    ``min_words=1`` for the rest of the bot's utterance.
+    Regression guard for 909a440df. The controller notifies *every* start
+    strategy whenever any turn opens, and no new ``BotStartedSpeakingFrame``
+    arrives mid-utterance — so clearing ``_bot_speaking`` there silently turned
+    ``min_words=N`` into ``min_words=1`` for the rest of the bot's utterance.
+
+    The callback is ``handle_user_turn_started()``; it used to be ``reset()``,
+    which upstream deprecated into a no-op bridge on the base class. These
+    tests must drive the callback the controller actually calls — calling the
+    deprecated ``reset()`` here exercises nothing.
     """
 
-    async def test_reset_preserves_bot_speaking(self):
+    async def test_turn_start_preserves_bot_speaking(self):
         strategy = MinWordsUserTurnStartStrategy(min_words=3)
         starts = []
 
@@ -594,7 +599,7 @@ class TestMinWordsResetPreservesBotState(unittest.IsolatedAsyncioTestCase):
             starts.append(params)
 
         await strategy.process_frame(BotStartedSpeakingFrame())
-        await strategy.reset()
+        await strategy.handle_user_turn_started()
 
         self.assertTrue(strategy._bot_speaking)
 
@@ -610,7 +615,7 @@ class TestMinWordsResetPreservesBotState(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(starts), 1)
 
-    async def test_reset_after_bot_stopped_keeps_single_word_start(self):
+    async def test_turn_start_after_bot_stopped_keeps_single_word_start(self):
         strategy = MinWordsUserTurnStartStrategy(min_words=3)
         starts = []
 
@@ -620,12 +625,78 @@ class TestMinWordsResetPreservesBotState(unittest.IsolatedAsyncioTestCase):
 
         await strategy.process_frame(BotStartedSpeakingFrame())
         await strategy.process_frame(BotStoppedSpeakingFrame())
-        await strategy.reset()
+        await strategy.handle_user_turn_started()
 
         await strategy.process_frame(
             TranscriptionFrame(text="כן", user_id="u", timestamp="")
         )
         self.assertEqual(len(starts), 1)
+
+    async def test_deprecated_reset_is_not_the_preservation_mechanism(self):
+        """The preservation must live where the controller looks for it.
+
+        Overriding the deprecated ``reset()`` would leave ``_bot_speaking``
+        untouched only by accident, and it would emit a DeprecationWarning at
+        class-definition time. Pin the mechanism to the supported callback so a
+        later "fix" cannot quietly move it back.
+        """
+        cls = MinWordsUserTurnStartStrategy
+        self.assertIsNot(
+            cls.handle_user_turn_started,
+            BaseUserTurnStartStrategy.handle_user_turn_started,
+            "MinWords must own the turn-start callback, not inherit the "
+            "deprecated reset() bridge",
+        )
+        self.assertIs(
+            cls.reset,
+            BaseUserTurnStartStrategy.reset,
+            "MinWords must not override the deprecated reset()",
+        )
+
+    async def test_controller_turn_start_leaves_the_gate_raised(self):
+        """End-to-end: the real controller callback, on the real strategy.
+
+        Proves the two halves line up — the controller notifies MinWords when a
+        turn opens, and MinWords survives that notification with its gate still
+        at ``min_words`` because the bot never stopped speaking.
+        """
+        strategy = MinWordsUserTurnStartStrategy(min_words=3, use_interim=False)
+        controller = UserTurnController(
+            user_turn_strategies=UserTurnStrategies(
+                start=[strategy],
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=NEVER)],
+            )
+        )
+        await controller.setup(TaskManager())
+
+        starts = []
+
+        @controller.event_handler("on_user_turn_started")
+        async def on_user_turn_started(controller, strategy, params):
+            starts.append(params)
+
+        await controller.process_frame(BotStartedSpeakingFrame())
+
+        # A single word must not open the turn while the bot speaks.
+        await controller.process_frame(
+            TranscriptionFrame(text="כן", user_id="u", timestamp="now")
+        )
+        self.assertEqual(starts, [])
+        self.assertFalse(controller.has_active_user_turn)
+
+        # Three words do — and this is what makes the controller notify every
+        # start strategy that a turn began.
+        await controller.process_frame(
+            TranscriptionFrame(text="רגע יש לי", user_id="u", timestamp="now")
+        )
+        self.assertEqual(len(starts), 1)
+        self.assertTrue(controller.has_active_user_turn)
+
+        # The assertion this test exists for: the bot is still speaking, so the
+        # gate for the remainder of this utterance is still `min_words`, not 1.
+        self.assertTrue(strategy._bot_speaking)
+
+        await controller.cleanup()
 
 
 DEBOUNCE_SECS = 0.05

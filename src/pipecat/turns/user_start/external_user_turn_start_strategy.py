@@ -50,13 +50,21 @@ class ExternalUserTurnStartStrategy(BaseUserTurnStartStrategy):
                 proposal opens a turn. Ignored on the adopt path, where the
                 emitter has already broadcast one.
 
-                The default is True because the realtime services this fork
-                drives (OpenAI Realtime, Grok/xAI Realtime) now emit
+                The default is True because on the proposal path nothing else
+                broadcasts the interruption — the proposing emitter has
+                deliberately handed that job to this strategy. Several
+                turn-detecting services take that path (Deepgram Flux, Soniox
+                and Gladia among them): they emit
                 :class:`~pipecat.frames.frames.ProposedUserStartedSpeakingFrame`
-                and no longer call ``broadcast_interruption()`` themselves —
-                the interruption is this strategy's job on that path. Passing
-                False there disables barge-in entirely rather than deferring it
-                to the provider.
+                and never interrupt themselves, so ``False`` there silently
+                kills barge-in. Deepgram Flux is the one the VoiceMan api wires
+                this strategy for by hand.
+
+                It has no effect for the realtime services this fork drives
+                (OpenAI Realtime, Grok/xAI Realtime): both broadcast the real
+                :class:`~pipecat.frames.frames.UserStartedSpeakingFrame` plus
+                their own interruption, which puts them on the adopt path where
+                this flag is ignored.
 
             **kwargs: Additional keyword arguments.
         """

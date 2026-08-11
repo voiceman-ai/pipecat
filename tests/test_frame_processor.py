@@ -679,6 +679,13 @@ class TestHeartbeatIgnoresProcessingPause(unittest.IsolatedAsyncioTestCase):
     for the entire utterance playout. Routing heartbeats around the output
     transport's paced audio queue fixes nothing if they then park here for the
     same duration: the traversal latency would once again be the playout backlog.
+
+    The same argument applies to the *other* pause path,
+    ``pause_processing_all_frames_until()``, which additionally holds the input
+    queue. That gate sits ahead of the ``isinstance(frame, SystemFrame)``
+    dispatch, so it holds every frame class — a ``HeartbeatFrame`` is
+    ``(ControlFrame, UninterruptibleFrame)``, not a ``SystemFrame`` — and must
+    exempt the probe too.
     """
 
     async def _make_processor(self):
@@ -733,6 +740,49 @@ class TestHeartbeatIgnoresProcessingPause(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(blocked, pushed)
 
             await processor.resume_processing_frames()
+            await asyncio.sleep(0.1)
+
+            self.assertIn(blocked, pushed)
+        finally:
+            await processor.cleanup()
+
+    async def test_heartbeat_traverses_while_all_frames_are_paused(self):
+        """`pause_processing_all_frames_until()` must not park the probe either.
+
+        This path holds the *input* queue as well, and that gate runs before the
+        system-frame dispatch, so it would otherwise hold the heartbeat for the
+        full readiness wait (up to PAUSE_UNTIL_READY_TIMEOUT_SECS).
+        """
+        processor, pushed = await self._make_processor()
+        try:
+            never = asyncio.Event()
+            await processor.pause_processing_all_frames_until(never.wait, timeout=30.0)
+
+            heartbeat = HeartbeatFrame(timestamp=0)
+            await processor.queue_frame(heartbeat, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.1)
+
+            self.assertIn(heartbeat, pushed)
+        finally:
+            await processor.cleanup()
+
+    async def test_pause_all_still_blocks_real_work_after_a_heartbeat(self):
+        """The exemption must not disarm either queue's hold for other frames."""
+        processor, pushed = await self._make_processor()
+        try:
+            ready = asyncio.Event()
+            await processor.pause_processing_all_frames_until(ready.wait, timeout=30.0)
+
+            heartbeat = HeartbeatFrame(timestamp=0)
+            blocked = TextFrame(text="must wait for the readiness condition")
+            await processor.queue_frame(heartbeat, FrameDirection.DOWNSTREAM)
+            await processor.queue_frame(blocked, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.1)
+
+            self.assertIn(heartbeat, pushed)
+            self.assertNotIn(blocked, pushed)
+
+            ready.set()
             await asyncio.sleep(0.1)
 
             self.assertIn(blocked, pushed)

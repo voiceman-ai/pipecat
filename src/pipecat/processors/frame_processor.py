@@ -863,7 +863,10 @@ class FrameProcessor(BaseObject):
         # An orphaned process task may still be unwinding an in-flight frame
         # (see __interrupt_process_task); the interruption already flushed
         # everything it produced, so anything more it pushes is stale.
-        if self.__orphaned_process_tasks and asyncio.current_task() in self.__orphaned_process_tasks:
+        if (
+            self.__orphaned_process_tasks
+            and asyncio.current_task() in self.__orphaned_process_tasks
+        ):
             logger.debug(f"{self}: dropping {frame.name} pushed by an orphaned process task")
             return
 
@@ -1318,7 +1321,25 @@ class FrameProcessor(BaseObject):
         while True:
             (frame, direction, callback) = await self.__input_queue.get()
 
-            if self.__should_block_system_frames and self.__input_event:
+            # This gate runs BEFORE the SystemFrame dispatch below, so it holds
+            # every frame class, not just system frames. A HeartbeatFrame is
+            # (ControlFrame, UninterruptibleFrame) — not a SystemFrame — so
+            # without this exemption the health probe parks here for the whole
+            # hold, which is the same defect the process-queue exemption below
+            # exists to prevent, merely moved one queue upstream. Both holders
+            # of this queue can run for a long time relative to the heartbeat
+            # period: `pause_processing_all_frames_until()` holds it for up to
+            # PAUSE_UNTIL_READY_TIMEOUT_SECS (e.g. Deepgram STT waiting on its
+            # websocket), and ParallelPipeline holds it across lifecycle-frame
+            # synchronization. A heartbeat carries no ordering semantics, so
+            # letting it through changes nothing those holds are protecting.
+            # As with the process queue, the pause flag is deliberately left
+            # armed so the next non-heartbeat frame still blocks.
+            if (
+                self.__should_block_system_frames
+                and self.__input_event
+                and not isinstance(frame, HeartbeatFrame)
+            ):
                 logger.trace(f"{self}: system frame processing paused")
                 await self.__input_event.wait()
                 self.__input_event.clear()

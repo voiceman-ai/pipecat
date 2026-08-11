@@ -27,9 +27,9 @@ from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
     EndFrame,
     Frame,
-    HeartbeatFrame,
     StartFrame,
     TextFrame,
+    UserStartedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineWorker
@@ -39,7 +39,7 @@ from pipecat.processors.frame_processor import (
     FrameProcessor,
     FrameProcessorSetup,
 )
-from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
+from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.runner import WorkerRunner
 
 
@@ -61,8 +61,9 @@ class WedgeProcessor(FrameProcessor):
 
 
 async def _setup_processor(processor: FrameProcessor) -> TaskManager:
+    # Upstream 1.5.0 deprecated TaskManager.setup()/TaskManagerParams; the
+    # constructor now binds the running loop itself.
     task_manager = TaskManager()
-    task_manager.setup(TaskManagerParams(loop=asyncio.get_event_loop()))
     await processor.setup(
         FrameProcessorSetup(
             clock=SystemClock(),
@@ -156,7 +157,13 @@ async def test_paused_processor_reads_as_paused_not_wedged():
 
 @pytest.mark.asyncio
 async def test_input_queue_depth_counts_undispatched_system_frames():
-    """System frames parked behind pause_processing_system_frames() must show up."""
+    """System frames parked behind pause_processing_system_frames() must show up.
+
+    Deliberately NOT driven with ``HeartbeatFrame``: the health probe is exempt
+    from both pause gates (see TestHeartbeatIgnoresProcessingPause in
+    tests/test_frame_processor.py), so it would sail through and never show up
+    in the depth. Any other frame class parks.
+    """
     processor = IdentityFilter()
     await _setup_processor(processor)
     try:
@@ -165,10 +172,10 @@ async def test_input_queue_depth_counts_undispatched_system_frames():
 
         await processor.pause_processing_system_frames()
         for _ in range(3):
-            await processor.queue_frame(HeartbeatFrame(timestamp=0), FrameDirection.DOWNSTREAM)
+            await processor.queue_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
         await asyncio.sleep(0.1)
 
-        # One heartbeat is held by the parked input task; the rest are queued.
+        # One frame is held by the parked input task; the rest are queued.
         assert processor.input_queue_depth == 2
 
         await processor.resume_processing_system_frames()

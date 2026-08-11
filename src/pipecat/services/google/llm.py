@@ -27,12 +27,8 @@ from pipecat.adapters.base_llm_adapter import LLMContextConversionError
 from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.frames.frames import (
     AssistantImageRawFrame,
-    AudioRawFrame,
     BotStoppedSpeakingFrame,
     Frame,
-    FunctionCallCancelFrame,
-    FunctionCallInProgressFrame,
-    FunctionCallResultFrame,
     FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
@@ -620,9 +616,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             if aclose is not None:
                 await aclose()
 
-    def _handle_finish_reason(
-        self, finish_reason: FinishReason, finish_message: str | None = None
-    ):
+    def _handle_finish_reason(self, finish_reason: FinishReason, finish_message: str | None = None):
         """Log why Gemini stopped generating, when it stopped for a notable reason.
 
         Anything other than a normal stop leaves the turn short of what the model
