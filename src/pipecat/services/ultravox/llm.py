@@ -225,6 +225,7 @@ class UltravoxRealtimeLLMService(LLMService):
             **kwargs,
         )
         self._params = params
+        self._selected_tools: ToolsSchema | None = None
         if one_shot_selected_tools:
             if not isinstance(self._params, OneShotInputParams):
                 logger.warning(
