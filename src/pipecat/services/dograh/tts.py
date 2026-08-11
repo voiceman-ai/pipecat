@@ -210,7 +210,7 @@ class DograhTTSService(WebsocketTTSService):
 
             await ws.send(json.dumps(config_msg))
 
-            logger.info(f"Connected to Dograh TTS service")
+            logger.info("Connected to Dograh TTS service")
 
         except Exception as e:
             self._websocket = None
