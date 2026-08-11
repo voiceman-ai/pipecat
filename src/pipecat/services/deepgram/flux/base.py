@@ -20,18 +20,19 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     InterimTranscriptionFrame,
+    ProposedUserStartedSpeakingFrame,
+    ProposedUserStoppedSpeakingFrame,
     StartFrame,
     STTMetadataFrame,
     TranscriptionFrame,
-    UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, assert_given
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 
 def language_to_deepgram_flux_language(language: Language) -> str:
@@ -123,18 +124,22 @@ class DeepgramFluxSTTSettings(STTSettings):
             confidence (default 5000).
         keyterm: Keyterms to boost recognition accuracy for specialized terminology.
         min_confidence: Minimum confidence required to create a TranscriptionFrame.
+        numerals: Convert spoken numbers to numeral form (e.g. "twenty three" → "23").
+            Connection-time only: Flux does not support toggling numerals
+            mid-stream, so updates via ``STTUpdateSettingsFrame`` are ignored.
         language_hints: Languages to bias transcription toward. Only honored by the
             ``flux-general-multi`` model. An empty list clears any active hints;
             ``None``/``NOT_GIVEN`` means no hints (auto-detect). Can be updated
             mid-stream via ``STTUpdateSettingsFrame``.
     """
 
-    eager_eot_threshold: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    eot_threshold: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    eot_timeout_ms: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    keyterm: list | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    min_confidence: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    language_hints: list[Language] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    eager_eot_threshold: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    eot_threshold: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    eot_timeout_ms: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    keyterm: list | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    min_confidence: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    numerals: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    language_hints: list[Language] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class DeepgramFluxSTTBase(STTService):
@@ -156,6 +161,11 @@ class DeepgramFluxSTTBase(STTService):
         "language_hints",
     }
     _MULTILINGUAL_MODEL = "flux-general-multi"
+    # How long an in-flight Configure is trusted before a new update supersedes
+    # it outright. Flux caps the number of un-acked Configure messages, so at
+    # most one is ever in flight; this bounds how long a missing ack can block
+    # later updates from ever being sent.
+    _CONFIGURE_ACK_TIMEOUT = 5.0
 
     def __init__(
         self,
@@ -175,7 +185,10 @@ class DeepgramFluxSTTBase(STTService):
             mip_opt_out: Opt out of the Deepgram Model Improvement Program.
             tag: Tags to label requests for identification during usage reporting.
             should_interrupt: Whether to interrupt the bot when Flux detects that
-                the user is speaking.
+                the user is speaking. Passed along to the user turn strategies
+                this service recommends, which own the interruption; a
+                user-supplied ``user_turn_strategies`` overrides the
+                recommendation and this setting with it.
             watchdog_min_timeout: minimum idle timeout before sending silence to
                 prevent dangling turns. The actual threshold is
                 ``max(chunk_duration * 2, watchdog_min_timeout)``. Defaults to 0.5.
@@ -193,6 +206,16 @@ class DeepgramFluxSTTBase(STTService):
 
         # Connection readiness: Flux sends a "Connected" message when ready
         self._connection_established_event = asyncio.Event()
+
+        # Configure serialization: Flux caps the number of un-acked Configure
+        # messages, so we only allow one in flight at a time. A Configure sent
+        # while one is already in flight is coalesced into
+        # `_configure_pending_fields` instead, and sent once the in-flight one
+        # is acked (see `_on_configure_acked`) — only the latest settings
+        # matter, so there's no need to replay every intermediate update.
+        self._configure_in_flight = False
+        self._configure_sent_at: float | None = None
+        self._configure_pending_fields: set[str] | None = None
 
         # Watchdog state — see _watchdog_task_handler for details
         self._last_stt_time: float | None = None
@@ -219,12 +242,14 @@ class DeepgramFluxSTTBase(STTService):
         """Recommend external turn strategies: Flux detects turns server-side.
 
         Flux emits its own start-of-turn and end-of-turn events (as
-        ``UserStarted/StoppedSpeakingFrame``), so the user aggregator defers to
-        those rather than running local VAD/smart-turn. Applied unless the user
-        passed their own ``user_turn_strategies``.
+        ``ProposedUserStarted/StoppedSpeakingFrame``), so the user aggregator
+        resolves those rather than running local VAD/smart-turn. Applied unless
+        the user passed their own ``user_turn_strategies``.
         """
         frame = super().service_metadata_frame()
-        frame.user_turn_strategies = ExternalUserTurnStrategies()
+        frame.user_turn_strategies = ExternalUserTurnStrategies(
+            enable_interruptions=self._should_interrupt,
+        )
         return frame
 
     # ------------------------------------------------------------------
@@ -277,6 +302,9 @@ class DeepgramFluxSTTBase(STTService):
         if self._settings.eot_timeout_ms is not None:
             params.append(f"eot_timeout_ms={self._settings.eot_timeout_ms}")
 
+        if self._settings.numerals is not None:
+            params.append(f"numerals={str(self._settings.numerals).lower()}")
+
         if self._mip_opt_out is not None:
             params.append(f"mip_opt_out={str(self._mip_opt_out).lower()}")
 
@@ -290,7 +318,7 @@ class DeepgramFluxSTTBase(STTService):
 
         # Add language_hint parameters (only valid on flux-general-multi)
         hints = self._settings.language_hints
-        if hints and not isinstance(hints, _NotGiven):
+        if hints and is_given(hints):
             if self._settings.model == self._MULTILINGUAL_MODEL:
                 for code in _prepare_language_hints(hints):
                     params.append(urlencode({"language_hint": code}))
@@ -309,6 +337,9 @@ class DeepgramFluxSTTBase(STTService):
         num_samples = int(self.sample_rate * duration_secs)
         silence = b"\x00" * (num_samples * sample_width * num_channels)
         await self._transport_send_audio(silence)
+        # Watchdog silence is real audio submitted to the service, so it
+        # counts toward usage.
+        self._record_stt_audio_usage(silence)
 
     async def _watchdog_task_handler(self):
         """Prevent dangling turns by sending silence when audio stops flowing.
@@ -386,16 +417,6 @@ class DeepgramFluxSTTBase(STTService):
         await super().cleanup()
         await self._disconnect()
 
-    async def start_metrics(self):
-        """Start TTFB and processing metrics collection."""
-        # TTFB (Time To First Byte) metrics are currently disabled for Deepgram Flux.
-        # Ideally, TTFB should measure the time from when a user starts speaking
-        # until we receive the first transcript. However, Deepgram Flux delivers
-        # both the "user started speaking" event and the first transcript simultaneously,
-        # making this timing measurement meaningless in this context.
-        # await self.start_ttfb_metrics()
-        await self.start_processing_metrics()
-
     @traced_stt
     async def _handle_transcription(
         self, transcript: str, is_final: bool, language: Language | None = None
@@ -409,9 +430,28 @@ class DeepgramFluxSTTBase(STTService):
         Builds a Configure JSON message containing only the fields that changed
         and sends it over the existing connection.
 
+        At most one Configure is ever in flight, since Flux caps the number of
+        un-acked Configure messages. If one is already in flight, ``fields`` is
+        merged into the pending set and sent once the in-flight one is acked
+        (see ``_on_configure_acked``) instead of being sent now — the message is
+        always built from the current settings, so only the latest values ever
+        need to go out. An in-flight Configure older than
+        ``_CONFIGURE_ACK_TIMEOUT`` is treated as lost so a missing ack can't
+        permanently block later updates.
+
         Args:
             fields: Set of changed field names to include in the message.
         """
+        if self._configure_in_flight:
+            assert self._configure_sent_at is not None
+            if time.monotonic() - self._configure_sent_at < self._CONFIGURE_ACK_TIMEOUT:
+                self._configure_pending_fields = (self._configure_pending_fields or set()) | fields
+                return
+            logger.warning(
+                f"{self}: timed out after {self._CONFIGURE_ACK_TIMEOUT}s waiting for "
+                "Configure ack; sending the next Configure anyway"
+            )
+
         message: dict[str, Any] = {"type": "Configure"}
 
         if "keyterm" in fields:
@@ -437,13 +477,46 @@ class DeepgramFluxSTTBase(STTService):
                 hints = self._settings.language_hints
                 # Empty list clears hints; NOT_GIVEN/None also treated as clear
                 # since we only reach this branch when the user set the field.
-                if hints is None or isinstance(hints, _NotGiven):
+                if hints is None or not is_given(hints):
                     message["language_hints"] = []
                 else:
                     message["language_hints"] = _prepare_language_hints(hints)
 
+        self._configure_in_flight = True
+        self._configure_sent_at = time.monotonic()
         logger.debug(f"{self}: sending Configure message: {message}")
         await self._transport_send_json(message)
+
+    async def _on_configure_acked(self):
+        """Mark the in-flight Configure as acked and flush any pending update.
+
+        Called when a ConfigureSuccess/ConfigureFailure arrives. If fields were
+        coalesced into ``_configure_pending_fields`` while this Configure was in
+        flight, immediately sends a follow-up Configure covering all of them —
+        unless the transport has since gone inactive, in which case the pending
+        fields are simply dropped, since a reconnect re-applies current settings
+        via the connection URL anyway. Safe to call with nothing in flight (e.g.
+        a stray/duplicate ack), which is a no-op.
+        """
+        self._configure_in_flight = False
+        self._configure_sent_at = None
+        if self._configure_pending_fields is not None:
+            fields = self._configure_pending_fields
+            self._configure_pending_fields = None
+            if self._transport_is_active():
+                await self._send_configure(fields)
+
+    def _reset_configure_state(self):
+        """Clear Configure-serialization state during teardown.
+
+        Called when the connection is torn down (including ahead of a
+        reconnect), since any in-flight or pending Configure can no longer be
+        acked or sent on a dead connection. A reconnect re-applies the current
+        settings via the connection URL, so nothing needs to be replayed.
+        """
+        self._configure_in_flight = False
+        self._configure_sent_at = None
+        self._configure_pending_fields = None
 
     async def _update_settings(self, delta: Settings) -> dict[str, Any]:
         """Apply a settings delta.
@@ -520,11 +593,13 @@ class DeepgramFluxSTTBase(STTService):
                 await self._handle_turn_info(data)
             case FluxMessageType.CONFIGURE_SUCCESS:
                 logger.info(f"{self}: Configure accepted: {data}")
+                await self._on_configure_acked()
             case FluxMessageType.CONFIGURE_FAILURE:
                 error_code = data.get("error_code", "unknown")
                 description = data.get("description", "no description")
                 error_msg = f"Configure rejected: [{error_code}] {description}"
                 logger.warning(f"{self}: {error_msg}")
+                await self._on_configure_acked()
                 await self.push_error(error_msg=error_msg)
 
     async def _handle_connection_established(self):
@@ -595,23 +670,18 @@ class DeepgramFluxSTTBase(STTService):
         """Handle StartOfTurn events from Deepgram Flux.
 
         StartOfTurn events are fired when Deepgram Flux detects the beginning
-        of a new speaking turn. This triggers bot interruption to stop any
-        ongoing speech synthesis and signals the start of user speech detection.
+        of a new speaking turn.
 
         The service will:
-        - Send a BotInterruptionFrame upstream to stop bot speech
-        - Send a UserStartedSpeakingFrame downstream to notify other components
-        - Start metrics collection for measuring response times
+        - Propose a turn start, which the user turn strategies resolve into a
+          UserStartedSpeakingFrame and an interruption
 
         Args:
             transcript: maybe the first few words of the turn.
         """
         logger.debug("User started speaking")
         self._user_is_speaking = True
-        await self.broadcast_frame(UserStartedSpeakingFrame)
-        if self._should_interrupt:
-            await self.broadcast_interruption()
-        await self.start_metrics()
+        await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
         await self._call_event_handler("on_start_of_turn", transcript)
         if transcript:
             logger.trace(f"Start of turn transcript: {transcript}")
@@ -670,8 +740,8 @@ class DeepgramFluxSTTBase(STTService):
         The service will:
         - Create and send a final TranscriptionFrame with the complete transcript
         - Trigger transcription handling with tracing for metrics
-        - Stop processing metrics collection
-        - Send a UserStoppedSpeakingFrame to signal turn completion
+        - Propose a turn stop, which the user turn strategies resolve into a
+          UserStoppedSpeakingFrame
 
         Args:
             transcript: The final transcript text for the completed turn.
@@ -690,6 +760,9 @@ class DeepgramFluxSTTBase(STTService):
         if not min_confidence or (
             average_confidence is not None and average_confidence > min_confidence
         ):
+            # Report usage before the transcription frame so tracing can
+            # attach it to the STT span the frame closes.
+            await self.emit_stt_usage_metrics()
             # EndOfTurn means Flux has determined the turn is complete,
             # so this TranscriptionFrame is always finalized
             await self.push_frame(
@@ -708,8 +781,7 @@ class DeepgramFluxSTTBase(STTService):
             )
 
         await self._handle_transcription(transcript, True, detected_language)
-        await self.stop_processing_metrics()
-        await self.broadcast_frame(UserStoppedSpeakingFrame)
+        await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
         await self._call_event_handler("on_end_of_turn", transcript)
 
     async def _handle_eager_end_of_turn(self, transcript: str, data: dict[str, Any]):

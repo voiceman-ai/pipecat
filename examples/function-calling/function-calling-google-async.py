@@ -40,7 +40,7 @@ load_dotenv(override=True)
 
 
 @tool_options(cancel_on_interruption=False, timeout_secs=30)
-async def get_weather(params: FunctionCallParams, location: str, format: str):
+async def get_current_weather(params: FunctionCallParams, location: str, format: str):
     """Get the current weather.
 
     Args:
@@ -48,8 +48,9 @@ async def get_weather(params: FunctionCallParams, location: str, format: str):
         format: The temperature unit to use. Must be either "celsius" or "fahrenheit". Infer this from the user's location.
     """
     # Simulate a long-running API call, so we can test async function calls (cancel_on_interruption=False).
-    await asyncio.sleep(20)
-    await params.result_callback(f"The weather in {location} is currently 72 degrees and sunny.")
+    await asyncio.sleep(15)
+    logger.debug(f"Returning get_current_weather result.")
+    await params.result_callback({"conditions": "nice", "temperature": "75"})
 
 
 async def get_restaurant_recommendation(params: FunctionCallParams, location: str):
@@ -161,7 +162,7 @@ indicate you should use the get_image tool are:
             logger.info(f"Function call cancelled: {item.function_name} [{item.tool_call_id}]")
 
     # cancel_on_interruption=False (set via @tool_options) makes this an async
-    # function call..
+    # function call.
     context = LLMContext(tools=[get_current_weather, get_image, get_restaurant_recommendation])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
@@ -189,6 +190,10 @@ indicate you should use the get_image tool are:
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
 
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+
+    await runner.add_workers(worker)
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info(f"Client connected: {client}")
@@ -209,11 +214,8 @@ indicate you should use the get_image tool are:
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
-        await worker.cancel()
+        await runner.cancel()
 
-    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
-
-    await runner.add_workers(worker)
     await runner.run()
 
 

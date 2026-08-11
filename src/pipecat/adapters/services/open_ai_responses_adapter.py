@@ -6,6 +6,7 @@
 
 """OpenAI Responses API adapter for Pipecat."""
 
+import copy
 from typing import Any, Required, TypedDict, cast
 
 from openai._types import NotGiven as OpenAINotGiven
@@ -13,6 +14,7 @@ from openai.types.responses import FunctionToolParam, ResponseInputItemParam, To
 
 from pipecat.adapters.base_llm_adapter import BaseLLMAdapter
 from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
+from pipecat.adapters.services.open_ai_adapter import openai_from_llm_context_tools
 from pipecat.processors.aggregators.llm_context import (
     LLMContext,
     LLMContextMessage,
@@ -79,7 +81,8 @@ class OpenAIResponsesLLMAdapter(BaseLLMAdapter[OpenAIResponsesLLMInvocationParam
 
         params: OpenAIResponsesLLMInvocationParams = {
             "input": input_items,
-            "tools": self.from_standard_tools(context.tools),
+            # NOTE: LLMContext's tools are guaranteed to be a ToolsSchema (or NOT_GIVEN)
+            "tools": openai_from_llm_context_tools(self.from_standard_tools(context.tools)),
         }
 
         if system_instruction:
@@ -140,7 +143,8 @@ class OpenAIResponsesLLMAdapter(BaseLLMAdapter[OpenAIResponsesLLMInvocationParam
     def get_messages_for_logging(self, context: LLMContext) -> list[dict[str, Any]]:
         """Get messages from context in a format ready for logging.
 
-        Binary data (images, audio) is replaced with short placeholders.
+        Binary data (images, audio) is replaced with short placeholders, and
+        reasoning messages' encrypted payloads are elided.
 
         Args:
             context: The LLM context containing messages.
@@ -148,10 +152,20 @@ class OpenAIResponsesLLMAdapter(BaseLLMAdapter[OpenAIResponsesLLMInvocationParam
         Returns:
             List of messages in a format ready for logging.
         """
-        return cast(
-            list[dict[str, Any]],
-            self.get_messages(context, truncate_large_values=True),
-        )
+        # Sanitize messages for logging
+        messages_for_logging: list[dict[str, Any]] = []
+        for message in self.get_messages(context, truncate_large_values=True):
+            if isinstance(message, LLMSpecificMessage):
+                # Responses-specific messages are reasoning items (see
+                # _BaseOpenAIResponsesLLMService._append_reasoning_message).
+                # Elide the encrypted payload, which is opaque noise in logs.
+                msg: dict[str, Any] = copy.deepcopy(message.message)
+                if isinstance(msg, dict) and msg.get("encrypted_content"):
+                    msg["encrypted_content"] = "..."
+                messages_for_logging.append(msg)
+            else:
+                messages_for_logging.append(cast(dict[str, Any], message))
+        return messages_for_logging
 
     def _convert_messages_to_input(
         self, messages: list[LLMContextMessage]
@@ -168,7 +182,7 @@ class OpenAIResponsesLLMAdapter(BaseLLMAdapter[OpenAIResponsesLLMInvocationParam
 
         for message in messages:
             if isinstance(message, LLMSpecificMessage):
-                result.append(message.message)
+                result.append(self._from_specific_message(message))
                 continue
 
             role = message.get("role")
@@ -221,6 +235,32 @@ class OpenAIResponsesLLMAdapter(BaseLLMAdapter[OpenAIResponsesLLMInvocationParam
                 )
 
         return result
+
+    def _from_specific_message(self, message: LLMSpecificMessage) -> ResponseInputItemParam:
+        """Convert an OpenAI-Responses-specific message to an input item.
+
+        Reasoning messages — persisted so the model's prior reasoning round-trips
+        on later turns — become Responses ``reasoning`` input items. Anything
+        else is assumed to already be in Responses input shape.
+
+        Args:
+            message: The LLM-specific message from the context.
+
+        Returns:
+            A Responses API input item.
+        """
+        payload = message.message
+        if isinstance(payload, dict) and payload.get("type") == "reasoning":
+            item: dict[str, Any] = {
+                "type": "reasoning",
+                "id": payload.get("id"),
+                "summary": payload.get("summary", []),
+            }
+            encrypted = payload.get("encrypted_content")
+            if encrypted:
+                item["encrypted_content"] = encrypted
+            return cast(ResponseInputItemParam, item)
+        return cast(ResponseInputItemParam, payload)
 
     def _convert_multimodal_content(self, content: list) -> list:
         """Convert multimodal content parts to Responses API format.

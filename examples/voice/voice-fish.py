@@ -63,7 +63,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     tts = FishAudioTTSService(
         api_key=os.environ["FISH_API_KEY"],
         settings=FishAudioTTSService.Settings(
-            voice="4ce7e917cedd4bc2bb2e6ff3a46acaa1",  # Barack Obama
+            voice="933563129e564b19a115bedd57b7406a",
         ),
     )
 
@@ -101,6 +101,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
 
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+
+    await runner.add_workers(worker)
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
@@ -113,11 +117,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
-        await worker.cancel()
+        await runner.cancel()
 
-    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
-
-    await runner.add_workers(worker)
     await runner.run()
 
 

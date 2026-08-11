@@ -11,6 +11,8 @@ import asyncio
 from pipecat.frames.frames import (
     Frame,
     InterimTranscriptionFrame,
+    ProposedUserStartedSpeakingFrame,
+    ProposedUserStoppedSpeakingFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -23,7 +25,10 @@ from pipecat.turns.user_start import (
     BaseUserTurnStartStrategy,
     UserTurnStartedParams,
 )
-from pipecat.turns.user_stop import BaseUserTurnStopStrategy, UserTurnStoppedParams
+from pipecat.turns.user_stop import (
+    BaseUserTurnStopStrategy,
+    UserTurnStoppedParams,
+)
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import BaseTaskManager
 from pipecat.utils.base_object import BaseObject
@@ -151,6 +156,29 @@ class UserTurnController(BaseObject):
         """Whether a user turn is currently active."""
         return self._user_turn
 
+    @property
+    def resolves_proposed_turn_start_frames(self) -> bool:
+        """Whether any active start strategy resolves proposed turn starts.
+
+        A proposal is resolved once, so a caller holding this controller should stop
+        forwarding :class:`~pipecat.frames.frames.ProposedUserStartedSpeakingFrame`
+        when this is True — passing it along would let a resolver further down
+        the pipeline decide the same turn a second time.
+        """
+        return any(
+            s.resolves_proposed_turn_start_frames for s in self._user_turn_strategies.start or []
+        )
+
+    @property
+    def resolves_proposed_turn_stop_frames(self) -> bool:
+        """Whether any active stop strategy resolves proposed turn stops.
+
+        The end-of-turn counterpart to :attr:`resolves_proposed_turn_start_frames`.
+        """
+        return any(
+            s.resolves_proposed_turn_stop_frames for s in self._user_turn_strategies.stop or []
+        )
+
     async def force_user_turn_stop(self, *, enable_user_speaking_frames: bool = True):
         """Force the current user turn to stop.
 
@@ -164,13 +192,21 @@ class UserTurnController(BaseObject):
         if not self._user_turn:
             return
 
+        # Clearing `_user_speaking` is load-bearing, not just bookkeeping:
+        # `_trigger_user_turn_stop` refuses to finalize while the user is
+        # audibly speaking, and a forced stop is precisely the case where the
+        # decision came from downstream semantics rather than from silence.
         self._user_speaking = False
         self._user_turn_stop_timeout_event.set()
 
         # Clear any partially accumulated start-strategy state so the next
-        # turn begins from a clean slate after a semantic stop.
+        # turn begins from a clean slate after a semantic stop. This is the
+        # turn-start reset (upstream renamed `reset()` to
+        # `handle_user_turn_started()`), not `handle_user_turn_stopped()`:
+        # the latter is a no-op for start strategies by design, so it would
+        # leave e.g. a VAD barge-in deferral pending across the forced stop.
         for s in self._user_turn_strategies.start or []:
-            await s.reset()
+            await s.handle_user_turn_started()
 
         await self._trigger_user_turn_stop(
             None, UserTurnStoppedParams(enable_user_speaking_frames=enable_user_speaking_frames)
@@ -187,9 +223,9 @@ class UserTurnController(BaseObject):
             frame: The frame to be processed.
 
         """
-        if isinstance(frame, UserStartedSpeakingFrame):
+        if isinstance(frame, (UserStartedSpeakingFrame, ProposedUserStartedSpeakingFrame)):
             await self._handle_user_started_speaking(frame)
-        elif isinstance(frame, UserStoppedSpeakingFrame):
+        elif isinstance(frame, (UserStoppedSpeakingFrame, ProposedUserStoppedSpeakingFrame)):
             await self._handle_user_stopped_speaking(frame)
         elif isinstance(frame, VADUserStartedSpeakingFrame):
             await self._handle_vad_user_started_speaking(frame)
@@ -245,13 +281,17 @@ class UserTurnController(BaseObject):
             )
             s.remove_event_handler("on_user_turn_stopped", self._on_user_turn_stopped)
 
-    async def _handle_user_started_speaking(self, frame: UserStartedSpeakingFrame):
+    async def _handle_user_started_speaking(
+        self, frame: UserStartedSpeakingFrame | ProposedUserStartedSpeakingFrame
+    ):
         self._user_speaking = True
 
         # The user started talking, let's reset the user turn timeout.
         self._user_turn_stop_timeout_event.set()
 
-    async def _handle_user_stopped_speaking(self, frame: UserStoppedSpeakingFrame):
+    async def _handle_user_stopped_speaking(
+        self, frame: UserStoppedSpeakingFrame | ProposedUserStoppedSpeakingFrame
+    ):
         self._user_speaking = False
 
         # The user stopped talking, let's reset the user turn timeout.
@@ -317,13 +357,14 @@ class UserTurnController(BaseObject):
         self._user_turn = True
         self._user_turn_stop_timeout_event.set()
 
-        # Reset all user turn start strategies to start fresh.
+        # Notify every strategy that the turn has started. Start strategies
+        # ready themselves for the next detection; stop strategies arm to detect
+        # this turn's end. A strategy resets whatever per-turn state it keeps
+        # inside its own handle_user_turn_started.
         for s in self._user_turn_strategies.start or []:
-            await s.reset()
-
-        # Reset all user turn stop strategies to start fresh for the new turn.
+            await s.handle_user_turn_started()
         for s in self._user_turn_strategies.stop or []:
-            await s.reset()
+            await s.handle_user_turn_started()
 
         await self._call_event_handler("on_user_turn_started", strategy, params)
 
@@ -348,12 +389,27 @@ class UserTurnController(BaseObject):
         if not self._user_turn:
             return
 
+        # Never finalize while the user is audibly speaking. A stop strategy can
+        # finalize on a latent signal (e.g. an LLM ✓ that resolves after the
+        # user resumed), which is stale by the time it arrives. Keep the turn
+        # open so the next inference re-evaluates; the watchdog still finalizes
+        # if the user then falls silent. Detector strategies only finalize once
+        # the user has stopped, so this is a no-op for them.
+        if self._user_speaking:
+            return
+
         self._user_turn = False
         self._user_turn_stop_timeout_event.set()
 
-        # Reset all user turn stop strategies to start fresh.
+        # Notify every strategy that the turn has ended. Stop strategies reset
+        # (and, e.g., drop a turn analyzer's buffered speech that must not
+        # survive an externally-ended turn). Start strategies get the same
+        # callback, but it's a no-op by default: their reset is turn-start
+        # semantic, so resetting them here would be wrong.
+        for s in self._user_turn_strategies.start or []:
+            await s.handle_user_turn_stopped()
         for s in self._user_turn_strategies.stop or []:
-            await s.reset()
+            await s.handle_user_turn_stopped()
 
         await self._call_event_handler("on_user_turn_stopped", strategy, params)
 

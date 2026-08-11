@@ -21,7 +21,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 import pipecat.processors.frameworks.rtvi.models as RTVI
-from pipecat.audio.utils import calculate_audio_volume
+from pipecat.audio.volume import AudioVolumeTracker
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     AggregatedTextProgressFrame,
@@ -56,6 +56,7 @@ from pipecat.frames.frames import (
 from pipecat.metrics.metrics import (
     LLMUsageMetricsData,
     ProcessingMetricsData,
+    STTUsageMetricsData,
     TTFAMetricsData,
     TTFBMetricsData,
     TTSUsageMetricsData,
@@ -227,6 +228,8 @@ class RTVIObserver(BaseObserver):
         self._bot_transcription = ""
         self._last_user_audio_level = 0
         self._last_bot_audio_level = 0
+        self._user_volume_tracker = AudioVolumeTracker()
+        self._bot_volume_tracker = AudioVolumeTracker()
 
         # Track bot speaking state for queuing aggregated text frames
         self._bot_is_speaking = False
@@ -567,18 +570,22 @@ class RTVIObserver(BaseObserver):
             else:
                 await self._send_server_response(frame)
         elif isinstance(frame, InputAudioRawFrame) and self._params.user_audio_level_enabled:
+            # Every frame feeds the rolling window, but the window is only
+            # measured when a level is due to be reported.
+            self._user_volume_tracker.update(frame.audio, frame.sample_rate)
             curr_time = time.time()
             diff_time = curr_time - self._last_user_audio_level
             if diff_time > self._params.audio_level_period_secs:
-                level = calculate_audio_volume(frame.audio, frame.sample_rate)
+                level = self._user_volume_tracker.volume
                 message = RTVI.UserAudioLevelMessage(data=RTVI.AudioLevelMessageData(value=level))
                 await self.send_rtvi_message(message)
                 self._last_user_audio_level = curr_time
         elif isinstance(frame, TTSAudioRawFrame) and self._params.bot_audio_level_enabled:
+            self._bot_volume_tracker.update(frame.audio, frame.sample_rate)
             curr_time = time.time()
             diff_time = curr_time - self._last_bot_audio_level
             if diff_time > self._params.audio_level_period_secs:
-                level = calculate_audio_volume(frame.audio, frame.sample_rate)
+                level = self._bot_volume_tracker.volume
                 message = RTVI.BotAudioLevelMessage(data=RTVI.AudioLevelMessageData(value=level))
                 await self.send_rtvi_message(message)
                 self._last_bot_audio_level = curr_time
@@ -840,6 +847,10 @@ class RTVIObserver(BaseObserver):
                 if "tokens" not in metrics:
                     metrics["tokens"] = []
                 metrics["tokens"].append(d.value.model_dump(exclude_none=True))
+            elif isinstance(d, STTUsageMetricsData):
+                if "stt_usage" not in metrics:
+                    metrics["stt_usage"] = []
+                metrics["stt_usage"].append(d.model_dump(exclude_none=True))
             elif isinstance(d, TTSUsageMetricsData):
                 if "characters" not in metrics:
                     metrics["characters"] = []

@@ -48,7 +48,6 @@ from typing import Any, ClassVar
 import aiohttp
 from loguru import logger
 from pydantic import BaseModel, Field
-from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -59,11 +58,12 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
 )
 from pipecat.services.sarvam._sdk import sdk_headers
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, assert_given, is_given
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import InterruptibleTTSService, TextAggregationMode, TTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_tts
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 
 class SarvamTTSModel(StrEnum):
@@ -267,11 +267,11 @@ class SarvamHttpTTSSettings(TTSSettings):
             **Note:** Only supported for bulbul:v3-beta. Ignored for v2.
     """
 
-    enable_preprocessing: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    pace: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    pitch: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    loudness: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    temperature: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_preprocessing: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pace: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pitch: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    loudness: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    temperature: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 @dataclass
@@ -289,8 +289,8 @@ class SarvamTTSSettings(SarvamHttpTTSSettings):
 
     _aliases: ClassVar[dict[str, str]] = {"target_language_code": "language"}
 
-    min_buffer_size: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    max_chunk_length: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    min_buffer_size: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    max_chunk_length: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class SarvamHttpTTSService(TTSService):
@@ -582,8 +582,6 @@ class SarvamHttpTTSService(TTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         try:
             # Build payload with common parameters
             payload = {
@@ -1073,7 +1071,7 @@ class SarvamTTSService(InterruptibleTTSService):
                 "api-subscription-key": self._api_key,
             }
 
-            self._websocket = await websocket_connect(
+            self._websocket = await self._websocket_connect(
                 self._websocket_url,
                 additional_headers=ws_additional_headers,
                 user_agent_header=sdk_headers()["User-Agent"],
@@ -1213,8 +1211,6 @@ class SarvamTTSService(InterruptibleTTSService):
         Yields:
             Frame objects including TTSStartedFrame, TTSAudioRawFrame(s, context_id=context_id), or TTSStoppedFrame.
         """
-        logger.debug(f"Generating TTS: [{text}]")
-
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()

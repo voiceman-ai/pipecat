@@ -43,17 +43,24 @@ class MinWordsUserTurnStartStrategy(BaseUserTurnStartStrategy):
         self._use_interim = use_interim
         self._bot_speaking = False
 
-    async def reset(self):
-        """Reset per-turn state.
+    async def handle_user_turn_started(self):
+        """Ready the strategy for a new user turn.
 
-        ``_bot_speaking`` is deliberately preserved: the turn controller resets
-        every start strategy whenever any turn opens, and no new
+        ``_bot_speaking`` is deliberately preserved: the controller calls this
+        on *every* start strategy whenever any turn opens, and no new
         ``BotStartedSpeakingFrame`` arrives mid-utterance — clearing the flag
         here collapsed the word gate to 1 for the rest of the bot's utterance.
         The flag only tracks bot speech and is maintained solely by the
         bot-started/stopped handlers.
+
+        (Upstream clears the flag here; this fork does not. Mirrors the same
+        deliberate preservation in
+        :class:`~pipecat.turns.user_start.vad_user_turn_start_strategy.VADUserTurnStartStrategy`.)
+
+        Intentionally does not chain to ``super()``: a concrete strategy that
+        overrides this callback opts out of the deprecated ``reset()`` bridge,
+        which is the behavior the base class documents.
         """
-        await super().reset()
 
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         """Process an incoming frame to detect the start of a user turn.

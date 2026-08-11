@@ -53,6 +53,7 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
+from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators import async_tool_messages
 from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMessage
 from pipecat.processors.frame_processor import FrameDirection
@@ -61,9 +62,10 @@ from pipecat.services.aws.nova_sonic.session_continuation import (
     SessionContinuationParams,
 )
 from pipecat.services.llm_service import LLMService
-from pipecat.services.settings import NOT_GIVEN, LLMSettings, _NotGiven, assert_given
+from pipecat.services.settings import LLMSettings
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.time import time_now_iso8601
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 try:
     from aws_sdk_bedrock_runtime.client import (
@@ -240,8 +242,8 @@ class AWSNovaSonicLLMSettings(LLMSettings):
             user has stopped speaking. Can be "LOW", "MEDIUM", or "HIGH".
     """
 
-    voice: str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    endpointing_sensitivity: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    voice: str | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    endpointing_sensitivity: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class AWSNovaSonicLLMService(LLMService[AWSNovaSonicLLMAdapter]):
@@ -539,6 +541,14 @@ class AWSNovaSonicLLMService(LLMService[AWSNovaSonicLLMAdapter]):
         """
         self._wants_connection = False
         await self._disconnect()
+
+    def can_generate_metrics(self) -> bool:
+        """Check if the service can generate usage metrics.
+
+        Returns:
+            True if metrics generation is supported.
+        """
+        return True
 
     #
     # conversation resetting
@@ -1342,6 +1352,9 @@ class AWSNovaSonicLLMService(LLMService[AWSNovaSonicLLMAdapter]):
                         elif "completionEnd" in event_json:
                             # Handle the LLM completion ending
                             await self._handle_completion_end_event(event_json)
+                        elif "usageEvent" in event_json:
+                            # Handle token usage reporting
+                            await self._handle_usage_event(event_json)
         except Exception as e:
             if self._disconnecting:
                 return
@@ -1511,6 +1524,28 @@ class AWSNovaSonicLLMService(LLMService[AWSNovaSonicLLMAdapter]):
         # Session continuation: completionEnd is a fallback completion signal
         if self._sc.on_completion_end():
             self.create_task(self._run_sc_handoff(), name="sc_handoff")
+
+    async def _handle_usage_event(self, event_json):
+        # Nova Sonic reports incremental token usage in details.delta, split into
+        # speech/text buckets for input and output. We report the delta (not the
+        # cumulative details.total) so usage stays incremental per event, matching
+        # the convention of the other speech-to-speech services. Pipecat's
+        # LLMTokenUsage does not separate modalities, so collapse speech + text
+        # into prompt/completion totals.
+        delta = event_json["usageEvent"].get("details", {}).get("delta", {})
+        input_tokens = delta.get("input", {})
+        output_tokens = delta.get("output", {})
+        prompt_tokens = input_tokens.get("speechTokens", 0) + input_tokens.get("textTokens", 0)
+        completion_tokens = output_tokens.get("speechTokens", 0) + output_tokens.get(
+            "textTokens", 0
+        )
+        if prompt_tokens or completion_tokens:
+            tokens = LLMTokenUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            )
+            await self.start_llm_usage_metrics(tokens)
 
     #
     # assistant response reporting

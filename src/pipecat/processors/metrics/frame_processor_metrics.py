@@ -17,6 +17,8 @@ from pipecat.metrics.metrics import (
     LLMUsageMetricsData,
     MetricsData,
     ProcessingMetricsData,
+    STTUsage,
+    STTUsageMetricsData,
     TextAggregationMetricsData,
     TTFAMetricsData,
     TTFBMetricsData,
@@ -31,7 +33,7 @@ class FrameProcessorMetrics(BaseObject):
     Provides comprehensive metrics tracking for frame processing operations,
     including timing measurements, resource usage, and performance analytics.
     Supports TTFB tracking, TTFA tracking, processing duration metrics, and
-    usage statistics for LLM and TTS operations.
+    usage statistics for LLM, STT, and TTS operations.
     """
 
     # Cap on buffered audio while waiting for a TTFA speech onset, so a response
@@ -237,9 +239,30 @@ class FrameProcessorMetrics(BaseObject):
             logstr += f", cache read input tokens: {tokens.cache_read_input_tokens}"
         if tokens.reasoning_tokens:
             logstr += f", reasoning tokens: {tokens.reasoning_tokens}"
+        if tokens.input_audio_tokens:
+            logstr += f", input audio tokens: {tokens.input_audio_tokens}"
+        if tokens.output_audio_tokens:
+            logstr += f", output audio tokens: {tokens.output_audio_tokens}"
+        if tokens.cache_read_input_audio_tokens:
+            logstr += f", cache read input audio tokens: {tokens.cache_read_input_audio_tokens}"
         logger.debug(logstr)
         value = LLMUsageMetricsData(
             processor=self._processor_name(), model=self._model_name(), value=tokens
+        )
+        return MetricsFrame(data=[value])
+
+    async def start_stt_usage_metrics(self, usage: STTUsage):
+        """Record STT usage metrics.
+
+        Args:
+            usage: Usage information for the STT operation.
+
+        Returns:
+            MetricsFrame containing STT usage data.
+        """
+        logger.debug(f"{self._processor_name()} usage audio seconds: {usage.audio_seconds:.3f}")
+        value = STTUsageMetricsData(
+            processor=self._processor_name(), model=self._model_name(), value=usage
         )
         return MetricsFrame(data=[value])
 

@@ -26,7 +26,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
+from pipecat.adapters.services.gemini_live_adapter import GeminiLiveLLMAdapter
 from pipecat.frames.frames import (
     AggregationType,
     BotStartedSpeakingFrame,
@@ -63,11 +63,12 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.frames import LLMSearchOrigin, LLMSearchResponseFrame, LLMSearchResult
 from pipecat.services.google.utils import update_google_client_http_options
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
-from pipecat.services.settings import NOT_GIVEN, LLMSettings, _NotGiven, assert_given
+from pipecat.services.settings import LLMSettings
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.string import match_endofsentence
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_gemini_live, traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 from .file_api import GeminiFileAPI
 
@@ -90,8 +91,10 @@ try:
         HttpOptions,
         LiveConnectConfig,
         LiveServerMessage,
+        MediaModality,
         MediaResolution,
         Modality,
+        ModalityTokenCount,
         Part,
         ProactivityConfig,
         RealtimeInputConfig,
@@ -111,6 +114,34 @@ except ModuleNotFoundError as e:
 # Connection management constants
 MAX_CONSECUTIVE_FAILURES = 3
 CONNECTION_ESTABLISHED_THRESHOLD = 10.0  # seconds
+
+
+def _audio_token_count(details: list[ModalityTokenCount] | None) -> int | None:
+    """Get the AUDIO token count from a modality breakdown, if reported.
+
+    Gemini omits modalities with no tokens (and omits the list entirely when
+    there is no breakdown), so absence means "not reported" rather than zero.
+
+    Args:
+        details: A modality breakdown from usage metadata, e.g.
+            ``prompt_tokens_details``.
+
+    Returns:
+        The AUDIO token count, or ``None`` if not reported.
+    """
+    if not details:
+        return None
+    for entry in details:
+        if entry.modality == MediaModality.AUDIO:
+            return entry.token_count
+    return None
+
+
+# NOTE (fork): upstream's auto-sized user-audio pre-roll constants
+# (AUTOSIZED_USER_AUDIO_PREROLL_MARGIN_SECS / DEFAULT_USER_AUDIO_PREROLL_SECS)
+# are intentionally not carried here. This fork keeps the fixed-length
+# `_user_audio_buffer` trim in `_send_user_audio`, so the constants and the
+# SpeechControlParamsFrame sizing that reads them would be dead code.
 
 
 def language_to_gemini_language(language: Language) -> str:
@@ -343,20 +374,20 @@ class GeminiLiveLLMSettings(LLMSettings):
         proactivity: Proactivity configuration.
     """
 
-    voice: str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    modalities: GeminiModalities | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    language: Language | str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    media_resolution: GeminiMediaResolution | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    vad: GeminiVADParams | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    context_window_compression: ContextWindowCompressionParams | dict | _NotGiven = field(
+    voice: str | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    modalities: GeminiModalities | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    language: Language | str | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    media_resolution: GeminiMediaResolution | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    vad: GeminiVADParams | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    context_window_compression: ContextWindowCompressionParams | dict | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
-    thinking: ThinkingConfig | dict | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enable_affective_dialog: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    proactivity: ProactivityConfig | dict | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    thinking: ThinkingConfig | dict | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_affective_dialog: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    proactivity: ProactivityConfig | dict | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
-class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
+class GeminiLiveLLMService(LLMService[GeminiLiveLLMAdapter]):
     """Provides access to Google's Gemini Live API.
 
     This service enables real-time conversations with Gemini, supporting both
@@ -367,8 +398,8 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
     Settings = GeminiLiveLLMSettings
     _settings: Settings
 
-    # Overriding the default adapter to use the Gemini one.
-    adapter_class = GeminiLLMAdapter
+    # Overriding the default adapter to use the Gemini Live one.
+    adapter_class = GeminiLiveLLMAdapter
 
     @property
     def _is_gemini_3(self) -> bool:
@@ -950,7 +981,9 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
                     tool_name = self._tool_call_id_to_name.get(
                         async_payload.tool_call_id, "tool_call_result"
                     )
-                    response_dict = GeminiLLMAdapter.to_function_response_dict(async_payload.result)
+                    response_dict = GeminiLiveLLMAdapter.to_function_response_dict(
+                        async_payload.result
+                    )
                     delivered = True
                     if send_new_results:
                         delivered = await self._tool_result(
@@ -970,7 +1003,7 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
                 if tool_call_id and tool_call_id not in self._completed_tool_calls:
                     # Found a newly-completed function call - send the result to the service
                     tool_name = self._tool_call_id_to_name.get(tool_call_id, "tool_call_result")
-                    response_dict = GeminiLLMAdapter.to_function_response_dict(
+                    response_dict = GeminiLiveLLMAdapter.to_function_response_dict(
                         message.get("content")
                     )
                     delivered = True
@@ -2055,6 +2088,9 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
             total_tokens=total_tokens,
             cache_read_input_tokens=usage.cached_content_token_count,
             reasoning_tokens=usage.thoughts_token_count,
+            input_audio_tokens=_audio_token_count(usage.prompt_tokens_details),
+            output_audio_tokens=_audio_token_count(usage.response_tokens_details),
+            cache_read_input_audio_tokens=_audio_token_count(usage.cache_tokens_details),
         )
 
         await self.start_llm_usage_metrics(tokens)

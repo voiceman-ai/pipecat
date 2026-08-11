@@ -35,7 +35,7 @@ from pipecat.processors.filters.identity_filter import IdentityFilter
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.registry import WorkerRegistry
 from pipecat.registry.types import WorkerReadyData
-from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
+from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.base_worker import BaseWorker
 from pipecat.workers.runner import WorkerRunner
 
@@ -55,7 +55,6 @@ async def create_test_bus():
     """Create an AsyncQueueBus with a TaskManager for testing."""
     bus = AsyncQueueBus()
     tm = TaskManager()
-    tm.setup(TaskManagerParams(loop=asyncio.get_running_loop()))
     await bus.setup(tm)
     return bus, tm
 
@@ -94,7 +93,7 @@ def make_stub_pipeline_task(name, *, bridged=None, active=True):
     )
 
 
-class TestPipelineTaskLifecycle(unittest.IsolatedAsyncioTestCase):
+class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bus, self.tm = await create_test_bus()
         self.registry = create_test_registry()
@@ -1218,6 +1217,43 @@ class TestJobLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(msgs[0].target, "parent")
         self.assertEqual(msgs[0].job_id, "t1")
         self.assertEqual(msgs[0].data, {"final": True})
+
+    async def test_send_job_stream_end_marks_job_complete(self):
+        """send_job_stream_end removes the job from active_jobs, like send_job_response.
+
+        A cancel that races in after the stream ends is then a no-op: no
+        on_job_cancelled hook and no CANCELLED response for the finished job.
+        """
+        sent = capture_bus(self.bus)
+
+        worker = await self._attach(BaseWorker("worker"))
+        await worker.on_bus_message(
+            BusJobRequestMessage(source="parent", target="worker", job_id="t1")
+        )
+        self.assertIn("t1", worker.active_jobs)
+
+        cancelled = []
+
+        @worker.event_handler("on_job_cancelled")
+        async def on_cancelled(t, message):
+            cancelled.append(message)
+
+        await worker.send_job_stream_end("t1", {"final": True})
+        self.assertNotIn("t1", worker.active_jobs)
+
+        # A late cancel for the already-completed job is ignored.
+        await worker.on_bus_message(
+            BusJobCancelMessage(source="parent", target="worker", job_id="t1")
+        )
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(cancelled, [])
+        cancelled_responses = [
+            m
+            for m in sent
+            if isinstance(m, BusJobResponseMessage) and m.status == JobStatus.CANCELLED
+        ]
+        self.assertEqual(cancelled_responses, [])
 
     async def test_stream_end_triggers_on_job_completed(self):
         """BusJobStreamEndMessage triggers group completion like BusJobResponseMessage."""

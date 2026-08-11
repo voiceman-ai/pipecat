@@ -11,11 +11,14 @@ information to bot functions.
 """
 
 import argparse
+import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from fastapi import WebSocket
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from fastapi import WebSocket
 
 
 class DialinSettings(BaseModel):
@@ -56,6 +59,82 @@ class DailyDialinRequest(BaseModel):
     daily_api_url: str
 
 
+class CallData(BaseModel):
+    """Parsed telephony handshake data from the provider's first WebSocket messages.
+
+    Populated by :func:`pipecat.runner.utils.parse_telephony_websocket` and exposed on
+    ``WebSocketRunnerArguments.call_data`` by ``create_transport``. Gives typed
+    attribute access — ``call_data.to_number``, ``call_data.call_id`` — while staying
+    dict-compatible (``call_data["call_id"]``, ``call_data.get("body", {})``) so bots
+    written against the old dict keep working.
+
+    Fields are populated per provider; absent ones stay ``None``. Provider-specific keys
+    not modeled here remain accessible (``extra="allow"``).
+
+    This base holds the fields common to all providers. Provider-specific fields live
+    on subclasses (:class:`TelnyxCallData`, :class:`ExotelCallData`), which
+    ``parse_telephony_websocket`` / ``create_transport`` construct per provider.
+
+    Parameters:
+        stream_id: Provider media-stream identifier.
+        call_id: Provider call identifier, normalized across providers (Twilio
+            ``callSid``, Plivo ``callId``, Exotel ``call_sid``, Telnyx
+            ``call_control_id``).
+        from_number: Caller's number. Wire key ``from``.
+        to_number: Dialed number. Wire key ``to``.
+        body: Custom parameters sent by the provider (e.g. Twilio TwiML stream
+            parameters).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    stream_id: str | None = None
+    call_id: str | None = None
+    from_number: str | None = Field(default=None, alias="from")
+    to_number: str | None = Field(default=None, alias="to")
+    body: dict = Field(default_factory=dict)
+
+    def _wire_dict(self) -> dict:
+        """The original provider dict shape (wire/alias keys, including extras)."""
+        return self.model_dump(by_alias=True)
+
+    def __getitem__(self, key: str):
+        """Dict-style access, e.g. ``call_data["call_id"]``."""
+        return self._wire_dict()[key]
+
+    def __contains__(self, key: str) -> bool:
+        """``"call_id" in call_data`` — True only when the provider set the value."""
+        wire = self._wire_dict()
+        return key in wire and wire[key] is not None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Dict-style ``.get`` returning ``default`` when the key is missing or unset."""
+        value = self._wire_dict().get(key, default)
+        return default if value is None else value
+
+
+class TelnyxCallData(CallData):
+    """Telnyx-specific parsed telephony handshake data.
+
+    Parameters:
+        outbound_encoding: Telnyx outbound media encoding.
+    """
+
+    outbound_encoding: str | None = None
+
+
+class ExotelCallData(CallData):
+    """Exotel-specific parsed telephony handshake data.
+
+    Parameters:
+        account_sid: Exotel account sid.
+        custom_parameters: Exotel custom parameters.
+    """
+
+    account_sid: str | None = None
+    custom_parameters: str | dict | None = None
+
+
 @dataclass
 class RunnerArguments:
     """Base class for runner session arguments.
@@ -66,6 +145,12 @@ class RunnerArguments:
         pipeline_idle_timeout_secs: Seconds the pipeline may stay idle before
             shutting down.
         body: Optional request body data passed from the runner entry point.
+        call_data: Parsed telephony handshake as a :class:`CallData` model — typed
+            attribute access (``call_data.to_number``) that's also dict-compatible
+            (``call_data["call_id"]``). Populated by ``create_transport`` (or a direct
+            ``parse_telephony_websocket`` call) for telephony connections; ``None``
+            otherwise. Lives on the base so any bot can read ``runner_args.call_data``
+            uniformly, mirroring ``body``.
         session_id: Identifier for this bot session.
         cli_args: Parsed CLI arguments from the runner, when launched via the
             development runner.
@@ -76,6 +161,7 @@ class RunnerArguments:
     handle_sigterm: bool = field(init=False, kw_only=True)
     pipeline_idle_timeout_secs: int = field(init=False, kw_only=True)
     body: Any | None = field(default_factory=dict, kw_only=True)
+    call_data: CallData | None = field(default=None, kw_only=True)
     session_id: str | None = field(default=None, kw_only=True)
     cli_args: argparse.Namespace | None = field(default=None, init=False, kw_only=True)
 
@@ -118,15 +204,19 @@ class VonageRunnerArguments(RunnerArguments):
 class WebSocketRunnerArguments(RunnerArguments):
     """WebSocket transport session arguments for the runner.
 
+    The parsed telephony handshake is available on the inherited ``call_data`` field
+    (a :class:`CallData` model), populated by ``create_transport``.
+
     Parameters:
         websocket: WebSocket connection for audio streaming
         transport_type: Transport type identifier. Set to ``"websocket"`` for plain
             WebSocket connections; ``None`` triggers auto-detection from the first
-            telephony provider message.
+            telephony provider message. After auto-detection, ``create_transport``
+            overwrites this in place with the detected provider (e.g. ``"twilio"``).
         body: Additional request data
     """
 
-    websocket: WebSocket
+    websocket: "WebSocket"
     transport_type: str | None = None
 
 
@@ -172,3 +262,53 @@ class EvalRunnerArguments(RunnerArguments):
 
     host: str = "localhost"
     port: int = 7860
+
+
+@dataclass
+class MOQRunnerArguments(RunnerArguments):
+    """MOQ (Media over QUIC) transport session arguments for the runner.
+
+    The ``ready_event`` and ``cert_fingerprints`` fields are populated
+    automatically by :func:`pipecat.runner.utils.create_transport`; bots
+    don't need to thread them by hand.
+
+    Parameters:
+        host: MOQ relay/server hostname the browser uses to connect.
+        port: MOQ relay/server port.
+        path: MOQ endpoint path on the relay (client mode).
+        namespace: MOQ namespace (like a room identifier).
+        participant_id: This bot's participant id; it broadcasts under
+            ``<namespace>/<participant_id>``.
+        peer_id: The peer's participant id; the bot subscribes to
+            ``<namespace>/<peer_id>``.
+        verify_ssl: Whether to verify SSL certificates (client mode).
+        serve: When True, the bot binds its own MOQ server instead of
+            dialing a relay — useful for local dev with no separate
+            ``moq-relay`` process.
+        serve_bind: Address to bind in serve mode (e.g. ``"[::]:4080"``).
+        serve_tls_host: Hostname used for the generated self-signed cert
+            when no on-disk cert/key is provided.
+        serve_tls_cert: Path to a PEM-encoded TLS cert chain.
+        serve_tls_key: Path to the matching PEM-encoded private key.
+        ready_event: Event the bot fires once it has finished MOQ
+            bring-up. The HTTP ``/start`` endpoint waits on this before
+            telling the browser to open its WebTransport.
+        cert_fingerprints: SHA-256 fingerprints (hex) of the bot's TLS
+            cert chain — populated by the transport in serve mode so
+            ``/api/config`` can hand them to the browser for pinning.
+    """
+
+    host: str
+    port: int
+    path: str = "/moq"
+    namespace: str = "pipecat"
+    participant_id: str = "bot0"
+    peer_id: str = "client0"
+    verify_ssl: bool = True
+    serve: bool = False
+    serve_bind: str | None = None
+    serve_tls_host: str = "localhost"
+    serve_tls_cert: str | None = None
+    serve_tls_key: str | None = None
+    ready_event: asyncio.Event | None = field(default=None, kw_only=True)
+    cert_fingerprints: list[str] = field(default_factory=list, kw_only=True)

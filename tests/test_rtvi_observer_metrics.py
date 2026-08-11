@@ -14,6 +14,8 @@ from pipecat.metrics.metrics import (
     LLMTokenUsage,
     LLMUsageMetricsData,
     ProcessingMetricsData,
+    STTUsage,
+    STTUsageMetricsData,
     TTFAMetricsData,
     TTFBMetricsData,
     TTSUsageMetricsData,
@@ -73,8 +75,16 @@ class TestRTVIObserverMetrics(unittest.IsolatedAsyncioTestCase):
                     LLMUsageMetricsData(
                         processor="llm",
                         value=LLMTokenUsage(
-                            prompt_tokens=10, completion_tokens=20, total_tokens=30
+                            prompt_tokens=10,
+                            completion_tokens=20,
+                            total_tokens=30,
+                            input_audio_tokens=7,
+                            output_audio_tokens=13,
                         ),
+                    ),
+                    STTUsageMetricsData(
+                        processor="soniox_stt",
+                        value=STTUsage(audio_seconds=1.5),
                     ),
                     TTSUsageMetricsData(processor="cartesia_tts", value=42),
                 ]
@@ -88,6 +98,13 @@ class TestRTVIObserverMetrics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["processing"][0]["value"], 0.05)
         # LLM usage unwraps to the token-usage payload.
         self.assertEqual(data["tokens"][0]["total_tokens"], 30)
+        # Populated optional fields are included; unset ones are dropped
+        # entirely (exclude_none) rather than sent as null.
+        self.assertEqual(data["tokens"][0]["input_audio_tokens"], 7)
+        self.assertEqual(data["tokens"][0]["output_audio_tokens"], 13)
+        self.assertNotIn("cache_read_input_audio_tokens", data["tokens"][0])
+        self.assertEqual(data["stt_usage"][0]["value"]["audio_seconds"], 1.5)
+        self.assertEqual(data["stt_usage"][0]["processor"], "soniox_stt")
         self.assertEqual(data["characters"][0]["value"], 42)
 
 

@@ -10,17 +10,20 @@ This module provides Google Gemini integration for the Pipecat framework,
 including LLM services, context management, and message aggregation.
 """
 
+import asyncio
 import io
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union, cast
 
 from loguru import logger
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from pipecat.adapters.base_llm_adapter import LLMContextConversionError
 from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.frames.frames import (
     AssistantImageRawFrame,
@@ -45,15 +48,10 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.frames import LLMSearchResponseFrame
 from pipecat.services.google.utils import update_google_client_http_options
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
-from pipecat.services.settings import (
-    NOT_GIVEN,
-    LLMSettings,
-    _NotGiven,
-    assert_given,
-    is_given,
-)
+from pipecat.services.settings import LLMSettings
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_llm
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 # Suppress gRPC fork warnings
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
@@ -62,13 +60,15 @@ try:
     import google.genai as genai
     from google.api_core.exceptions import DeadlineExceeded
     from google.genai.types import (
+        FinishReason,
         GenerateContentConfig,
         GenerateContentResponse,
         HttpOptions,
+        SafetySetting,
     )
 
     # Temporary hack to be able to process Nano Banana returned images.
-    genai._api_client.READ_BUFFER_SIZE = 5 * 1024 * 1024
+    genai._api_client.READ_BUFFER_SIZE = 5 * 1024 * 1024  # pyright: ignore[reportAttributeAccessIssue]
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error('In order to use Google AI, you need to `uv add "pipecat-ai[google]"`.')
@@ -112,22 +112,36 @@ class GoogleLLMSettings(LLMSettings):
 
     Parameters:
         thinking: Thinking configuration.
+        safety_settings: Content safety filters, as a list of
+            :class:`~google.genai.types.SafetySetting`. Each entry pairs a harm
+            category with the threshold at which content is blocked. Categories
+            left unspecified keep the Gemini API defaults.
     """
 
-    thinking: Union["GoogleLLMService.ThinkingConfig", None, _NotGiven] = field(
+    thinking: Union["GoogleLLMService.ThinkingConfig", None, NotGiven] = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    safety_settings: list[SafetySetting] | None | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
     @classmethod
     def from_mapping(cls, settings):
-        """Convert a plain dict to settings, coercing thinking dicts.
+        """Convert a plain dict to settings, coercing thinking and safety dicts.
 
-        For backward compatibility, a ``thinking`` value that is a plain dict
-        is converted to a :class:`GoogleLLMService.ThinkingConfig`.
+        For backward compatibility, a ``thinking`` value that is a plain dict is
+        converted to a :class:`GoogleLLMService.ThinkingConfig`, and any
+        ``safety_settings`` entry that is a plain dict is converted to a
+        :class:`~google.genai.types.SafetySetting`.
         """
         instance = super().from_mapping(settings)
         if is_given(instance.thinking) and isinstance(instance.thinking, dict):
             instance.thinking = GoogleLLMService.ThinkingConfig(**instance.thinking)
+        if is_given(instance.safety_settings) and instance.safety_settings:
+            instance.safety_settings = [
+                SafetySetting(**entry) if isinstance(entry, dict) else entry
+                for entry in instance.safety_settings
+            ]
         return instance
 
 
@@ -190,6 +204,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         tools: list[dict[str, Any]] | None = None,
         tool_config: dict[str, Any] | None = None,
         http_options: HttpOptions | None = None,
+        stream_idle_timeout_secs: float | None = 20.0,
+        retry_timeout_secs: float | None = 5.0,
+        retry_on_timeout: bool | None = False,
         **kwargs,
     ):
         """Initialize the Google LLM service.
@@ -220,11 +237,28 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             tools: List of available tools/functions.
             tool_config: Configuration for tool usage.
             http_options: HTTP options for the client.
+            stream_idle_timeout_secs: How long to wait for the next chunk of a streamed
+                response before giving up on it. Bounds the wait when the API accepts a
+                request and then stops producing without closing the stream. This is a
+                gap between chunks, not a limit on how long a response may take overall.
+                The first chunk is the slowest, since its wait spans the whole round trip
+                including any thinking the model does before it emits anything; raise this
+                for models configured to think at length. Set to ``None`` to wait
+                indefinitely.
+            retry_timeout_secs: How long to wait for the first chunk before giving up
+                on the request and re-issuing it, when ``retry_on_timeout`` is set.
+                Like the first-chunk wait above, this window spans the whole round
+                trip including any thinking, so it is only a good fit for models that
+                start emitting quickly.
+            retry_on_timeout: Whether to re-issue the request once if the first chunk
+                doesn't arrive within ``retry_timeout_secs``. Only the first chunk is
+                retried: once a chunk has been pushed downstream, re-issuing would
+                duplicate the response.
             **kwargs: Additional arguments passed to parent class.
         """
         # 1. Initialize default_settings with hardcoded defaults
         default_settings = self.Settings(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             system_instruction=None,
             max_tokens=4096,
             temperature=None,
@@ -236,6 +270,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             filter_incomplete_user_turns=False,
             user_turn_completion_config=None,
             thinking=None,
+            safety_settings=None,
             extra={},
         )
 
@@ -269,6 +304,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         self._http_options = update_google_client_http_options(http_options)
         self._tools = tools
         self._tool_config = tool_config
+        self._stream_idle_timeout_secs = stream_idle_timeout_secs
+        self._retry_timeout_secs = retry_timeout_secs
+        self._retry_on_timeout = retry_on_timeout
 
         # Store pending function calls that need to be executed after TTS
         self._pending_function_calls = []
@@ -326,7 +364,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         messages = []
         system = []
         tools = []
-        effective_instruction = system_instruction or self._settings.system_instruction
+        effective_instruction = system_instruction or assert_given(
+            self._settings.system_instruction
+        )
         adapter = self.get_llm_adapter()
         params = adapter.get_llm_invocation_params(
             context, system_instruction=effective_instruction
@@ -347,9 +387,14 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         generation_config = GenerateContentConfig(**generation_params)
 
         # Use the new google-genai client's async method
+        assert self._client is not None
+
+        model = assert_given(self._settings.model)
+        assert model is not None
+
         response = await self._client.aio.models.generate_content(
-            model=self._settings.model,
-            contents=messages,
+            model=model,
+            contents=cast(Any, messages),
             config=generation_config,
         )
 
@@ -369,7 +414,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
         # Extract text from response
         if response.candidates and response.candidates[0].content:
-            for part in response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts or []:
                 if part.text:
                     return part.text, usage
 
@@ -400,6 +445,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 "top_p": self._settings.top_p,
                 "top_k": self._settings.top_k,
                 "max_output_tokens": self._settings.max_tokens,
+                "safety_settings": assert_given(self._settings.safety_settings),
                 "tools": tools,
                 "tool_config": tool_config,
             }.items()
@@ -471,12 +517,137 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
         generation_config = GenerateContentConfig(**generation_params)
 
-        await self.start_ttfb_metrics()
+        assert self._client is not None
+
+        model = assert_given(self._settings.model)
+        assert model is not None
+
         return await self._client.aio.models.generate_content_stream(
-            model=self._settings.model,
-            contents=messages,
+            model=model,
+            contents=cast(Any, messages),
             config=generation_config,
         )
+
+    async def _stream_response(self, context: LLMContext) -> AsyncIterator[GenerateContentResponse]:
+        """Yield the model's streamed chunks, re-issuing the request once if it stalls.
+
+        The API client sends the request lazily, when the first chunk is pulled, so a
+        request that is accepted and then produces nothing shows up as a first chunk
+        that never arrives. Re-issuing is safe only up to that point: once a chunk has
+        been yielded, its content is already on its way downstream.
+
+        Args:
+            context: The context to generate a response for.
+
+        Yields:
+            Each chunk of the streamed response.
+
+        Raises:
+            TimeoutError: If the stream stalls past the timeout it is bounded by.
+        """
+        if self._retry_on_timeout:
+            async with aclosing(
+                self._iter_stream(
+                    await self._stream_content(context),
+                    first_chunk_timeout=self._retry_timeout_secs,
+                )
+            ) as stream:
+                try:
+                    first_chunk = await stream.__anext__()
+                except StopAsyncIteration:
+                    return
+                except (TimeoutError, DeadlineExceeded):
+                    logger.debug(f"{self}: retrying content generation due to timeout")
+                else:
+                    yield first_chunk
+                    async for chunk in stream:
+                        yield chunk
+                    return
+
+        # Either retries are disabled, or the initial attempt timed out.
+        async with aclosing(
+            self._iter_stream(
+                await self._stream_content(context),
+                first_chunk_timeout=self._stream_idle_timeout_secs,
+            )
+        ) as stream:
+            async for chunk in stream:
+                yield chunk
+
+    async def _iter_stream(
+        self,
+        response: AsyncIterator[GenerateContentResponse],
+        *,
+        first_chunk_timeout: float | None,
+    ) -> AsyncGenerator[GenerateContentResponse, None]:
+        """Yield streamed chunks, giving up if the stream stalls between them.
+
+        A stream that stops producing without closing would otherwise leave the
+        response open indefinitely, since the API client applies no timeout of its
+        own. The timeout covers the gap between chunks rather than the response as
+        a whole, so a slow but healthy stream is never cut short.
+
+        Args:
+            response: The streamed response to consume.
+            first_chunk_timeout: How long to wait for the first chunk. Every later
+                chunk is bounded by ``stream_idle_timeout_secs``.
+
+        Yields:
+            Each chunk of the streamed response.
+
+        Raises:
+            TimeoutError: If the next chunk doesn't arrive in time.
+        """
+        chunks = response.__aiter__()
+        timeout = first_chunk_timeout
+        try:
+            while True:
+                try:
+                    if timeout is None:
+                        chunk = await chunks.__anext__()
+                    else:
+                        chunk = await asyncio.wait_for(chunks.__anext__(), timeout=timeout)
+                except StopAsyncIteration:
+                    return
+                yield chunk
+                timeout = self._stream_idle_timeout_secs
+        finally:
+            # Release the HTTP resources held by a stream we walk away from, whether
+            # that's because it stalled, was interrupted, or is being re-issued.
+            # Closing is best-effort: the client's stream type only promises
+            # AsyncIterator, which has no aclose().
+            aclose = getattr(response, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    def _handle_finish_reason(
+        self, finish_reason: FinishReason, finish_message: str | None = None
+    ):
+        """Log why Gemini stopped generating, when it stopped for a notable reason.
+
+        Anything other than a normal stop leaves the turn short of what the model
+        would otherwise have said: the response was withheld (safety, recitation,
+        prohibited content), a tool call was rejected, or the output hit the token
+        limit. Whatever text did arrive is still passed downstream.
+
+        Fork note: abnormal terminations (SAFETY, MALFORMED_FUNCTION_CALL,
+        RECITATION, ...) usually mean the bot produced nothing, so this stays
+        visible at prod log level, and the provider's ``finish_message`` is
+        included when there is one. A normal stop is logged at debug rather than
+        dropped, so a turn can always be traced end to end.
+
+        Args:
+            finish_reason: The reason the model stopped generating.
+            finish_message: The provider's accompanying detail, if any.
+        """
+        name = getattr(finish_reason, "name", None) or str(finish_reason)
+        detail = f" finish_message={finish_message!r}" if finish_message else ""
+
+        if finish_reason in (FinishReason.STOP, FinishReason.FINISH_REASON_UNSPECIFIED):
+            logger.debug(f"{self}: Google generation stopped with finish_reason={name}{detail}")
+            return
+
+        logger.warning(f"{self}: response incomplete, the model stopped for {name}{detail}")
 
     @traced_llm
     async def _process_context(self, context: LLMContext):
@@ -500,11 +671,10 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         self._pending_function_calls = []
 
         try:
-            # Generate content from LLMContext
-            response = await self._stream_content(context)
+            await self.start_ttfb_metrics()
 
             function_calls = []
-            async for chunk in response:
+            async for chunk in self._stream_response(context):
                 # Stop TTFB metrics after the first chunk
                 await self.stop_ttfb_metrics()
                 # Gemini may send usage_metadata in multiple chunks with varying behavior:
@@ -533,24 +703,14 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
                 for candidate in chunk.candidates:
                     if candidate.finish_reason:
-                        finish_reason = (
+                        # Remembered for the "produced no output" diagnostic below.
+                        last_finish_reason = (
                             candidate.finish_reason.value
                             if hasattr(candidate.finish_reason, "value")
                             else candidate.finish_reason
                         )
-                        last_finish_reason = finish_reason
-                        finish_message = (
-                            f" finish_message={candidate.finish_message!r}"
-                            if candidate.finish_message
-                            else ""
-                        )
-                        # Abnormal terminations (SAFETY, MALFORMED_FUNCTION_CALL,
-                        # RECITATION, ...) usually mean the bot produced nothing —
-                        # keep them visible at prod log level.
-                        log = logger.debug if str(finish_reason) == "STOP" else logger.warning
-                        log(
-                            f"{self}: Google generation stopped with "
-                            f"finish_reason={finish_reason}{finish_message}"
+                        self._handle_finish_reason(
+                            candidate.finish_reason, candidate.finish_message
                         )
 
                     if candidate.content and candidate.content.parts:
@@ -578,7 +738,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                                     FunctionCallFromLLM(
                                         context=context,
                                         tool_call_id=function_call_id,
-                                        function_name=function_call.name,
+                                        function_name=function_call.name or "",
                                         arguments=function_call.args or {},
                                     )
                                 )
@@ -717,12 +877,16 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                         f"(finish_reason={last_finish_reason}, block_reason={block_reason})"
                     )
                 )
-        except DeadlineExceeded:
+        except (TimeoutError, DeadlineExceeded) as e:
             # Surface the timeout as a non-fatal error so the application layer
             # can retry the turn; the event stays for service-level listeners.
-            logger.warning(f"{self}: Google completion deadline exceeded (request timeout)")
+            # The message stays exactly "LLM completion timeout" — downstream
+            # transient-error matching keys off the word "timeout".
+            logger.warning(f"{self}: Google completion timed out ({type(e).__name__})")
             await self._call_event_handler("on_completion_timeout")
-            await self.push_error(error_msg="LLM completion deadline exceeded (request timeout)")
+            await self.push_error(error_msg="LLM completion timeout", exception=e)
+        except LLMContextConversionError as e:
+            await self.push_error(error_msg=str(e), exception=e)
         except Exception as e:
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:

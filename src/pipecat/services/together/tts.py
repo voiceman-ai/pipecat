@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
-from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -31,10 +30,11 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import WebsocketTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.tracing.service_decorators import traced_tts
+from pipecat.utils.types import NOT_GIVEN, NotGiven
 
 # Together TTS streams 24 kHz signed 16-bit mono PCM for all models; the API does
 # not support requesting a different rate. The output transport resamples to the
@@ -50,7 +50,7 @@ class TogetherTTSSettings(TTSSettings):
         max_partial_length: Maximum partial text length for streaming.
     """
 
-    max_partial_length: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    max_partial_length: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class TogetherTTSService(WebsocketTTSService):
@@ -210,7 +210,7 @@ class TogetherTTSService(WebsocketTTSService):
             logger.debug(f"Connecting to Together AI TTS: {ws_url}")
 
             headers = {"Authorization": f"Bearer {self._api_key}"}
-            self._websocket = await websocket_connect(ws_url, additional_headers=headers)
+            self._websocket = await self._websocket_connect(ws_url, additional_headers=headers)
             await self._call_event_handler("on_connected")
 
             # Ensure voice is set on the server side
@@ -440,8 +440,6 @@ class TogetherTTSService(WebsocketTTSService):
         Yields:
             Frame: Audio arrives via the WebSocket receive task.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()

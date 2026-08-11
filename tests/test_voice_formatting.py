@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import locale
 import unittest
 
 from pipecat.utils.text.transforms._alnum_utils import normalize
@@ -116,6 +117,69 @@ class TestReplaceText(unittest.IsolatedAsyncioTestCase):
         result = await transform("Hello world", "*")
         self.assertEqual(result, "Hello world")
 
+    async def test_word_splitting_replacement(self):
+        """A replacement is allowed to turn one word into several."""
+        transform = replace_text([(r"\bBODYPUMP\b", "body pump")])
+        result = await transform("Try BODYPUMP on Monday morning.", "*")
+        self.assertEqual(result, "Try body pump on Monday morning.")
+
+    async def test_case_only_replacement(self):
+        """A replacement is allowed to change only the case of a word."""
+        transform = replace_text([(r"\bSQL\b", "sql")])
+        result = await transform("Contact SQL support today.", "*")
+        self.assertEqual(result, "Contact sql support today.")
+
+    async def test_inline_ipa_tag_replacement(self):
+        transform = replace_text([(r"\bleisure\b", "<<l|ɛ|ʒ|ə|r>>")])
+        result = await transform("The leisure centre opens at six.", "*")
+        self.assertIn("<<l|ɛ|ʒ|ə|r>>", result)
+
+    async def test_ssml_phoneme_tag_replacement(self):
+        """A word can be wrapped in an SSML phoneme tag (e.g. ElevenLabs'
+        <phoneme alphabet="ipa" ph="...">word</phoneme>) instead of respelled."""
+        transform = replace_text(
+            [(r"(?i)\bSiobhan\b", '<phoneme alphabet="ipa" ph="ʃəˈvɔːn">Siobhan</phoneme>')]
+        )
+        result = await transform("My name is Siobhan.", "*")
+        self.assertIn('<phoneme alphabet="ipa" ph="ʃəˈvɔːn">Siobhan</phoneme>', result)
+
+
+class TestNormalizeCollapsesCaseAndSplitReplacements(unittest.IsolatedAsyncioTestCase):
+    """Whether normalize() treats a case-only or word-splitting replacement as
+    unchanged. normalize() lowercases text and drops whitespace/punctuation, so a
+    replacement that only changes case, or that splits one word into several,
+    normalizes identically on both sides even though the original text cannot be
+    recovered by simple proportional advancement.
+    """
+
+    async def test_word_split_normalizes_the_same_as_original(self):
+        transform = replace_text([(r"\bBODYPUMP\b", "body pump")])
+        result = await transform("BODYPUMP", "*")
+        self.assertEqual(normalize(result), normalize("BODYPUMP"))
+
+    async def test_case_change_normalizes_the_same_as_original(self):
+        transform = replace_text([(r"\bSQL\b", "sql")])
+        result = await transform("SQL", "*")
+        self.assertEqual(normalize(result), normalize("SQL"))
+
+    async def test_pronunciation_respelling_does_not_normalize_the_same(self):
+        """Contrast case: a genuine 1-to-1 respelling ("leisure" -> "lezher") does
+        change the normalized alnum content, so it is correctly flagged as transformed."""
+        transform = replace_text([(r"\bleisure\b", "lezher")])
+        result = await transform("leisure", "*")
+        self.assertNotEqual(normalize(result), normalize("leisure"))
+
+    async def test_ssml_phoneme_tag_normalizes_the_same_as_original(self):
+        """An SSML phoneme tag wraps the word without altering it, so tag-stripped
+        normalization matches the original — unlike a respelling. (The wrapping
+        markup itself is still picked up as a transformed segment by
+        TextSegmentMap, not by normalize() here.)"""
+        transform = replace_text(
+            [(r"\bSiobhan\b", '<phoneme alphabet="ipa" ph="ʃəˈvɔːn">Siobhan</phoneme>')]
+        )
+        result = await transform("Siobhan", "*")
+        self.assertEqual(normalize(result), normalize("Siobhan"))
+
 
 class TestExpandPercentages(unittest.IsolatedAsyncioTestCase):
     async def test_integer_percent(self):
@@ -170,6 +234,48 @@ class TestExpandUnits(unittest.IsolatedAsyncioTestCase):
         """'g' standing alone in prose must not expand to 'grams'."""
         result = await expand_units("1 g of something", "*")
         self.assertNotIn("grams", result)
+
+
+class TestExpandUnitsSingular(unittest.IsolatedAsyncioTestCase):
+    """A quantity of exactly one takes the singular form of the unit."""
+
+    async def test_singular_forms(self):
+        cases = {
+            "Only 1km left": "Only 1 kilometer left",
+            "Only 1mi left": "Only 1 mile left",
+            "Only 1ft left": "Only 1 foot left",
+            "Only 1in left": "Only 1 inch left",
+            "Only 1lb left": "Only 1 pound left",
+            "Only 1gb left": "Only 1 gigabyte left",
+            "Only 1mph left": "Only 1 mile per hour left",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(await expand_units(text, "*"), expected)
+
+    async def test_singular_with_space(self):
+        result = await expand_units("1 km away", "*")
+        self.assertEqual(result, "1 kilometer away")
+
+    async def test_plural_forms_kept(self):
+        cases = {
+            "5km away": "5 kilometers away",
+            "0.5 mi away": "0.5 miles away",
+            "21 lb of flour": "21 pounds of flour",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(await expand_units(text, "*"), expected)
+
+    async def test_decimal_one_is_plural(self):
+        """A decimal such as "1.0" reads as plural in speech, unlike a bare "1"."""
+        result = await expand_units("1.0km away", "*")
+        self.assertEqual(result, "1.0 kilometers away")
+
+    async def test_invariant_units_unchanged(self):
+        """Units whose singular and plural forms match expand identically."""
+        self.assertEqual(await expand_units("1hz tone", "*"), "1 hertz tone")
+        self.assertEqual(await expand_units("3 GHz processor", "*"), "3 gigahertz processor")
 
 
 class TestExpandUnitsUnambiguous(unittest.IsolatedAsyncioTestCase):
@@ -311,6 +417,16 @@ class TestExpandCurrency(unittest.IsolatedAsyncioTestCase):
         self.assertIn("one thousand dollars", result)
         self.assertIn("fifty cents", result)
 
+    async def test_extra_fractional_digits_not_leaked(self):
+        # Regression: a fraction with 3+ digits must be fully consumed by the match,
+        # read to cent precision, with no stray digit glued onto the subunit word.
+        result = await expand_currency("The item costs $5.500 today", "*")
+        self.assertEqual(result, "The item costs five dollars and fifty cents today")
+        self.assertNotIn("cents0", result)
+        # Sub-cent precision is dropped (read like a 2-digit amount), not spoken.
+        self.assertEqual(await expand_currency("$3.567", "*"), "three dollars and fifty-six cents")
+        self.assertEqual(await expand_currency("£1.999", "*"), "one pound and ninety-nine pence")
+
 
 class TestNormalizeDates(unittest.IsolatedAsyncioTestCase):
     async def test_iso_date(self):
@@ -348,6 +464,21 @@ class TestNormalizeDates(unittest.IsolatedAsyncioTestCase):
         self.assertIn("21st", await normalize_dates("2023-05-21", "*"))
         self.assertIn("2nd", await normalize_dates("2023-05-02", "*"))
         self.assertIn("3rd", await normalize_dates("2023-05-03", "*"))
+
+    async def test_month_is_english_under_non_english_locale(self):
+        # The month must stay English even when LC_TIME is a non-English locale,
+        # to match the hardcoded-English year and ordinal suffix.
+        saved = locale.setlocale(locale.LC_TIME)
+        try:
+            locale.setlocale(locale.LC_TIME, "de_DE.UTF-8")
+        except locale.Error:
+            self.skipTest("de_DE.UTF-8 locale not available")
+        try:
+            result = await normalize_dates("Meeting on 2023-05-10", "*")
+        finally:
+            locale.setlocale(locale.LC_TIME, saved)
+        self.assertIn("May 10th", result)
+        self.assertNotIn("Mai", result)
 
 
 class TestExpandNumbers(unittest.IsolatedAsyncioTestCase):
@@ -387,6 +518,71 @@ class TestExpandNumbers(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2 5 0 0", result)
         self.assertIn("point", result)
         self.assertIn("7 5", result)
+
+    async def test_trailing_fractional_zero_is_spoken(self):
+        # Every written digit is spoken, trailing zeros included -- the above-cutoff
+        # branch reads fractions the same way.
+        transform = expand_numbers(digit_cutoff=2025)
+        cases = {
+            "1.0": "one point zero",
+            "1.00": "one point zero zero",
+            "2.0": "two point zero",
+            "0.50": "zero point five zero",
+            "1.10": "one point one zero",
+            "10.0": "ten point zero",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(await transform(text, "*"), expected)
+
+    async def test_fractions_without_trailing_zeros_unchanged(self):
+        # The digit-by-digit reading covers every decimal, not just the ones with a
+        # trailing zero.
+        transform = expand_numbers(digit_cutoff=None)
+        cases = {
+            "3.5": "three point five",
+            "1.05": "one point zero five",
+            "1.25": "one point two five",
+            "12.345": "twelve point three four five",
+            "5.0001": "five point zero zero zero one",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(await transform(text, "*"), expected)
+
+
+class TestUnitsAndNumbersComposition(unittest.IsolatedAsyncioTestCase):
+    """``expand_units`` and ``expand_numbers`` have to agree on decimal quantities.
+
+    ``expand_units`` keeps the plural for a decimal such as "1.0" because it reads as
+    "one point zero" in speech, and ``expand_numbers`` runs after it in the default
+    ``VoiceFormatter`` order. Both have to spell the decimal out the same way, or the
+    composed output is ungrammatical: "one kilometers".
+    """
+
+    async def test_decimal_one_agrees_with_plural_unit(self):
+        formatter = VoiceFormatter(expand_numbers=True)
+        cases = {
+            "1.0km left": "one point zero kilometers left",
+            "1.0kg of flour": "one point zero kilograms of flour",
+            "1.0 mi away": "one point zero miles away",
+            "1.00km left": "one point zero zero kilometers left",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(await formatter(text, "*"), expected)
+
+    async def test_singular_and_plural_quantities_still_agree(self):
+        formatter = VoiceFormatter(expand_numbers=True)
+        cases = {
+            "1km left": "one kilometer left",
+            "2.0km left": "two point zero kilometers left",
+            "1.5km left": "one point five kilometers left",
+            "1.0hz tone": "one point zero hertz tone",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(await formatter(text, "*"), expected)
 
 
 if __name__ == "__main__":

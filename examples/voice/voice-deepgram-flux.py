@@ -23,7 +23,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
-from pipecat.services.deepgram.tts import DeepgramTTSService
+from pipecat.services.deepgram.flux.tts import DeepgramFluxTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
@@ -65,10 +65,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
     )
 
-    tts = DeepgramTTSService(
+    tts = DeepgramFluxTTSService(
         api_key=os.environ["DEEPGRAM_API_KEY"],
-        settings=DeepgramTTSService.Settings(
-            voice="aura-2-andromeda-en",
+        settings=DeepgramFluxTTSService.Settings(
+            voice="flux-drew-en",
         ),
     )
 
@@ -106,6 +106,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
 
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+
+    await runner.add_workers(worker)
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
@@ -118,15 +122,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
-        await worker.cancel()
+        await runner.cancel()
 
     @stt.event_handler("on_update")
     async def on_deepgram_flux_update(stt, transcript):
         logger.debug(f"On deeggram flux update: {transcript}")
 
-    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
-
-    await runner.add_workers(worker)
     await runner.run()
 
 

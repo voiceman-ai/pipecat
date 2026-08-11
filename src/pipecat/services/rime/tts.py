@@ -19,7 +19,6 @@ from typing import Any, ClassVar
 import aiohttp
 from loguru import logger
 from pydantic import BaseModel
-from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -30,7 +29,7 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import (
     InterruptibleTTSService,
     TextAggregationMode,
@@ -41,6 +40,7 @@ from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.text.skip_tags_aggregator import SkipTagsAggregator
 from pipecat.utils.tracing.service_decorators import traced_tts
+from pipecat.utils.types import NOT_GIVEN, NotGiven
 
 
 def language_to_rime_language(language: Language) -> str:
@@ -82,18 +82,18 @@ class RimeTTSSettings(TTSSettings):
             Values above 1.0 slow down the audio; values below 1.0 speed it up.
     """
 
-    segment: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    speedAlpha: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    reduceLatency: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    pauseBetweenBrackets: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    phonemizeBetweenBrackets: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    noTextNormalization: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    saveOovs: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    inlineSpeedAlpha: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    repetition_penalty: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    temperature: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    top_p: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    timeScaleFactor: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    segment: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    speedAlpha: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    reduceLatency: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pauseBetweenBrackets: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    phonemizeBetweenBrackets: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    noTextNormalization: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    saveOovs: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    inlineSpeedAlpha: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    repetition_penalty: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    temperature: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    top_p: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    timeScaleFactor: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
     _aliases: ClassVar[dict[str, str]] = {"speaker": "voice"}
 
@@ -109,10 +109,10 @@ class RimeNonJsonTTSSettings(TTSSettings):
         top_p: Cumulative probability threshold (0.0-1.0).
     """
 
-    segment: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    repetition_penalty: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    temperature: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    top_p: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    segment: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    repetition_penalty: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    temperature: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    top_p: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
     _aliases: ClassVar[dict[str, str]] = {"speaker": "voice"}
 
@@ -300,6 +300,8 @@ class RimeTTSService(WebsocketTTSService):
         self._receive_task = None
         self._cumulative_time = 0  # Accumulates time across messages
         self._extra_msg_fields = {}  # Extra fields for next message
+        self._audio_remainder = b""  # Held-back byte of a sample split across chunks
+        self._audio_remainder_context_id = None
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -465,7 +467,9 @@ class RimeTTSService(WebsocketTTSService):
             params = "&".join(f"{k}={v}" for k, v in ws_params.items() if v is not None)
             url = f"{self._url}?{params}"
             headers = {"Authorization": f"Bearer {self._api_key}"}
-            self._websocket = await websocket_connect(url, additional_headers=headers)
+            self._audio_remainder = b""
+            self._audio_remainder_context_id = None
+            self._websocket = await self._websocket_connect(url, additional_headers=headers)
 
             await self._call_event_handler("on_connected")
         except Exception as e:
@@ -551,6 +555,21 @@ class RimeTTSService(WebsocketTTSService):
         logger.trace(f"{self}: flushing audio")
         await self._get_websocket().send(json.dumps({"operation": "flush"}))
 
+    def _sample_aligned_audio(self, context_id: str, audio: bytes) -> bytes:
+        """Return whole 16-bit samples, holding back any dangling byte.
+
+        Rime chops its PCM stream at arbitrary byte boundaries, so a chunk may
+        end mid-sample. The dangling byte is held back and prepended to the
+        context's next chunk so emitted frames always contain whole samples.
+        """
+        if self._audio_remainder_context_id != context_id:
+            self._audio_remainder = b""
+            self._audio_remainder_context_id = context_id
+        audio = self._audio_remainder + audio
+        aligned = len(audio) - (len(audio) % 2)
+        self._audio_remainder = audio[aligned:]
+        return audio[:aligned]
+
     async def _receive_messages(self):
         """Process incoming websocket messages."""
         async for message in self._get_websocket():
@@ -562,8 +581,11 @@ class RimeTTSService(WebsocketTTSService):
             context_id = msg["contextId"]
             if msg["type"] == "chunk":
                 # Process audio chunk
+                audio = self._sample_aligned_audio(context_id, base64.b64decode(msg["data"]))
+                if not audio:
+                    continue
                 frame = TTSAudioRawFrame(
-                    audio=base64.b64decode(msg["data"]),
+                    audio=audio,
                     sample_rate=self.sample_rate,
                     num_channels=1,
                     context_id=context_id,
@@ -609,7 +631,6 @@ class RimeTTSService(WebsocketTTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
@@ -801,8 +822,6 @@ class RimeHttpTTSService(TTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         headers = {
             "Accept": "audio/pcm",
             "Authorization": f"Bearer {self._api_key}",
@@ -1109,7 +1128,7 @@ class RimeNonJsonTTSService(InterruptibleTTSService):
             params = "&".join(f"{k}={v}" for k, v in settings_dict.items() if v is not None)
             url = f"{self._url}?{params}"
             headers = {"Authorization": f"Bearer {self._api_key}"}
-            self._websocket = await websocket_connect(
+            self._websocket = await self._websocket_connect(
                 url, additional_headers=headers, max_size=1024 * 1024 * 16
             )
             await self._call_event_handler("on_connected")
@@ -1177,7 +1196,6 @@ class RimeNonJsonTTSService(InterruptibleTTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()

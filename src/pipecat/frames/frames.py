@@ -21,14 +21,18 @@ from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
+    Generic,
     Literal,
 )
+
+from typing_extensions import TypeVar
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.audio.turn.base_turn_analyzer import BaseTurnParams
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.metrics.metrics import MetricsData
+from pipecat.services.settings import LLMSettings, ServiceSettings, STTSettings, TTSSettings
 from pipecat.transcriptions.language import Language
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.text.base_text_aggregator import AggregationType
@@ -40,7 +44,6 @@ if TYPE_CHECKING:
     from pipecat.adapters.schemas.function_schema import FunctionSchema
     from pipecat.processors.aggregators.llm_context import LLMContext, LLMContextMessage, NotGiven
     from pipecat.processors.frame_processor import FrameProcessor
-    from pipecat.services.settings import ServiceSettings
     from pipecat.turns.user_turn_strategies import UserTurnStrategies
     from pipecat.utils.context.llm_context_summarization import LLMContextSummaryConfig
     from pipecat.utils.tracing.tracing_context import TracingContext
@@ -1151,6 +1154,32 @@ class VADUserStoppedSpeakingFrame(SystemFrame):
 
 
 @dataclass
+class ProposedUserStartedSpeakingFrame(SystemFrame):
+    """Frame proposing that the user turn has started.
+
+    Emitted by a component with its own turn detection — typically an STT or
+    realtime LLM service whose provider reports speech boundaries. It is a
+    proposal, not a decision: an
+    :class:`~pipecat.turns.user_start.ExternalUserTurnStartStrategy` resolves it
+    into a :class:`UserStartedSpeakingFrame` and broadcasts the interruption.
+    """
+
+    pass
+
+
+@dataclass
+class ProposedUserStoppedSpeakingFrame(SystemFrame):
+    """Frame proposing that the user turn has ended.
+
+    The end-of-turn counterpart to :class:`ProposedUserStartedSpeakingFrame`,
+    resolved into a :class:`UserStoppedSpeakingFrame` by an
+    :class:`~pipecat.turns.user_stop.ExternalUserTurnStopStrategy`.
+    """
+
+    pass
+
+
+@dataclass
 class BotStartedSpeakingFrame(SystemFrame):
     """Frame indicating the bot started speaking.
 
@@ -2123,8 +2152,17 @@ class TTSStoppedFrame(ControlFrame):
     context_id: str | None = None
 
 
+# Covariant so a bare ``ServiceUpdateSettingsFrame`` annotation still accepts the
+# subclasses. Gotcha: ``delta`` is mutable, so writing through the base type is
+# unsound and goes unreported — treat a base-typed frame as read-only::
+#
+#     def audit(frame: ServiceUpdateSettingsFrame) -> None:
+#         frame.delta = TTSSettings(voice="x")  # accepted, even for an LLM frame
+TSettings = TypeVar("TSettings", bound=ServiceSettings, default=ServiceSettings, covariant=True)
+
+
 @dataclass
-class ServiceUpdateSettingsFrame(ControlFrame, UninterruptibleFrame):
+class ServiceUpdateSettingsFrame(ControlFrame, UninterruptibleFrame, Generic[TSettings]):
     """Base frame for updating service settings.
 
     Supports both a ``settings`` dict (for backward compatibility) and a
@@ -2139,33 +2177,38 @@ class ServiceUpdateSettingsFrame(ControlFrame, UninterruptibleFrame):
 
         delta: :class:`~pipecat.services.settings.ServiceSettings` delta-mode
             object describing the fields to change.
-
         service: Optional target service instance. When provided, only that
             service will apply the settings; other services will forward the
             frame unchanged.
+        reach_inactive_services: Whether these settings should reach every
+            service a
+            :class:`~pipecat.pipeline.service_switcher.ServiceSwitcher` manages,
+            rather than only the active one. Set this for provider-neutral
+            settings that must survive a service switch.
     """
 
     settings: Mapping[str, Any] = field(default_factory=dict)
-    delta: ServiceSettings | None = None
+    delta: TSettings | None = None
     service: FrameProcessor | None = None
+    reach_inactive_services: bool = False
 
 
 @dataclass
-class LLMUpdateSettingsFrame(ServiceUpdateSettingsFrame):
+class LLMUpdateSettingsFrame(ServiceUpdateSettingsFrame[LLMSettings]):
     """Frame for updating LLM service settings."""
 
     pass
 
 
 @dataclass
-class TTSUpdateSettingsFrame(ServiceUpdateSettingsFrame):
+class TTSUpdateSettingsFrame(ServiceUpdateSettingsFrame[TTSSettings]):
     """Frame for updating TTS service settings."""
 
     pass
 
 
 @dataclass
-class STTUpdateSettingsFrame(ServiceUpdateSettingsFrame):
+class STTUpdateSettingsFrame(ServiceUpdateSettingsFrame[STTSettings]):
     """Frame for updating STT service settings."""
 
     pass
@@ -2176,7 +2219,9 @@ class UserIdleTimeoutUpdateFrame(SystemFrame):
     """Frame for updating the user idle timeout at runtime.
 
     Setting timeout to 0 disables idle detection. Setting a positive value
-    enables it.
+    enables it. Updates apply immediately: a running idle timer restarts with
+    the new duration, and if the bot is waiting for the user to speak the
+    timer is armed right away.
 
     Parameters:
         timeout: The new idle timeout in seconds. 0 disables idle detection.

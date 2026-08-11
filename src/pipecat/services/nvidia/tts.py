@@ -43,16 +43,22 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStartedFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, is_given
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.deprecation import deprecated
+from pipecat.utils.types import NOT_GIVEN, NotGiven, is_given
 
 try:
     import grpc
     import riva.client
     import riva.client.proto.riva_tts_pb2 as rtts
-    from riva.client.proto.riva_audio_pb2 import AudioEncoding
+
+    # riva's generated protobuf modules build their message classes at import
+    # time, so the names below exist only at runtime.
+    from riva.client.proto.riva_audio_pb2 import (
+        AudioEncoding,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error('In order to use NVIDIA TTS, you need to `uv add "pipecat-ai[nvidia]"`.')
@@ -93,8 +99,8 @@ class NvidiaTTSSettings(TTSSettings):
             multiple sentences across a single streaming request.
     """
 
-    quality: int | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    synthesis_mode: NvidiaTTSSynthesisMode | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    quality: int | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    synthesis_mode: NvidiaTTSSynthesisMode | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 @dataclass
@@ -149,6 +155,9 @@ class NvidiaTTSService(TTSService):
         voice_id: str | None = None,
         sample_rate: int | None = None,
         model_function_map: Mapping[str, str] = {
+            # The function id identifies NVIDIA's hosted deployment of the model
+            # and changes when NVIDIA redeploys it. The current id is on
+            # https://build.nvidia.com/nvidia/magpie-tts-multilingual/api
             "function_id": "877104f7-e885-42b9-8de8-f6e4c6303969",
             "model_name": "magpie-tts-multilingual",
         },
@@ -318,14 +327,14 @@ class NvidiaTTSService(TTSService):
 
         self._service = riva.client.SpeechSynthesisService(auth)
 
-    def _create_synthesis_config(self) -> rtts.RivaSynthesisConfigResponse:
+    def _create_synthesis_config(self) -> rtts.RivaSynthesisConfigResponse:  # pyright: ignore[reportAttributeAccessIssue]
         """Fetch and validate synthesis configuration from the server."""
         if not self._service:
             raise RuntimeError("TTS service not initialized")
 
         try:
             config = self._service.stub.GetRivaSynthesisConfig(
-                riva.client.proto.riva_tts_pb2.RivaSynthesisConfigRequest()
+                rtts.RivaSynthesisConfigRequest()  # pyright: ignore[reportAttributeAccessIssue]
             )
             return config
         except grpc.RpcError as e:
@@ -422,9 +431,9 @@ class NvidiaTTSService(TTSService):
             self._process_responses(state), name="nvidia-tts-response"
         )
 
-    def _build_base_request(self) -> rtts.SynthesizeSpeechRequest:
+    def _build_base_request(self) -> rtts.SynthesizeSpeechRequest:  # pyright: ignore[reportAttributeAccessIssue]
         """Build a reusable ``SynthesizeSpeechRequest`` with current settings."""
-        req = rtts.SynthesizeSpeechRequest(
+        req = rtts.SynthesizeSpeechRequest(  # pyright: ignore[reportAttributeAccessIssue]
             text="",
             language_code=str(self._settings.language or "en-US"),
             sample_rate_hz=self.sample_rate,
@@ -450,6 +459,8 @@ class NvidiaTTSService(TTSService):
         ``SynthesizeOnline`` call, enabling Magpie's cross-sentence stitching.
         Audio responses are forwarded to the async response queue.
         """
+        assert self._service is not None, "TTS service not initialized"
+
         event_loop = self.get_event_loop()
         base_req = self._build_base_request()
 
@@ -678,8 +689,6 @@ class NvidiaTTSService(TTSService):
                 self._start_synthesis_stream(context_id)
                 logger.trace(f"{self}: Started synthesis stream for context {context_id}")
 
-            logger.debug(f"{self}: Generating TTS [{text}]")
-
             state = self._stream_state
             if state is None:
                 raise RuntimeError("Synthesis stream not started")
@@ -703,8 +712,6 @@ class NvidiaTTSService(TTSService):
             await self.start_ttfb_metrics()
             yield TTSStartedFrame(context_id=context_id)
 
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         chunks = [
             chunk for chunk in self._split_text_into_chunks(text) if any(c.isalnum() for c in chunk)
         ]
@@ -718,6 +725,8 @@ class NvidiaTTSService(TTSService):
         stop_event = threading.Event()
 
         def run_grpc():
+            assert self._service is not None, "TTS service not initialized"
+
             try:
                 for chunk in chunks:
                     if stop_event.is_set():

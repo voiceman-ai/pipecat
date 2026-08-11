@@ -19,7 +19,6 @@ from typing import Any, cast
 
 from loguru import logger
 from pydantic import BaseModel
-from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -29,17 +28,17 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
-    VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, assert_given
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import GRADIUM_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 # Seconds to wait after a "flushed" message for trailing text tokens to arrive
 # before finalizing the transcription.
@@ -108,7 +107,7 @@ class GradiumSTTSettings(STTSettings):
             Default is 10 (800ms). Lower values like 7-8 give faster response.
     """
 
-    delay_in_frames: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    delay_in_frames: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class GradiumSTTService(WebsocketSTTService):
@@ -302,10 +301,6 @@ class GradiumSTTService(WebsocketSTTService):
         await super().cancel(frame)
         await self._disconnect()
 
-    async def _start_metrics(self):
-        """Start performance metrics collection for transcription processing."""
-        await self.start_processing_metrics()
-
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process incoming frames and handle speech events.
 
@@ -315,9 +310,7 @@ class GradiumSTTService(WebsocketSTTService):
         """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, VADUserStartedSpeakingFrame):
-            await self._start_metrics()
-        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
             await self._send_flush()
 
     async def _send_flush(self):
@@ -388,7 +381,7 @@ class GradiumSTTService(WebsocketSTTService):
                 "x-api-key": self._api_key,
                 "x-api-source": "pipecat",
             }
-            websocket = await websocket_connect(
+            websocket = await self._websocket_connect(
                 ws_url,
                 additional_headers=headers,
             )
@@ -496,7 +489,6 @@ class GradiumSTTService(WebsocketSTTService):
                 language=cast("Language | None", assert_given(self._settings.language)),
             )
         )
-        await self.stop_processing_metrics()
 
     async def _handle_flushed(self):
         """Handle flush completion by starting a transcript aggregation timer.
@@ -528,6 +520,9 @@ class GradiumSTTService(WebsocketSTTService):
         # Technically `_settings.language` could be a raw string, but Language
         # is a StrEnum so downstream handles either.
         language = cast("Language | None", assert_given(self._settings.language))
+        # Report usage before the transcription frame so tracing can attach
+        # it to the STT span the frame closes.
+        await self.emit_stt_usage_metrics()
         await self.push_frame(
             TranscriptionFrame(
                 text,

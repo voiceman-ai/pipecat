@@ -16,12 +16,14 @@ import io
 import time
 import wave
 from collections.abc import Awaitable, Callable
+from typing import cast
 
 import websockets
 from loguru import logger
 from pydantic import BaseModel, Field
 from websockets.asyncio.server import serve as websocket_serve
 from websockets.protocol import State
+from websockets.typing import Origin
 
 from pipecat.frames.frames import (
     CancelFrame,
@@ -74,9 +76,18 @@ class SingleClientWebsocketServerCallbacks(BaseModel):
         on_websocket_ready: Called when the WebSocket server is ready to accept connections.
     """
 
-    on_client_connected: Callable[[websockets.WebSocketServerProtocol], Awaitable[None]]
-    on_client_disconnected: Callable[[websockets.WebSocketServerProtocol], Awaitable[None]]
-    on_session_timeout: Callable[[websockets.WebSocketServerProtocol], Awaitable[None]]
+    on_client_connected: Callable[
+        [websockets.WebSocketServerProtocol],  # pyright: ignore[reportAttributeAccessIssue]
+        Awaitable[None],
+    ]
+    on_client_disconnected: Callable[
+        [websockets.WebSocketServerProtocol],  # pyright: ignore[reportAttributeAccessIssue]
+        Awaitable[None],
+    ]
+    on_session_timeout: Callable[
+        [websockets.WebSocketServerProtocol],  # pyright: ignore[reportAttributeAccessIssue]
+        Awaitable[None],
+    ]
     on_websocket_ready: Callable[[], Awaitable[None]]
 
 
@@ -89,7 +100,7 @@ class SingleClientWebsocketServerInputTransport(BaseInputTransport):
 
     def __init__(
         self,
-        transport: BaseTransport,
+        transport: "SingleClientWebsocketServerTransport",
         host: str,
         port: int,
         params: SingleClientWebsocketServerParams,
@@ -114,7 +125,7 @@ class SingleClientWebsocketServerInputTransport(BaseInputTransport):
         self._params = params
         self._callbacks = callbacks
 
-        self._websocket: websockets.WebSocketServerProtocol | None = None
+        self._websocket: websockets.WebSocketServerProtocol | None = None  # pyright: ignore[reportAttributeAccessIssue]
 
         self._server_task = None
 
@@ -122,6 +133,13 @@ class SingleClientWebsocketServerInputTransport(BaseInputTransport):
         self._monitor_task = None
 
         self._stop_server_event = asyncio.Event()
+
+        # The server is shared by the input and output transports. It is drained
+        # only once both sides have released it (see `release_server`), so output
+        # still being flushed after the EndFrame passed the input — e.g. a
+        # goodbye spoken by the TTS via Flows' `end_conversation` action — isn't
+        # cut off. Mirrors the leave-counter used by the FastAPI/Daily transports.
+        self._server_refs = 0
 
         # Whether we have seen a StartFrame already.
         self._initialized = False
@@ -143,15 +161,42 @@ class SingleClientWebsocketServerInputTransport(BaseInputTransport):
             await self._params.serializer.setup(frame)
         if not self._server_task:
             self._server_task = self.create_task(self._server_task_handler())
+        # The input side now holds the server; the output side registers its own
+        # hold in its start().
+        self._server_refs += 1
         await self.set_transport_ready(frame)
 
+    def acquire_server(self):
+        """Register a hold on the shared WebSocket server.
+
+        Called by the output transport when it starts, so the server stays up
+        until both the input and output sides have released it.
+        """
+        self._server_refs += 1
+
     async def stop(self, frame: EndFrame):
-        """Stop the WebSocket server and cleanup resources.
+        """Stop the input side and release its hold on the server.
 
         Args:
             frame: The end frame signaling transport shutdown.
         """
         await super().stop(frame)
+        # Release our hold, but don't tear the server down while the output side
+        # still holds it: it may have frames left to flush (e.g. a goodbye spoken
+        # by the TTS after this EndFrame passed the input). Whichever side is last
+        # drives the drain.
+        await self.release_server()
+
+    async def release_server(self):
+        """Release one hold on the shared server, draining it once none remain.
+
+        Called by the input transport when its EndFrame arrives and by the
+        output transport once it has flushed all pending output. The last
+        release drives the graceful drain.
+        """
+        self._server_refs -= 1
+        if self._server_refs > 0:
+            return
         # Signal the server loop to exit and drain it gracefully before
         # cancelling whatever is left.
         self._stop_server_event.set()
@@ -187,14 +232,15 @@ class SingleClientWebsocketServerInputTransport(BaseInputTransport):
     async def _server_task_handler(self):
         """Handle WebSocket server startup and client connections."""
         logger.info(f"Starting websocket server on {self._host}:{self._port}")
-        origins = self._params.allowed_origins or None
+        # websockets types each origin as its own Origin alias over str.
+        origins = cast("list[Origin] | None", self._params.allowed_origins or None)
         async with websocket_serve(
             self._client_handler, self._host, self._port, origins=origins
         ) as server:
             await self._callbacks.on_websocket_ready()
             await self._stop_server_event.wait()
 
-    async def _client_handler(self, websocket: websockets.WebSocketServerProtocol):
+    async def _client_handler(self, websocket: websockets.WebSocketServerProtocol):  # pyright: ignore[reportAttributeAccessIssue]
         """Handle individual client connections and message processing."""
         logger.info(f"New client connection from {websocket.remote_address}")
 
@@ -257,7 +303,9 @@ class SingleClientWebsocketServerInputTransport(BaseInputTransport):
         logger.info(f"Client {websocket.remote_address} disconnected")
 
     async def _monitor_websocket(
-        self, websocket: websockets.WebSocketServerProtocol, session_timeout: int
+        self,
+        websocket: websockets.WebSocketServerProtocol,  # pyright: ignore[reportAttributeAccessIssue]
+        session_timeout: int,
     ):
         """Monitor WebSocket connection for session timeout."""
         try:
@@ -277,7 +325,10 @@ class SingleClientWebsocketServerOutputTransport(BaseOutputTransport):
     """
 
     def __init__(
-        self, transport: BaseTransport, params: SingleClientWebsocketServerParams, **kwargs
+        self,
+        transport: "SingleClientWebsocketServerTransport",
+        params: SingleClientWebsocketServerParams,
+        **kwargs,
     ):
         """Initialize the WebSocket server output transport.
 
@@ -291,7 +342,7 @@ class SingleClientWebsocketServerOutputTransport(BaseOutputTransport):
         self._transport = transport
         self._params = params
 
-        self._websocket: websockets.WebSocketServerProtocol | None = None
+        self._websocket: websockets.WebSocketServerProtocol | None = None  # pyright: ignore[reportAttributeAccessIssue]
 
         # write_audio_frame() is called quickly, as soon as we get audio
         # (e.g. from the TTS), and since this is just a network connection we
@@ -304,7 +355,10 @@ class SingleClientWebsocketServerOutputTransport(BaseOutputTransport):
         # Whether we have seen a StartFrame already.
         self._initialized = False
 
-    async def set_client_connection(self, websocket: websockets.WebSocketServerProtocol | None):
+    async def set_client_connection(
+        self,
+        websocket: websockets.WebSocketServerProtocol | None,  # pyright: ignore[reportAttributeAccessIssue]
+    ):
         """Set the active client WebSocket connection.
 
         Args:
@@ -333,16 +387,24 @@ class SingleClientWebsocketServerOutputTransport(BaseOutputTransport):
         if self._params.serializer:
             await self._params.serializer.setup(frame)
         self._send_interval = (self.audio_chunk_size / self.sample_rate) / 2
+        # Register the output side's hold on the shared server (owned by the
+        # input transport), so it stays up until this side has flushed.
+        self._transport.input().acquire_server()
         await self.set_transport_ready(frame)
 
     async def stop(self, frame: EndFrame):
-        """Stop the output transport and send final frame.
+        """Stop the output transport, flushing final output before releasing the server.
 
         Args:
             frame: The end frame signaling transport shutdown.
         """
         await super().stop(frame)
         await self._write_frame(frame)
+        # All pending output has been written; release our hold on the shared
+        # server. Since the input released its hold as soon as the EndFrame
+        # passed it, this last release drives the graceful drain — the client
+        # connection stays open until the goodbye has been sent.
+        await self._transport.input().release_server()
 
     async def cancel(self, frame: CancelFrame):
         """Cancel the output transport and send cancellation frame.
@@ -505,7 +567,7 @@ class SingleClientWebsocketServerTransport(BaseTransport):
         )
         self._input: SingleClientWebsocketServerInputTransport | None = None
         self._output: SingleClientWebsocketServerOutputTransport | None = None
-        self._websocket: websockets.WebSocketServerProtocol | None = None
+        self._websocket: websockets.WebSocketServerProtocol | None = None  # pyright: ignore[reportAttributeAccessIssue]
 
         # Register supported handlers. The user will only be able to register
         # these handlers.

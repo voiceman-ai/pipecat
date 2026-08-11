@@ -20,6 +20,7 @@ from pipecat.metrics.metrics import (
     MetricsData,
     ProcessingMetricsData,
     SmartTurnMetricsData,
+    STTUsageMetricsData,
     TTFAMetricsData,
     TTFBMetricsData,
     TTSUsageMetricsData,
@@ -37,6 +38,7 @@ class MetricsLogObserver(BaseObserver):
     - TTFAMetricsData (Time To First Audio)
     - ProcessingMetricsData (General processing time)
     - LLMUsageMetricsData (Token usage statistics)
+    - STTUsageMetricsData (Speech-to-Text audio seconds)
     - TTSUsageMetricsData (Text-to-Speech character counts)
     - TurnMetricsData (Turn prediction metrics)
 
@@ -157,6 +159,11 @@ class MetricsLogObserver(BaseObserver):
             )
         elif isinstance(metrics_data, LLMUsageMetricsData):
             self._log_llm_usage(metrics_data, processor_info, model_info, time_sec)
+        elif isinstance(metrics_data, STTUsageMetricsData):
+            logger.debug(
+                f"📊 {processor_info} STT USAGE{model_info}: "
+                f"{metrics_data.value.audio_seconds:.3f}s audio at {time_sec:.3f}s"
+            )
         elif isinstance(metrics_data, TTSUsageMetricsData):
             logger.debug(
                 f"📊 {processor_info} TTS USAGE{model_info}: {metrics_data.value} characters at {time_sec:.3f}s"
@@ -201,6 +208,15 @@ class MetricsLogObserver(BaseObserver):
 
         if usage.reasoning_tokens is not None:
             details.append(f"reasoning: {usage.reasoning_tokens}")
+
+        if usage.input_audio_tokens is not None:
+            details.append(f"input_audio: {usage.input_audio_tokens}")
+
+        if usage.output_audio_tokens is not None:
+            details.append(f"output_audio: {usage.output_audio_tokens}")
+
+        if usage.cache_read_input_audio_tokens is not None:
+            details.append(f"cache_read_audio: {usage.cache_read_input_audio_tokens}")
 
         usage_str = ", ".join(details)
 

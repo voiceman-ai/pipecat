@@ -27,7 +27,6 @@ from pipecat.frames.frames import (
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
 )
-from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -55,8 +54,6 @@ class NvidiaLLMService(OpenAILLMService):
     This service extends OpenAILLMService to work with NVIDIA's NIM API while
     maintaining compatibility with the OpenAI-style interface. It handles:
 
-    - Incremental token usage reporting (NIM sends per-chunk counts instead
-      of a final summary)
     - Detection and filtering of leading ``<think>``/``</think>`` content for
       models that emit reasoning inline before visible output (e.g.
       DeepSeek-R1, some nemotron models)
@@ -120,25 +117,12 @@ class NvidiaLLMService(OpenAILLMService):
                 "Set base_url to your local NIM endpoint for local deployments."
             )
 
-        # Counters for accumulating token usage metrics
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
-        self._total_tokens = 0
-        self._has_reported_prompt_tokens = False
-        self._is_processing = False
-
     def _reset_response_state(self):
         """Reset per-response state at the start of each LLM call.
 
-        Resets token accumulation counters, leading-think-tag detection state,
-        and reasoning-content field tracking.
+        Resets leading-think-tag detection state and reasoning-content field
+        tracking.
         """
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
-        self._total_tokens = 0
-        self._has_reported_prompt_tokens = False
-        self._is_processing = True
-
         self._think_tag_state = _ThinkTagState.DETECTING
         self._think_tag_buffer = ""
 
@@ -343,60 +327,16 @@ class NvidiaLLMService(OpenAILLMService):
             )
 
     async def _process_context(self, context: LLMContext):
-        """Process a context through the LLM and accumulate token usage metrics.
+        """Process a context through the LLM.
 
-        Delegates to the base OpenAI streaming loop while adding
-        NVIDIA-specific behavior:
-
-        - ``reasoning_content`` and leading ``<think>`` content are
-          intercepted via the ``get_chat_completions`` stream wrapper and
-          emitted as
-          ``LLMThought*Frame`` objects.
-        - Incremental token counts are accumulated and reported as final
-          totals.
+        Delegates to the base OpenAI streaming loop, resetting the per-response
+        state it needs to emit ``LLMThought*Frame`` objects for
+        ``reasoning_content`` and leading ``<think>`` content, which the
+        ``get_chat_completions`` stream wrapper intercepts.
 
         Args:
             context: The context to process, containing messages and other
                 information needed for the LLM interaction.
         """
         self._reset_response_state()
-
-        # Wrap in try/finally to guarantee accumulated token metrics are
-        # reported and _is_processing is cleared even on cancellation.
-        try:
-            await super()._process_context(context)
-        finally:
-            self._is_processing = False
-            # Report final accumulated token usage at the end of processing
-            if self._prompt_tokens > 0 or self._completion_tokens > 0:
-                self._total_tokens = self._prompt_tokens + self._completion_tokens
-                tokens = LLMTokenUsage(
-                    prompt_tokens=self._prompt_tokens,
-                    completion_tokens=self._completion_tokens,
-                    total_tokens=self._total_tokens,
-                )
-                await super().start_llm_usage_metrics(tokens)
-
-    async def start_llm_usage_metrics(self, tokens: LLMTokenUsage):
-        """Accumulate token usage metrics during processing.
-
-        This method intercepts the incremental token updates from NVIDIA's API
-        and accumulates them instead of passing each update to the metrics system.
-        The final accumulated totals are reported at the end of processing.
-
-        Args:
-            tokens: The token usage metrics for the current chunk of processing,
-                containing prompt_tokens and completion_tokens counts.
-        """
-        # Only accumulate metrics during active processing
-        if not self._is_processing:
-            return
-
-        # Record prompt tokens the first time we see them
-        if not self._has_reported_prompt_tokens and tokens.prompt_tokens > 0:
-            self._prompt_tokens = tokens.prompt_tokens
-            self._has_reported_prompt_tokens = True
-
-        # Update completion tokens count if it has increased
-        if tokens.completion_tokens > self._completion_tokens:
-            self._completion_tokens = tokens.completion_tokens
+        await super()._process_context(context)

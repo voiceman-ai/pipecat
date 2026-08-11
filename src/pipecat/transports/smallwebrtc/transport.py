@@ -42,10 +42,9 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection, SmallWebRTCTrack
 
 try:
-    import cv2
     from aiortc import VideoStreamTrack
     from aiortc.mediastreams import AudioStreamTrack, MediaStreamError
     from av import AudioFrame, AudioResampler, VideoFrame
@@ -230,13 +229,6 @@ class SmallWebRTCClient:
     messaging through the SmallWebRTCConnection interface.
     """
 
-    FORMAT_CONVERSIONS = {
-        "yuv420p": cv2.COLOR_YUV2RGB_I420,
-        "yuvj420p": cv2.COLOR_YUV2RGB_I420,  # OpenCV treats both the same
-        "nv12": cv2.COLOR_YUV2RGB_NV12,
-        "gray": cv2.COLOR_GRAY2RGB,
-    }
-
     def __init__(self, webrtc_connection: SmallWebRTCConnection, callbacks: SmallWebRTCCallbacks):
         """Initialize the WebRTC client.
 
@@ -250,18 +242,19 @@ class SmallWebRTCClient:
 
         self._audio_output_track = None
         self._video_output_track = None
-        self._audio_input_track: AudioStreamTrack | None = None
-        self._video_input_track: VideoStreamTrack | None = None
-        self._screen_video_track: VideoStreamTrack | None = None
+        self._audio_input_track: SmallWebRTCTrack | None = None
+        self._video_input_track: SmallWebRTCTrack | None = None
+        self._screen_video_track: SmallWebRTCTrack | None = None
 
         self._params = None
-        self._audio_in_channels = None
-        self._in_sample_rate = None
-        self._out_sample_rate = None
+        self._audio_in_channels = 0
+        self._in_sample_rate = 0
+        self._out_sample_rate = 0
         self._leave_counter = 0
 
-        # Audio resampler - will be configured during setup with target sample rate
+        # Audio resampler - will be configured during setup with target sample rate/layout
         self._audio_in_resampler = None
+        self._audio_in_layout = None
 
         @self._webrtc_connection.event_handler("connected")
         async def on_connected(connection: SmallWebRTCConnection):
@@ -293,12 +286,28 @@ class SmallWebRTCClient:
             The converted RGB frame as a NumPy array.
 
         Raises:
+            ImportError: If OpenCV is not installed.
             ValueError: If the format is unsupported.
         """
         if format_name.startswith("rgb"):  # Already in RGB, no conversion needed
             return frame_array
 
-        conversion_code = SmallWebRTCClient.FORMAT_CONVERSIONS.get(format_name)
+        try:
+            import cv2
+        except ModuleNotFoundError as e:
+            raise ImportError(
+                "Receiving non-RGB video frames requires OpenCV. Install it with "
+                '`uv add "pipecat-ai[webrtc-video]"`.'
+            ) from e
+
+        format_conversions = {
+            "yuv420p": cv2.COLOR_YUV2RGB_I420,
+            "yuvj420p": cv2.COLOR_YUV2RGB_I420,  # OpenCV treats both the same
+            "nv12": cv2.COLOR_YUV2RGB_NV12,
+            "gray": cv2.COLOR_GRAY2RGB,
+        }
+
+        conversion_code = format_conversions.get(format_name)
 
         if conversion_code is None:
             raise ValueError(f"Unsupported format: {format_name}")
@@ -385,6 +394,9 @@ class SmallWebRTCClient:
         Yields:
             InputAudioRawFrame objects containing audio data from the peer.
         """
+        # setup() builds the resampler before the reader task is started.
+        assert self._audio_in_resampler is not None
+
         while True:
             if self._audio_input_track is None:
                 await asyncio.sleep(0.01)
@@ -414,10 +426,16 @@ class SmallWebRTCClient:
                 await asyncio.sleep(0.01)
                 continue
 
-            # Resample if needed, otherwise use the frame as-is
+            # Resample if needed, otherwise use the frame as-is. The resampler
+            # also converts to the configured channel layout, so frames whose
+            # layout doesn't already match must go through it even when the
+            # rate already matches (e.g. aiortc decodes to stereo regardless
+            # of the source track) — otherwise interleaved bytes get labeled
+            # with the wrong channel count.
             frames_to_process = (
                 self._audio_in_resampler.resample(frame)
                 if frame.sample_rate != self._in_sample_rate
+                or frame.layout.name != self._audio_in_layout
                 else [frame]
             )
 
@@ -479,7 +497,10 @@ class SmallWebRTCClient:
         self._out_sample_rate = _params.audio_out_sample_rate or frame.audio_out_sample_rate
         self._params = _params
         self._leave_counter += 1
-        self._audio_in_resampler = AudioResampler("s16", "mono", self._in_sample_rate)
+        self._audio_in_layout = "stereo" if self._audio_in_channels == 2 else "mono"
+        self._audio_in_resampler = AudioResampler(
+            "s16", self._audio_in_layout, self._in_sample_rate
+        )
 
     async def connect(self):
         """Establish the WebRTC connection."""
@@ -507,11 +528,22 @@ class SmallWebRTCClient:
     ):
         """Send an application message through the WebRTC connection.
 
+        Messages sent before the data channel is open (e.g. while the peer
+        connection is still being established) are buffered by the connection
+        and flushed, in order, once the channel opens.
+
         Args:
             frame: The message frame to send.
         """
-        if self._can_send():
-            self._webrtc_connection.send_app_message(frame.message)
+        if self.is_closing:
+            message_type = (
+                frame.message.get("type", "unknown")
+                if isinstance(frame.message, dict)
+                else type(frame.message).__name__
+            )
+            logger.debug(f"Discarding app message '{message_type}': peer connection is closing.")
+            return
+        self._webrtc_connection.send_app_message(frame.message)
 
     async def _handle_client_connected(self):
         """Handle client connection establishment."""

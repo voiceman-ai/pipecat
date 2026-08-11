@@ -30,7 +30,6 @@ from websockets.protocol import State
 from pipecat.adapters.base_llm_adapter import BaseLLMAdapter
 from pipecat.adapters.schemas.direct_function import DirectFunction, DirectFunctionWrapper
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -63,7 +62,7 @@ from pipecat.processors.aggregators.llm_context import (
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_service import AIService
-from pipecat.services.settings import LLMSettings, assert_given
+from pipecat.services.settings import LLMSettings
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionLLMServiceMixin
 from pipecat.utils.async_tool_cancellation import (
@@ -76,6 +75,7 @@ from pipecat.utils.context.llm_context_summarization import (
     LLMContextSummarizationUtil,
 )
 from pipecat.utils.deprecation import deprecated
+from pipecat.utils.types import assert_given
 
 if TYPE_CHECKING:
     from pipecat.pipeline.worker import PipelineWorker
@@ -256,9 +256,11 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
     _settings: LLMSettings
     _adapter: TAdapter
 
-    # OpenAILLMAdapter is used as the default adapter since it aligns with most LLM implementations.
-    # However, subclasses should override this with a more specific adapter when necessary.
-    adapter_class: type[BaseLLMAdapter] = OpenAILLMAdapter
+    # Subclasses should set this to a more specific adapter when necessary.
+    # ``None`` selects OpenAILLMAdapter, which aligns with most LLM
+    # implementations; it is resolved at construction rather than named here so
+    # that importing an LLM service doesn't pull in the OpenAI SDK.
+    adapter_class: type[BaseLLMAdapter] | None = None
 
     # Returned to the LLM as the tool result when an unavailable function is
     # called. Deliberately neutral about future availability so the LLM can
@@ -308,7 +310,10 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         self._group_parallel_tools = group_parallel_tools
         self._function_call_timeout_secs = function_call_timeout_secs
         self._enable_async_tool_cancellation: bool = enable_async_tool_cancellation
+        # Turn completion is owned by LLMTurnCompletionUserTurnStopStrategy, which
+        # enables it over an LLMUpdateSettingsFrame once the pipeline starts.
         self._filter_incomplete_user_turns: bool = False
+        self._warn_turn_completion_settings_are_strategy_owned()
         self._async_tool_cancellation_enabled: bool = False
         # The user's base system instruction, without composed addons. Captured
         # here and refreshed when the user changes ``system_instruction`` at
@@ -322,7 +327,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         # (backward compatibility for 3rd-party providers outside this repo).
         # Cast to TAdapter to keep `_adapter` and `get_llm_adapter()` precisely
         # typed for callers that opt into `LLMService[XAdapter]`.
-        self._adapter = cast(TAdapter, self.adapter_class())
+        self._adapter = cast(TAdapter, self._resolve_adapter_class()())
         self._functions: dict[str | None, FunctionCallRegistryItem] = {}
         # Names we've already warned about for a redundant manual registration
         # (an explicit register_function call for a tool whose advertised
@@ -346,6 +351,16 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         self._register_event_handler("on_function_calls_started")
         self._register_event_handler("on_function_calls_cancelled")
         self._register_event_handler("on_completion_timeout")
+
+    @classmethod
+    def _resolve_adapter_class(cls) -> type[BaseLLMAdapter]:
+        """Return the adapter class to instantiate for this service."""
+        if cls.adapter_class is not None:
+            return cls.adapter_class
+
+        from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter
+
+        return OpenAILLMAdapter
 
     def get_llm_adapter(self) -> TAdapter:
         """Get the LLM adapter instance.
@@ -507,6 +522,32 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             await self._cancel_sequential_runner_task()
         await self._cancel_summary_task()
         await self._cancel_all_function_call_tasks()
+
+    def _warn_turn_completion_settings_are_strategy_owned(self):
+        """Warn that the turn-completion settings belong to the user turn strategy.
+
+        Construction is the one place these settings can only have come from
+        application code: the strategy configures the service over an
+        ``LLMUpdateSettingsFrame`` once the pipeline is running.
+        """
+        replacements = {
+            "filter_incomplete_user_turns": (
+                "`user_turn_strategies=FilterIncompleteUserTurnStrategies()`"
+            ),
+            "user_turn_completion_config": "`FilterIncompleteUserTurnStrategies(config=...)`",
+        }
+        for name, replacement in replacements.items():
+            if not getattr(self._settings, name, None):
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("always")
+                warnings.warn(
+                    f"`{type(self._settings).__name__}.{name}` is deprecated since 1.7.0 and "
+                    f"will be removed in 2.0.0. It has no effect here. "
+                    f"Use {replacement} instead.",
+                    DeprecationWarning,
+                    stacklevel=4,
+                )
 
     def append_system_instruction(self, instruction: str) -> None:
         """Append durable text to the system instruction, preserving the user's prompt.
@@ -921,12 +962,15 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
                 f"'{CANCEL_ASYNC_TOOL_NAME}' is a reserved built-in tool name and cannot be "
                 "registered by user code."
             )
-        cancel_on_interruption = self._resolve_tool_option(
-            wrapper.name,
-            cancel_on_interruption,
-            handler,
-            "_pipecat_cancel_on_interruption",
-            default=True,
+        cancel_on_interruption = cast(
+            bool,
+            self._resolve_tool_option(
+                wrapper.name,
+                cancel_on_interruption,
+                handler,
+                "_pipecat_cancel_on_interruption",
+                default=True,
+            ),
         )
         timeout_secs = self._resolve_tool_option(
             wrapper.name,
@@ -1006,12 +1050,12 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         # True and the normalizer rejects None, so guard it explicitly.
         if tools is None:
             return
-        tools = LLMContext._normalize_and_validate_tools(tools)
-        if not is_given(tools):
+        normalized = LLMContext._normalize_and_validate_tools(tools)
+        if not is_given(normalized):
             return
 
         # Register direct functions.
-        for wrapper in tools.direct_functions:
+        for wrapper in normalized.direct_functions:
             if wrapper.name in self._functions:
                 continue
             if wrapper.name in self._explicitly_unregistered_function_names:
@@ -1032,7 +1076,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         # registers like any classic handler — register_function reads its
         # @tool_options off the handler — only marked auto_registered so it's
         # pruned when no longer advertised.
-        for schema in tools.standard_tools:
+        for schema in normalized.standard_tools:
             if schema.handler is None:
                 continue
             if schema.name in self._functions:
@@ -1424,6 +1468,8 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         async def timeout_handler():
             try:
                 effective_timeout = item.timeout_secs or self._function_call_timeout_secs
+                # This task is only started when one of the two is set.
+                assert effective_timeout is not None
                 await asyncio.sleep(effective_timeout)
                 logger.warning(
                     f"{self} Function call [{runner_item.function_name}:{runner_item.tool_call_id}] timed out after {effective_timeout} seconds."

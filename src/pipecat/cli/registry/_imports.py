@@ -88,7 +88,9 @@ IMPORTS = {
     "anthropic_llm": ["from pipecat.services.anthropic.llm import AnthropicLLMService"],
     "aws_bedrock_llm": ["from pipecat.services.aws.llm import AWSBedrockLLMService"],
     "azure_llm": ["from pipecat.services.azure.llm import AzureLLMService"],
+    "baseten_llm": ["from pipecat.services.baseten.llm import BasetenLLMService"],
     "cerebras_llm": ["from pipecat.services.cerebras.llm import CerebrasLLMService"],
+    "crusoe_llm": ["from pipecat.services.crusoe.llm import CrusoeLLMService"],
     "deepseek_llm": ["from pipecat.services.deepseek.llm import DeepSeekLLMService"],
     "fireworks_llm": ["from pipecat.services.fireworks.llm import FireworksLLMService"],
     "google_gemini_llm": ["from pipecat.services.google.llm import GoogleLLMService"],
@@ -117,6 +119,7 @@ IMPORTS = {
     "camb_tts": ["from pipecat.services.camb.tts import CambTTSService"],
     "cartesia_tts": ["from pipecat.services.cartesia.tts import CartesiaTTSService"],
     "deepgram_tts": ["from pipecat.services.deepgram.tts import DeepgramTTSService"],
+    "deepgram_flux_tts": ["from pipecat.services.deepgram.flux.tts import DeepgramFluxTTSService"],
     "deepgram_sagemaker_tts": [
         "from pipecat.services.deepgram.sagemaker.tts import DeepgramSageMakerTTSService"
     ],
@@ -139,11 +142,13 @@ IMPORTS = {
     ],
     "openai_tts": ["from pipecat.services.openai.tts import OpenAITTSService"],
     "piper_tts": ["from pipecat.services.piper.tts import PiperTTSService"],
+    "pockettts_tts": ["from pipecat.services.pocket_tts.tts import PocketTTSService"],
     "resemble_tts": ["from pipecat.services.resembleai.tts import ResembleAITTSService"],
     "rime_tts": ["from pipecat.services.rime.tts import RimeTTSService"],
     "sarvam_tts": ["from pipecat.services.sarvam.tts import SarvamTTSService"],
     "smallest_tts": ["from pipecat.services.smallest.tts import SmallestTTSService"],
     "soniox_tts": ["from pipecat.services.soniox.tts import SonioxTTSService"],
+    "speechify_tts": ["from pipecat.services.speechify.tts import SpeechifyHttpTTSService"],
     "xai_tts": ["from pipecat.services.xai.tts import XAITTSService"],
     "xtts_tts": ["from pipecat.services.xtts.tts import XTTSService"],
     # Realtime Services

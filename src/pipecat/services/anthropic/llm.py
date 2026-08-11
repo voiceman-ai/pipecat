@@ -20,6 +20,7 @@ import httpx
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from pipecat.adapters.base_llm_adapter import LLMContextConversionError
 from pipecat.adapters.services.anthropic_adapter import (
     AnthropicLLMAdapter,
     AnthropicLLMInvocationParams,
@@ -38,13 +39,14 @@ from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
-from pipecat.services.settings import NOT_GIVEN as _NOT_GIVEN
-from pipecat.services.settings import LLMSettings, _NotGiven, assert_given, is_given
+from pipecat.services.settings import LLMSettings
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_llm
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 try:
-    from anthropic import NOT_GIVEN, APITimeoutError, AsyncAnthropic
+    from anthropic import NOT_GIVEN as ANTHROPIC_NOT_GIVEN
+    from anthropic import APITimeoutError, AsyncAnthropic
     from anthropic import NotGiven as AnthropicNotGiven
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
@@ -80,17 +82,17 @@ class AnthropicLLMSettings(LLMSettings):
         thinking: Extended thinking configuration.
     """
 
-    enable_prompt_caching: bool | _NotGiven = field(default_factory=lambda: _NOT_GIVEN)
-    # Override inherited LLMSettings fields to also accept anthropic's NotGiven
-    # sentinel. The service stores anthropic's NOT_GIVEN in these fields so
-    # they can be passed through unchanged to the AsyncAnthropic client.
-    temperature: float | None | _NotGiven | AnthropicNotGiven = field(
-        default_factory=lambda: _NOT_GIVEN
+    enable_prompt_caching: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    # Override inherited LLMSettings fields to also accept the Anthropic SDK's
+    # sentinel, which the service stores here so these fields can be passed
+    # through unchanged to the AsyncAnthropic client.
+    temperature: float | None | NotGiven | AnthropicNotGiven = field(
+        default_factory=lambda: NOT_GIVEN
     )
-    top_k: int | None | _NotGiven | AnthropicNotGiven = field(default_factory=lambda: _NOT_GIVEN)
-    top_p: float | None | _NotGiven | AnthropicNotGiven = field(default_factory=lambda: _NOT_GIVEN)
-    thinking: Union["AnthropicLLMService.ThinkingConfig", _NotGiven, AnthropicNotGiven] = field(
-        default_factory=lambda: _NOT_GIVEN
+    top_k: int | None | NotGiven | AnthropicNotGiven = field(default_factory=lambda: NOT_GIVEN)
+    top_p: float | None | NotGiven | AnthropicNotGiven = field(default_factory=lambda: NOT_GIVEN)
+    thinking: Union["AnthropicLLMService.ThinkingConfig", NotGiven, AnthropicNotGiven] = field(
+        default_factory=lambda: NOT_GIVEN
     )
 
     @classmethod
@@ -147,13 +149,21 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             extra: Additional parameters to pass to the API.
         """
 
+        # These fields declare the caller-facing type but default to anthropic's
+        # NOT_GIVEN sentinel, which the declaration predates.
         enable_prompt_caching: bool | None = None
         max_tokens: int | None = Field(default_factory=lambda: 4096, ge=1)
-        temperature: float | None = Field(default_factory=lambda: NOT_GIVEN, ge=0.0, le=1.0)
-        top_k: int | None = Field(default_factory=lambda: NOT_GIVEN, ge=0)
-        top_p: float | None = Field(default_factory=lambda: NOT_GIVEN, ge=0.0, le=1.0)
-        thinking: Optional["AnthropicLLMService.ThinkingConfig"] = Field(
-            default_factory=lambda: NOT_GIVEN
+        temperature: float | None = Field(  # pyright: ignore[reportAssignmentType]
+            default_factory=lambda: ANTHROPIC_NOT_GIVEN, ge=0.0, le=1.0
+        )
+        top_k: int | None = Field(  # pyright: ignore[reportAssignmentType]
+            default_factory=lambda: ANTHROPIC_NOT_GIVEN, ge=0
+        )
+        top_p: float | None = Field(  # pyright: ignore[reportAssignmentType]
+            default_factory=lambda: ANTHROPIC_NOT_GIVEN, ge=0.0, le=1.0
+        )
+        thinking: Optional["AnthropicLLMService.ThinkingConfig"] = Field(  # pyright: ignore[reportAssignmentType]
+            default_factory=lambda: ANTHROPIC_NOT_GIVEN
         )
         extra: dict[str, Any] | None = Field(default_factory=dict)
 
@@ -199,15 +209,15 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             system_instruction=None,
             max_tokens=4096,
             enable_prompt_caching=False,
-            temperature=NOT_GIVEN,
-            top_k=NOT_GIVEN,
-            top_p=NOT_GIVEN,
+            temperature=ANTHROPIC_NOT_GIVEN,
+            top_k=ANTHROPIC_NOT_GIVEN,
+            top_p=ANTHROPIC_NOT_GIVEN,
             frequency_penalty=None,
             presence_penalty=None,
             seed=None,
             filter_incomplete_user_turns=False,
             user_turn_completion_config=None,
-            thinking=NOT_GIVEN,
+            thinking=ANTHROPIC_NOT_GIVEN,
             extra={},
         )
 
@@ -224,7 +234,8 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
                 default_settings.temperature = params.temperature
                 default_settings.top_k = params.top_k
                 default_settings.top_p = params.top_p
-                default_settings.thinking = params.thinking
+                if params.thinking is not None:
+                    default_settings.thinking = params.thinking
                 if isinstance(params.extra, dict):
                     default_settings.extra = params.extra
                 if params.enable_prompt_caching is not None:
@@ -313,7 +324,7 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
         broken out in their own fields).
         """
         messages = []
-        system = NOT_GIVEN
+        system = ANTHROPIC_NOT_GIVEN
         tools = []
         effective_instruction = system_instruction or assert_given(
             self._settings.system_instruction
@@ -323,6 +334,7 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             context,
             enable_prompt_caching=assert_given(self._settings.enable_prompt_caching),
             system_instruction=effective_instruction,
+            ensure_last_message_is_user=self._should_inject_trailing_user_message(),
         )
         messages = invocation_params["messages"]
         system = invocation_params["system"]
@@ -367,12 +379,40 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
         text = next((block.text for block in response.content if hasattr(block, "text")), None)
         return text, usage
 
+    # Models known to support assistant message prefilling (a request whose
+    # message list ends with an assistant message). Anthropic dropped prefill
+    # support starting with the 4.6-generation models, so this is a frozen
+    # legacy set: any model NOT matching is assumed to reject prefill and gets
+    # a trailing user message injected when needed.
+    _PREFILL_SUPPORTED_PATTERNS = (
+        "claude-2",
+        "claude-instant",
+        "claude-3",
+        "claude-opus-4-0",
+        "claude-opus-4-1",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5",
+    )
+
+    def _should_inject_trailing_user_message(self) -> bool:
+        """Whether to fix up requests whose message list ends with an assistant message.
+
+        Models without assistant-prefill support reject such requests, so
+        injection is on for every model not known to support prefill.
+        Subclasses with exotic model naming can override
+        ``_PREFILL_SUPPORTED_PATTERNS``.
+        """
+        model = self._settings.model or ""
+        return not any(model.startswith(p) for p in self._PREFILL_SUPPORTED_PATTERNS)
+
     def _get_llm_invocation_params(self, context: LLMContext) -> AnthropicLLMInvocationParams:
         adapter = self.get_llm_adapter()
         params = adapter.get_llm_invocation_params(
             context,
             enable_prompt_caching=assert_given(self._settings.enable_prompt_caching),
             system_instruction=assert_given(self._settings.system_instruction),
+            ensure_last_message_is_user=self._should_inject_trailing_user_message(),
         )
         return params
 
@@ -515,14 +555,6 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
                         else 0
                     )
                     logger.debug(f"Cache read input tokens: {cache_read_input_tokens}")
-                    total_input_tokens = (
-                        prompt_tokens + cache_creation_input_tokens + cache_read_input_tokens
-                    )
-                    if total_input_tokens >= 1024:
-                        if hasattr(
-                            context, "turns_above_cache_threshold"
-                        ):  # LLMContext doesn't have this attribute
-                            context.turns_above_cache_threshold += 1
 
             await self.run_function_calls(function_calls)
 
@@ -534,6 +566,8 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             raise
         except httpx.TimeoutException:
             await self._call_event_handler("on_completion_timeout")
+        except LLMContextConversionError as e:
+            await self.push_error(error_msg=str(e), exception=e)
         except Exception as e:
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
@@ -592,6 +626,14 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
                 completion_tokens=completion_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
+                # Anthropic reports input_tokens net of the cache, so the cached
+                # tokens are added back to keep the total comparable with services
+                # whose provider supplies it already gross.
+                total_tokens=(
+                    prompt_tokens
+                    + cache_creation_input_tokens
+                    + cache_read_input_tokens
+                    + completion_tokens
+                ),
             )
             await self.start_llm_usage_metrics(tokens)

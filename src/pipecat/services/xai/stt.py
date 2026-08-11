@@ -18,7 +18,6 @@ from typing import Any
 from urllib.parse import urlencode
 
 from loguru import logger
-from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat import version as pipecat_version
@@ -30,12 +29,13 @@ from pipecat.frames.frames import (
     StartFrame,
     TranscriptionFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import XAI_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven
 
 
 def language_to_xai_stt_language(language: Language) -> str:
@@ -92,11 +92,11 @@ class XAISTTSettings(STTSettings):
             word identifying the detected speaker.
     """
 
-    interim_results: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    endpointing: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    multichannel: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    channels: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    diarize: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    interim_results: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    endpointing: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    multichannel: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    channels: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    diarize: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class XAISTTService(WebsocketSTTService):
@@ -283,7 +283,7 @@ class XAISTTService(WebsocketSTTService):
                 "Authorization": f"Bearer {self._api_key}",
                 "User-Agent": f"xAI/1.0 (integration=Pipecat/{pipecat_version()})",
             }
-            self._websocket = await websocket_connect(ws_url, additional_headers=headers)
+            self._websocket = await self._websocket_connect(ws_url, additional_headers=headers)
             await self._call_event_handler("on_connected")
             logger.debug(f"{self} connected to xAI STT WebSocket")
         except Exception as e:
@@ -373,6 +373,9 @@ class XAISTTService(WebsocketSTTService):
             return
         language = language if language is not None else self._language_for_frame()
 
+        # Report usage before the transcription frame so tracing can attach
+        # it to the STT span the frame closes.
+        await self.emit_stt_usage_metrics()
         await self.push_frame(
             TranscriptionFrame(
                 text,
@@ -384,8 +387,6 @@ class XAISTTService(WebsocketSTTService):
             )
         )
         await self._trace_transcription(text, True, language)
-        if speech_final:
-            await self.stop_processing_metrics()
 
     def _language_for_frame(self) -> Language:
         """Return a Language enum suitable for transcription frames.

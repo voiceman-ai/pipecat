@@ -13,7 +13,7 @@ Speech SDK for real-time audio transcription.
 import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from loguru import logger
 
@@ -27,12 +27,13 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
 )
 from pipecat.services.azure.common import language_to_azure_language
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, assert_given
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import AZURE_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 try:
     from azure.cognitiveservices.speech import (
@@ -53,10 +54,15 @@ except ModuleNotFoundError as e:
     raise ImportError(f"Missing module: {e}") from e
 
 
-# Accepted values for the ``profanity`` setting, mapped to Azure SDK options.
-# A dict (rather than an enum annotation) so an out-of-range value fails fast
-# with a KeyError at apply time instead of silently keeping the SDK default.
-_PROFANITY_OPTIONS: dict[str, "ProfanityOption"] = {
+AzureProfanity = Literal["raw", "masked", "removed"]
+"""How Azure handles profanity in transcripts.
+
+* ``"raw"`` — return the text as recognized, no masking.
+* ``"masked"`` — replace profane words with ``****`` (Azure default).
+* ``"removed"`` — drop profane words from the output.
+"""
+
+_PROFANITY_OPTIONS: dict[AzureProfanity, ProfanityOption] = {
     "raw": ProfanityOption.Raw,
     "masked": ProfanityOption.Masked,
     "removed": ProfanityOption.Removed,
@@ -67,13 +73,21 @@ _PROFANITY_OPTIONS: dict[str, "ProfanityOption"] = {
 class AzureSTTSettings(STTSettings):
     """Settings for AzureSTTService.
 
+    ``model`` and ``language`` are inherited from ``STTSettings`` /
+    ``ServiceSettings``.
+
     Parameters:
-        profanity: How Azure treats profanity in transcripts: ``"raw"``,
-            ``"masked"``, or ``"removed"``. ``None`` keeps the Azure SDK
-            default (masked).
+        profanity: How Azure handles profanity in transcripts. One of
+            ``"raw"``, ``"masked"``, or ``"removed"`` (see ``AzureProfanity``).
+            Store-mode default is ``None`` (Azure SDK default = ``"masked"``).
+            Use ``"raw"`` for non-English deployments where Azure's profanity
+            list is over-eager and masks ordinary words (e.g. Italian names
+            containing common substrings), which breaks downstream fuzzy
+            matching and LLM reasoning. See `SpeechConfig.set_profanity
+            <https://learn.microsoft.com/en-us/python/api/azure-cognitiveservices-speech/azure.cognitiveservices.speech.speechconfig#azure-cognitiveservices-speech-speechconfig-set-profanity>`_.
     """
 
-    profanity: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    profanity: AzureProfanity | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class AzureSTTService(STTService):
@@ -174,21 +188,10 @@ class AzureSTTService(STTService):
         if endpoint_id:
             self._speech_config.endpoint_id = endpoint_id
 
-        self._apply_profanity_setting()
+        self._apply_profanity()
 
         self._audio_stream = None
         self._speech_recognizer = None
-
-    def _apply_profanity_setting(self) -> None:
-        """Wire the ``profanity`` setting through to the speech config.
-
-        No-op when the setting is ``None`` (keep the Azure SDK default).
-        Raises ``KeyError`` on an out-of-range value so misconfiguration
-        fails fast instead of silently keeping the default.
-        """
-        profanity = assert_given(self._settings.profanity)
-        if profanity is not None:
-            self._speech_config.set_profanity(_PROFANITY_OPTIONS[profanity])
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate performance metrics.
@@ -209,18 +212,34 @@ class AzureSTTService(STTService):
         """
         return language_to_azure_language(language)
 
+    def _apply_profanity(self):
+        """Apply the current ``profanity`` setting to the speech config.
+
+        A no-op when profanity is ``None`` (keeps the Azure SDK default of
+        ``"masked"``).
+        """
+        # Annotate the local so pyright solves ``assert_given``'s TypeVar to the
+        # literal instead of widening it to ``str`` (which wouldn't be a valid
+        # ``_PROFANITY_OPTIONS`` key).
+        profanity: AzureProfanity | None = assert_given(self._settings.profanity)
+        if profanity is not None:
+            self._speech_config.set_profanity(_PROFANITY_OPTIONS[profanity])
+
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
-        """Apply a settings delta and reconnect if the speech config changed."""
+        """Apply a settings delta and reconnect if language or profanity changed."""
         changed = await super()._update_settings(delta)
 
         if "language" in changed:
             self._speech_config.speech_recognition_language = assert_given(
                 self._settings.language
             ) or language_to_azure_language(Language.EN_US)
+
         if "profanity" in changed:
-            self._apply_profanity_setting()
-        # SpeechConfig changes only take effect on a new recognizer.
-        if changed.keys() & {"language", "profanity"} and self._audio_stream:
+            self._apply_profanity()
+
+        # Both settings are baked into the recognizer at connect time, so a
+        # live change only takes effect after a reconnect.
+        if ("language" in changed or "profanity" in changed) and self._audio_stream:
             await self._disconnect()
             await self._connect()
 
@@ -239,7 +258,6 @@ class AzureSTTService(STTService):
             Frame: Either None for successful processing or ErrorFrame on failure.
         """
         try:
-            await self.start_processing_metrics()
             if self._audio_stream:
                 self._audio_stream.write(audio)
             yield None
@@ -316,7 +334,7 @@ class AzureSTTService(STTService):
         self, transcript: str, is_final: bool, language: Language | None = None
     ):
         """Handle a transcription result with tracing."""
-        await self.stop_processing_metrics()
+        pass
 
     def _on_handle_recognized(self, event):
         if event.result.reason == ResultReason.RecognizedSpeech and len(event.result.text) > 0:
@@ -326,9 +344,11 @@ class AzureSTTService(STTService):
                 "Language | None",
                 getattr(event.result, "language", None) or assert_given(self._settings.language),
             )
-            # RecognizedSpeech is Azure's final recognition for an utterance, so
-            # mark the frame finalized — downstream user-turn stop strategies
-            # take their fast-path on it.
+            # Azure's ``RecognizedSpeech`` event is by definition the final
+            # recognition for an utterance — mark the frame as such so that
+            # downstream turn-stop strategies (``SpeechTimeoutUserTurnStop``
+            # and friends) can take their finalized fast-path instead of
+            # waiting for VAD events that may never arrive on short replies.
             frame = TranscriptionFrame(
                 event.result.text,
                 self._user_id,
@@ -340,6 +360,9 @@ class AzureSTTService(STTService):
             asyncio.run_coroutine_threadsafe(
                 self._handle_transcription(event.result.text, True, language), self.get_event_loop()
             )
+            # Report usage before the transcription frame so tracing can attach
+            # it to the STT span the frame closes (submissions run in order).
+            asyncio.run_coroutine_threadsafe(self.emit_stt_usage_metrics(), self.get_event_loop())
             asyncio.run_coroutine_threadsafe(self.push_frame(frame), self.get_event_loop())
 
     def _on_handle_recognizing(self, event):

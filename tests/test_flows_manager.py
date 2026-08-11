@@ -23,7 +23,13 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from pipecat.flows.exceptions import FlowError, FlowTransitionError
 from pipecat.flows.manager import FlowManager, NodeConfig
-from pipecat.flows.types import FlowArgs, FlowResult, FlowsFunctionSchema, flows_tool_options
+from pipecat.flows.types import (
+    NO_RESPONSE,
+    FlowArgs,
+    FlowResult,
+    FlowsFunctionSchema,
+    flows_tool_options,
+)
 from pipecat.frames.frames import (
     LLMMessagesAppendFrame,
     LLMMessagesUpdateFrame,
@@ -32,12 +38,11 @@ from pipecat.frames.frames import (
 )
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.settings import LLMSettings
 from tests.flows_test_helpers import (
     assert_tts_speak_frames_queued,
     get_advertised_tool_handlers,
     get_advertised_tools,
-    make_mock_task,
+    make_mock_worker,
 )
 
 
@@ -55,7 +60,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         """Set up test fixtures before each test."""
-        self.mock_task = make_mock_task()
+        self.mock_worker = make_mock_worker()
         self.mock_llm = OpenAILLMService(api_key="test-key")
 
         # Create mock assistant aggregator with public property only
@@ -94,30 +99,30 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         """Test the worker argument and the deprecated task argument."""
         # worker= is the canonical argument
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
-        self.assertIs(flow_manager.worker, self.mock_task)
+        self.assertIs(flow_manager.worker, self.mock_worker)
 
         # task= still works but is deprecated
         with self.assertWarns(DeprecationWarning):
             flow_manager = FlowManager(
-                task=self.mock_task,
+                task=self.mock_worker,
                 llm=self.mock_llm,
                 context_aggregator=self.mock_context_aggregator,
             )
-        self.assertIs(flow_manager.worker, self.mock_task)
+        self.assertIs(flow_manager.worker, self.mock_worker)
 
         # The task property still resolves to the worker, but is deprecated
         with self.assertWarns(DeprecationWarning):
-            self.assertIs(flow_manager.task, self.mock_task)
+            self.assertIs(flow_manager.task, self.mock_worker)
 
         # Passing both is an error
         with self.assertRaises(ValueError):
             FlowManager(
-                worker=self.mock_task,
-                task=self.mock_task,
+                worker=self.mock_worker,
+                task=self.mock_worker,
                 llm=self.mock_llm,
                 context_aggregator=self.mock_context_aggregator,
             )
@@ -136,7 +141,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
 
         # Initialize flow manager
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -166,7 +171,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_node_validation(self):
         """Test node configuration validation."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -188,28 +193,28 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_function_registration(self):
         """Test that a node's functions are advertised with a handler for auto-registration."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
         await flow_manager.initialize()
 
         # Reset mock to clear initialization calls
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
 
         # Set node with function
         await flow_manager.set_node_from_config(self.sample_node)
 
         # The tool is advertised carrying its handler, which the LLM service
         # registers when it sees the advertised tools.
-        handlers = get_advertised_tool_handlers(self.mock_task)
+        handlers = get_advertised_tool_handlers(self.mock_worker)
         self.assertEqual(set(handlers), {"test_function"})
         self.assertTrue(callable(handlers["test_function"]))
 
     async def test_action_execution(self):
         """Test execution of pre and post actions."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -225,23 +230,23 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         }
 
         # Reset mock to clear initialization calls
-        self.mock_task.queue_frame.reset_mock()
+        self.mock_worker.queue_frame.reset_mock()
 
         # Set node with actions
         await flow_manager.set_node_from_config(node_with_actions)
 
-        assert_tts_speak_frames_queued(self.mock_task, ["Pre action", "Post action"])
+        assert_tts_speak_frames_queued(self.mock_worker, ["Pre action", "Post action"])
 
     async def test_error_handling(self):
         """Test error handling in flow manager.
 
         Verifies:
         1. Cannot set node before initialization
-        2. Initialization fails properly when task queue fails
-        3. Node setting fails when task queue fails
+        2. Initialization fails properly when the worker queue fails
+        3. Node setting fails when the worker queue fails
         """
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -255,7 +260,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(flow_manager._initialized)
 
         # Test node setting error
-        self.mock_task.queue_frames.side_effect = Exception("Queue error")
+        self.mock_worker.queue_frames.side_effect = Exception("Queue error")
         with self.assertRaises(FlowError):
             await flow_manager.set_node_from_config(self.sample_node)
 
@@ -265,7 +270,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_state_management(self):
         """Test state management across nodes."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -276,7 +281,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         flow_manager.state["test_key"] = test_value
 
         # Reset mock to clear initialization calls
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
 
         # Verify state persists across node transitions
         await flow_manager.set_node_from_config(self.sample_node)
@@ -285,7 +290,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_function_registration(self):
         """Test registration of multiple functions."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -309,7 +314,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         await flow_manager.set_node_from_config(node_config)
 
         # Verify all functions were advertised (each carrying a handler) and tracked
-        handlers = get_advertised_tool_handlers(self.mock_task)
+        handlers = get_advertised_tool_handlers(self.mock_worker)
         self.assertEqual(set(handlers), {"func_0", "func_1", "func_2"})
         self.assertEqual(len(flow_manager._current_functions), 3)
 
@@ -322,7 +327,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         overrides on both FlowsFunctionSchemas and direct functions.
         """
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -366,7 +371,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         )
 
         # Register the advertised tools the way the LLM service does on inference.
-        self.mock_llm._sync_registered_tool_handlers(get_advertised_tools(self.mock_task))
+        self.mock_llm._sync_registered_tool_handlers(get_advertised_tools(self.mock_worker))
 
         # FlowsFunctionSchema default: Flows' False default survives (not the service's True).
         defaults = self.mock_llm._functions["defaults"]
@@ -393,7 +398,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         See https://github.com/pipecat-ai/pipecat-flows/issues/269.
         """
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -446,7 +451,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         )
 
         # After node B, the advertised ``go`` handler must be node B's, not node A's.
-        latest_go = get_advertised_tool_handlers(self.mock_task)["go"]
+        latest_go = get_advertised_tool_handlers(self.mock_worker)["go"]
 
         async def result_callback(result, *, properties=None):
             pass
@@ -456,7 +461,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
             tool_call_id="t1",
             arguments={},
             llm=None,
-            pipeline_worker=self.mock_task,
+            pipeline_worker=self.mock_worker,
             context=None,
             result_callback=result_callback,
         )
@@ -468,7 +473,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_initialize_already_initialized(self):
         """Test initializing an already initialized flow manager."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -482,7 +487,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_register_action(self):
         """Test registering custom actions."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -496,7 +501,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_call_handler_variations(self):
         """Test different handler signature variations."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -604,7 +609,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_transition_func_error_handling(self):
         """Test error handling in transition functions."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -631,7 +636,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
             tool_call_id="id",
             arguments={},
             llm=None,
-            pipeline_worker=self.mock_task,
+            pipeline_worker=self.mock_worker,
             context=None,
             result_callback=result_callback,
         )
@@ -641,7 +646,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_node_validation_edge_cases(self):
         """Test edge cases in node validation."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -668,7 +673,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_action_execution_error_handling(self):
         """Test error handling in action execution."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -696,7 +701,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_update_llm_context_error_handling(self):
         """Test error handling in LLM context updates."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -716,7 +721,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_function_declarations_processing(self):
         """Test processing of function declarations format."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -756,7 +761,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_role_message_inheritance(self):
         """Test that role_message is sent as LLMUpdateSettingsFrame."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -777,7 +782,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
 
         # Set first node
         await flow_manager.set_node_from_config(first_node)
-        first_call = self.mock_task.queue_frames.call_args_list[0]
+        first_call = self.mock_worker.queue_frames.call_args_list[0]
         first_frames = first_call[0][0]
 
         # Verify LLMUpdateSettingsFrame with system_instruction
@@ -798,11 +803,11 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         self.assertLess(settings_idx, append_idx)
 
         # Reset mock and set second node
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
         await flow_manager.set_node_from_config(second_node)
 
         # Verify no LLMUpdateSettingsFrame for second node (no role_messages)
-        second_call = self.mock_task.queue_frames.call_args_list[0]
+        second_call = self.mock_worker.queue_frames.call_args_list[0]
         second_frames = second_call[0][0]
         settings_frames = [f for f in second_frames if isinstance(f, LLMUpdateSettingsFrame)]
         self.assertEqual(len(settings_frames), 0)
@@ -819,7 +824,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         every node.
         """
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -832,7 +837,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
 
         # Under the default strategy the first node appends.
         await flow_manager.set_node_from_config(test_node)
-        first_call = self.mock_task.queue_frames.call_args_list[0]  # Get first call
+        first_call = self.mock_worker.queue_frames.call_args_list[0]  # Get first call
         first_frames = first_call[0][0]
         self.assertTrue(
             any(isinstance(f, LLMMessagesAppendFrame) for f in first_frames),
@@ -844,11 +849,11 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         )
 
         # Reset mock
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
 
         # Subsequent node should also use AppendFrame
         await flow_manager.set_node_from_config(test_node)
-        first_call = self.mock_task.queue_frames.call_args_list[0]  # Get first call
+        first_call = self.mock_worker.queue_frames.call_args_list[0]  # Get first call
         second_frames = first_call[0][0]
         self.assertTrue(
             any(isinstance(f, LLMMessagesAppendFrame) for f in second_frames),
@@ -862,7 +867,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_edge_vs_node_function_behavior(self):
         """Test different completion behavior for edge and node functions."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -918,13 +923,13 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         await flow_manager.set_node_from_config(node_config)
 
         # Get the advertised handlers (which the LLM service auto-registers)
-        handlers = get_advertised_tool_handlers(self.mock_task)
+        handlers = get_advertised_tool_handlers(self.mock_worker)
         node_func = handlers["node_function"]
         edge_func_1 = handlers["edge_function_1"]
         edge_func_2 = handlers["edge_function_2"]
 
         # Test node function
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
         node_result = None
         node_properties = None
 
@@ -938,7 +943,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
             tool_call_id="id1",
             arguments={},
             llm=None,
-            pipeline_worker=self.mock_task,
+            pipeline_worker=self.mock_worker,
             context=None,
             result_callback=node_callback,
         )
@@ -948,7 +953,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(node_properties is None or node_properties.run_llm is not False)
 
         # Test edge function 1
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
         edge_result_1 = None
         edge_properties_1 = None
 
@@ -962,7 +967,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
             tool_call_id="id2",
             arguments={},
             llm=None,
-            pipeline_worker=self.mock_task,
+            pipeline_worker=self.mock_worker,
             context=None,
             result_callback=edge_callback_1,
         )
@@ -972,7 +977,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(edge_properties_1 is not None and edge_properties_1.run_llm is False)
 
         # Test edge function 2
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
         edge_result_2 = None
         edge_properties_2 = None
 
@@ -986,7 +991,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
             tool_call_id="id3",
             arguments={},
             llm=None,
-            pipeline_worker=self.mock_task,
+            pipeline_worker=self.mock_worker,
             context=None,
             result_callback=edge_callback_2,
         )
@@ -995,18 +1000,80 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         # Edge functions should set run_llm=False
         self.assertTrue(edge_properties_2 is not None and edge_properties_2.run_llm is False)
 
+    async def test_no_response_function_behavior(self):
+        """A function returning NO_RESPONSE finishes without responding or transitioning."""
+        flow_manager = FlowManager(
+            worker=self.mock_worker,
+            llm=self.mock_llm,
+            context_aggregator=self.mock_context_aggregator,
+        )
+        await flow_manager.initialize()
+
+        async def handoff_handler(args):
+            return {"status": "transferred"}, NO_RESPONSE
+
+        node_config: NodeConfig = {
+            "name": "test",
+            "task_messages": [{"role": "developer", "content": "Test"}],
+            "functions": [
+                FlowsFunctionSchema(
+                    name="handoff_function",
+                    description="Hands off without responding",
+                    properties={},
+                    required=[],
+                    handler=handoff_handler,
+                ),
+            ],
+        }
+        await flow_manager.set_node_from_config(node_config)
+        handoff_func = get_advertised_tool_handlers(self.mock_worker)["handoff_function"]
+
+        # Nothing should be queued (no context update, no completion) after the
+        # node is set up.
+        self.mock_worker.queue_frames.reset_mock()
+        result = None
+        properties = None
+
+        async def callback(res, *, properties=None):
+            nonlocal result
+            result = res
+            self._captured_properties = properties
+
+        self._captured_properties = None
+        params = FunctionCallParams(
+            function_name="handoff_function",
+            tool_call_id="id1",
+            arguments={},
+            llm=None,
+            pipeline_worker=self.mock_worker,
+            context=None,
+            result_callback=callback,
+        )
+        await handoff_func(params)
+        properties = self._captured_properties
+
+        # The result is delivered, but with no completion and no transition.
+        self.assertEqual(result, {"status": "transferred"})
+        self.assertIsNotNone(properties)
+        self.assertFalse(properties.run_llm)
+        self.assertIsNone(properties.on_context_updated)
+        # Unlike an edge function, NO_RESPONSE schedules no transition and
+        # writes nothing to the (possibly shared) context.
+        self.assertIsNone(flow_manager._pending_transition)
+        self.mock_worker.queue_frames.assert_not_called()
+
     @patch("pipecat.flows.manager.LLMRunFrame")
     async def test_completion_timing(self, mock_llm_run_frame):
         """Test that completions occur at the right time."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
         await flow_manager.initialize()
 
         # Test initial node setup
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
         mock_llm_run_frame.reset_mock()
 
         await flow_manager.set_node_from_config(
@@ -1018,7 +1085,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
 
         # Should see context update and completion trigger
         # First call is for updating context
-        self.assertTrue(self.mock_task.queue_frames.called)
+        self.assertTrue(self.mock_worker.queue_frames.called)
 
         # Verify that LLM completion was triggered by checking LLMRunFrame instantiation
         mock_llm_run_frame.assert_called_once()
@@ -1029,19 +1096,19 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
             "functions": [],
         }
 
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
         mock_llm_run_frame.reset_mock()
 
         await flow_manager.set_node_from_config(next_node)
 
         # Should see context update and completion trigger again
-        self.assertTrue(self.mock_task.queue_frames.called)
+        self.assertTrue(self.mock_worker.queue_frames.called)
         mock_llm_run_frame.assert_called_once()
 
     async def test_get_current_context(self):
         """Test getting current conversation context."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -1064,7 +1131,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_handler_with_flow_manager(self):
         """Test function handler that receives both args and flow_manager."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -1089,7 +1156,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_node_without_functions(self):
         """Test node configuration without functions field."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -1109,7 +1176,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         # Verify LLM tools were still set (with empty or placeholder functions)
         tools_frames_call = [
             call
-            for call in self.mock_task.queue_frames.call_args_list
+            for call in self.mock_worker.queue_frames.call_args_list
             if any(isinstance(frame, LLMSetToolsFrame) for frame in call[0][0])
         ]
         self.assertTrue(len(tools_frames_call) > 0, "Should have called LLMSetToolsFrame")
@@ -1117,7 +1184,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_node_with_empty_functions(self):
         """Test node configuration with empty functions list."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -1138,7 +1205,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         # Verify LLM tools were still set (with empty or placeholder functions)
         tools_frames_call = [
             call
-            for call in self.mock_task.queue_frames.call_args_list
+            for call in self.mock_worker.queue_frames.call_args_list
             if any(isinstance(frame, LLMSetToolsFrame) for frame in call[0][0])
         ]
         self.assertTrue(len(tools_frames_call) > 0, "Should have called LLMSetToolsFrame")
@@ -1146,7 +1213,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_role_message_singular(self):
         """Test that plain string role_message (singular) works correctly."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -1159,7 +1226,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         }
 
         await flow_manager.set_node_from_config(node)
-        first_call = self.mock_task.queue_frames.call_args_list[0]
+        first_call = self.mock_worker.queue_frames.call_args_list[0]
         first_frames = first_call[0][0]
 
         # Verify LLMUpdateSettingsFrame with correct system_instruction
@@ -1179,7 +1246,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         from pipecat.flows.types import ContextStrategy, ContextStrategyConfig
 
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
             context_strategy=ContextStrategyConfig(strategy=ContextStrategy.RESET),
@@ -1194,7 +1261,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         }
 
         await flow_manager.set_node_from_config(first_node)
-        first_call = self.mock_task.queue_frames.call_args_list[0]
+        first_call = self.mock_worker.queue_frames.call_args_list[0]
         first_frames = first_call[0][0]
 
         # Verify first node sends LLMUpdateSettingsFrame
@@ -1205,14 +1272,14 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         )
 
         # Second node with RESET strategy but no role_messages
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
         second_node: NodeConfig = {
             "task_messages": [{"role": "developer", "content": "Second task."}],
             "functions": [],
         }
 
         await flow_manager.set_node_from_config(second_node)
-        second_call = self.mock_task.queue_frames.call_args_list[0]
+        second_call = self.mock_worker.queue_frames.call_args_list[0]
         second_frames = second_call[0][0]
 
         # No LLMUpdateSettingsFrame since no role_message — system instruction
@@ -1230,7 +1297,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         import warnings
 
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -1253,7 +1320,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
 
         # Verify the node still works correctly despite the warning —
         # legacy role_messages go into context messages, not LLMUpdateSettingsFrame
-        first_call = self.mock_task.queue_frames.call_args_list[0]
+        first_call = self.mock_worker.queue_frames.call_args_list[0]
         first_frames = first_call[0][0]
         settings_frames = [f for f in first_frames if isinstance(f, LLMUpdateSettingsFrame)]
         self.assertEqual(len(settings_frames), 0)
@@ -1266,7 +1333,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         )
 
         # Verify the warning is only emitted once
-        self.mock_task.queue_frames.reset_mock()
+        self.mock_worker.queue_frames.reset_mock()
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             await flow_manager.set_node_from_config(node)
@@ -1276,7 +1343,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
     async def test_role_message_and_role_messages_both_specified(self):
         """Test that role_message takes precedence when both are specified."""
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -1295,7 +1362,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
                 "Both 'role_message' and 'role_messages' specified; using 'role_message'"
             )
 
-        first_call = self.mock_task.queue_frames.call_args_list[0]
+        first_call = self.mock_worker.queue_frames.call_args_list[0]
         first_frames = first_call[0][0]
         settings_frames = [f for f in first_frames if isinstance(f, LLMUpdateSettingsFrame)]
         self.assertEqual(len(settings_frames), 1)
@@ -1306,7 +1373,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         import warnings
 
         flow_manager = FlowManager(
-            worker=self.mock_task,
+            worker=self.mock_worker,
             llm=self.mock_llm,
             context_aggregator=self.mock_context_aggregator,
         )
@@ -1328,7 +1395,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
             deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
             self.assertEqual(len(deprecation_warnings), 1)
 
-        first_call = self.mock_task.queue_frames.call_args_list[0]
+        first_call = self.mock_worker.queue_frames.call_args_list[0]
         first_frames = first_call[0][0]
 
         # Legacy role_messages should NOT produce LLMUpdateSettingsFrame

@@ -39,6 +39,8 @@ from pipecat.frames.frames import (
     LLMMessagesAppendFrame,
     LLMSetToolsFrame,
     LLMTextFrame,
+    ProposedUserStartedSpeakingFrame,
+    ProposedUserStoppedSpeakingFrame,
     StartFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -54,16 +56,11 @@ from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMe
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.openai._constants import OPENAI_REALTIME_WHISPER_MODEL, OPENAI_SAMPLE_RATE
-from pipecat.services.settings import (
-    NOT_GIVEN,
-    LLMSettings,
-    _NotGiven,
-    assert_given,
-    is_given,
-)
+from pipecat.services.settings import LLMSettings
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_openai_realtime, traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 from . import events
 
@@ -105,7 +102,7 @@ class OpenAIRealtimeLLMSettings(LLMSettings):
             ``system_instruction`` fields.
     """
 
-    session_properties: events.SessionProperties | _NotGiven = field(
+    session_properties: events.SessionProperties | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -205,6 +202,27 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
     Implements the OpenAI Realtime API with WebSocket communication for low-latency
     bidirectional audio and text interactions. Supports function calling, conversation
     management, and real-time transcription.
+
+    Proposes turn boundaries from OpenAI's server-side VAD events as
+    ``ProposedUserStartedSpeakingFrame`` / ``ProposedUserStoppedSpeakingFrame``.
+    ``ExternalUserTurnStartStrategy`` / ``ExternalUserTurnStopStrategy`` resolve
+    those proposals into ``UserStartedSpeakingFrame`` /
+    ``UserStoppedSpeakingFrame`` — and own the interruption broadcast, which
+    this service no longer does itself — so pipeline processors that depend on
+    those frames (RTVI client speech events, ``TurnTrackingObserver``,
+    ``AudioBufferProcessor`` turn recording, ``UserIdleController``, user mute
+    strategies, voicemail detector) keep working.
+
+    Unlike upstream, this fork does not advertise those strategies through
+    ``service_metadata_frame()``: pass them explicitly via
+    ``LLMUserAggregatorParams(user_turn_strategies=...)``. See the
+    ``examples/realtime/realtime-openai.py`` example.
+
+    If you wire local VAD (``LLMUserAggregatorParams.vad_analyzer``) on
+    top of this service, disable OpenAI's server-side turn detection
+    first (``turn_detection=False``); otherwise both sources drive
+    duplicate user turns. See
+    ``examples/realtime/realtime-openai-locally-driven-turns.py``.
     """
 
     Settings = OpenAIRealtimeLLMSettings
@@ -950,17 +968,25 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
     async def _handle_evt_response_done(self, evt):
         # todo: figure out whether there's anything we need to do for "cancelled" events
         # usage metrics
-        cached_tokens = (
-            evt.response.usage.input_token_details.cached_tokens
+        input_details = (
+            evt.response.usage.input_token_details
             if hasattr(evt.response.usage, "input_token_details")
-            and evt.response.usage.input_token_details
             else None
         )
+        output_details = (
+            evt.response.usage.output_token_details
+            if hasattr(evt.response.usage, "output_token_details")
+            else None
+        )
+        cached_details = input_details.cached_tokens_details if input_details else None
         tokens = LLMTokenUsage(
             prompt_tokens=evt.response.usage.input_tokens,
             completion_tokens=evt.response.usage.output_tokens,
             total_tokens=evt.response.usage.total_tokens,
-            cache_read_input_tokens=cached_tokens,
+            cache_read_input_tokens=input_details.cached_tokens if input_details else None,
+            input_audio_tokens=input_details.audio_tokens if input_details else None,
+            output_audio_tokens=output_details.audio_tokens if output_details else None,
+            cache_read_input_audio_tokens=cached_details.audio_tokens if cached_details else None,
         )
         await self.start_llm_usage_metrics(tokens)
         await self.stop_processing_metrics()
@@ -1058,13 +1084,12 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
 
     async def _handle_evt_speech_started(self, evt):
         await self._truncate_current_audio_response()
-        await self.broadcast_frame(UserStartedSpeakingFrame)
-        await self.broadcast_interruption()
+        await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
 
     async def _handle_evt_speech_stopped(self, evt):
         await self.start_ttfb_metrics()
         await self.start_processing_metrics()
-        await self.broadcast_frame(UserStoppedSpeakingFrame)
+        await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
 
     async def _maybe_handle_evt_retrieve_conversation_item_error(self, evt: events.ErrorEvent):
         """Maybe handle an error event related to retrieving a conversation item.
@@ -1280,6 +1305,6 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
         item = events.ConversationItem(
             type="function_call_output",
             call_id=tool_call_id,
-            output=json.dumps(result, ensure_ascii=False),
+            output=result,
         )
         await self.send_client_event(events.ConversationItemCreateEvent(item=item))

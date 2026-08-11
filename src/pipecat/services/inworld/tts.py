@@ -34,7 +34,6 @@ from pipecat import version as pipecat_version
 
 USER_AGENT = f"pipecat/{pipecat_version()}"
 from pydantic import BaseModel
-from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -49,11 +48,12 @@ from pipecat.frames.frames import (
     TTSTextFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TextAggregationMode, TTSService, WebsocketTTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_tts
+from pipecat.utils.types import NOT_GIVEN, NotGiven
 
 
 def language_to_inworld_language(language: Language) -> str:
@@ -100,9 +100,9 @@ class InworldTTSSettings(TTSSettings):
             Only supported by ``inworld-tts-2``.
     """
 
-    speaking_rate: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    temperature: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    delivery_mode: Literal["STABLE", "BALANCED", "CREATIVE"] | None | _NotGiven = field(
+    speaking_rate: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    temperature: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    delivery_mode: Literal["STABLE", "BALANCED", "CREATIVE"] | None | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -344,8 +344,6 @@ class InworldHttpTTSService(TTSService):
         Returns:
             An asynchronous generator of frames.
         """
-        logger.debug(f"{self}: Generating TTS [{text}] (streaming={self._streaming})")
-
         self._current_run_had_timestamps = False
 
         audio_config = {
@@ -975,7 +973,7 @@ class InworldTTSService(WebsocketTTSService):
                 ("X-User-Agent", USER_AGENT),
                 ("X-Request-Id", request_id),
             ]
-            self._websocket = await websocket_connect(self._url, additional_headers=headers)
+            self._websocket = await self._websocket_connect(self._url, additional_headers=headers)
             await self._call_event_handler("on_connected")
         except Exception as e:
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)

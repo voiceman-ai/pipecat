@@ -44,12 +44,14 @@ from pipecat.frames.frames import (
     OutputTransportMessageUrgentFrame,
     SpriteFrame,
     StartFrame,
+    STTMetadataFrame,
     TranscriptionFrame,
     UserAudioRawFrame,
     UserImageRawFrame,
     UserImageRequestFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.services.stt_latency import DEEPGRAM_TTFS_P99
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
@@ -650,7 +652,7 @@ class DailyTransportClient(EventHandler):
             await asyncio.sleep(0.01)
             return None
 
-    async def register_audio_destination(self, destination: str, auto_silence: bool | None = True):
+    async def register_audio_destination(self, destination: str, auto_silence: bool = True):
         """Register an audio destination for multi-track output.
 
         Built-in destination ("microphone") is configured at join time so it's
@@ -876,10 +878,15 @@ class DailyTransportClient(EventHandler):
             await self._callbacks.on_error(error_msg)
             self._joining = False
 
-    async def _join(self):
-        """Execute the actual room join operation."""
+    async def _join(self) -> tuple[Any, Any]:
+        """Execute the actual room join operation.
+
+        Returns:
+            The ``(data, error)`` pair from the join completion; ``data`` is
+            the join payload on success, ``error`` an error message otherwise.
+        """
         if not self._client:
-            return
+            return (None, "Daily client not initialized")
 
         future = self._get_event_loop().create_future()
 
@@ -980,7 +987,10 @@ class DailyTransportClient(EventHandler):
         """Cleanup the Daily client instance."""
         if self._client:
             self._client.release()
-            self._client = None
+            # The client is not usable after release(); the None breaks the
+            # declared CallClient type on purpose so a double cleanup is a
+            # no-op.
+            self._client = None  # pyright: ignore[reportAttributeAccessIssue]
 
     def participants(self) -> Mapping[str, Any]:
         """Get current participants in the room.
@@ -1257,7 +1267,7 @@ class DailyTransportClient(EventHandler):
         self,
         track_name: str,
         params: DailyCustomAudioTrackParams | None = None,
-        auto_silence: bool | None = True,
+        auto_silence: bool = True,
     ) -> DailyAudioTrack:
         """Add a custom audio track for multi-stream output.
 
@@ -1319,7 +1329,7 @@ class DailyTransportClient(EventHandler):
         """
         future = self._get_event_loop().create_future()
 
-        video_track = self._create_video_track(params)
+        video_track = await self._create_video_track(params)
 
         self._client.add_custom_video_track(
             track_name=track_name,
@@ -1425,7 +1435,7 @@ class DailyTransportClient(EventHandler):
     async def _create_audio_track(
         self,
         params: DailyCustomAudioTrackParams | None = None,
-        auto_silence: bool | None = True,
+        auto_silence: bool = True,
     ) -> DailyAudioTrack:
         """Create an audio track for the given parameters."""
         sample_rate = params.sample_rate if params and params.sample_rate else self._out_sample_rate
@@ -1453,9 +1463,7 @@ class DailyTransportClient(EventHandler):
 
         return DailyVideoTrack(source=video_source, track=video_track)
 
-    async def _register_custom_audio_destination(
-        self, destination: str, auto_silence: bool | None = True
-    ):
+    async def _register_custom_audio_destination(self, destination: str, auto_silence: bool = True):
         """Register a custom audio destination for multi-track output."""
         params = (self._params.custom_audio_track_params or {}).get(destination)
         self._custom_audio_tracks[destination] = await self.add_custom_audio_track(
@@ -1466,7 +1474,7 @@ class DailyTransportClient(EventHandler):
             publishing["customAudio"][destination] = {"sendSettings": params.send_settings}
         self._client.update_publishing(publishing)
 
-    async def _register_screen_audio_destination(self, auto_silence: bool | None = True):
+    async def _register_screen_audio_destination(self, auto_silence: bool = True):
         """Register screen audio destination track."""
         params = (self._params.custom_audio_track_params or {}).get("screenAudio")
 
@@ -1983,6 +1991,12 @@ class DailyInputTransport(BaseInputTransport):
             frame: The transcription frame to push.
         """
         await self.push_frame(frame)
+
+    async def push_stt_metadata_frame(self):
+        """Broadcast STT metadata for Daily's built-in transcription (Deepgram)."""
+        await self.broadcast_frame(
+            STTMetadataFrame, service_name=self.name, ttfs_p99_latency=DEEPGRAM_TTFS_P99
+        )
 
     async def push_app_message(self, message: Any, sender: str):
         """Push an application message as an urgent transport frame.
@@ -2848,6 +2862,7 @@ class DailyTransport(BaseTransport):
 
     async def _on_joined(self, data):
         """Handle room joined events."""
+        transcription_started = False
         if self._params.transcription_enabled:
             # We report an error because we are starting transcription
             # internally and if it fails we need to know.
@@ -2855,11 +2870,15 @@ class DailyTransport(BaseTransport):
             error = await self.start_transcription(settings)
             if error:
                 await self._on_error(f"Unable to start transcription: {error}")
+            else:
+                transcription_started = True
         await self._call_event_handler("on_joined", data)
         # Also call on_connected for compatibility with other transports
         await self._call_event_handler("on_connected", data)
         if self._input:
             await self._input.push_frame(BotConnectedFrame())
+            if transcription_started:
+                await self._input.push_stt_metadata_frame()
 
     async def _on_left(self):
         """Handle room left events."""

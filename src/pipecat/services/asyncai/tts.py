@@ -17,7 +17,6 @@ import aiohttp
 import websockets
 from loguru import logger
 from pydantic import BaseModel
-from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -131,7 +130,7 @@ class AsyncAITTSService(WebsocketTTSService):
 
             version: Async API version.
             url: WebSocket URL for Async TTS API.
-            model: TTS model to use (e.g., "async_flash_v1.0").
+            model: TTS model to use (e.g., "async_flash_v1.5").
 
                 .. deprecated:: 0.0.105
                     Use ``settings=AsyncAITTSService.Settings(model=...)`` instead.
@@ -159,7 +158,7 @@ class AsyncAITTSService(WebsocketTTSService):
         """
         # 1. Initialize default_settings with hardcoded defaults
         default_settings = self.Settings(
-            model="async_flash_v1.0",
+            model="async_flash_v1.5",
             voice=None,
             language=None,
         )
@@ -281,7 +280,7 @@ class AsyncAITTSService(WebsocketTTSService):
             if self._websocket and self._websocket.state is State.OPEN:
                 return
             logger.debug("Connecting to Async")
-            self._websocket = await websocket_connect(
+            self._websocket = await self._websocket_connect(
                 f"{self._url}?api_key={self._api_key}&version={self._api_version}"
             )
             init_msg = {
@@ -445,8 +444,6 @@ class AsyncAITTSService(WebsocketTTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
@@ -520,7 +517,7 @@ class AsyncAIHttpTTSService(TTSService):
                     Will be removed in 2.0.0.
 
             aiohttp_session: An aiohttp session for making HTTP requests.
-            model: TTS model to use (e.g., "async_flash_v1.0").
+            model: TTS model to use (e.g., "async_flash_v1.5").
 
                 .. deprecated:: 0.0.105
                     Use ``settings=AsyncAIHttpTTSService.Settings(model=...)`` instead.
@@ -543,7 +540,7 @@ class AsyncAIHttpTTSService(TTSService):
         """
         # 1. Initialize default_settings with hardcoded defaults
         default_settings = self.Settings(
-            model="async_flash_v1.0",
+            model="async_flash_v1.5",
             voice=None,
             language=None,
         )
@@ -624,8 +621,6 @@ class AsyncAIHttpTTSService(TTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         try:
             voice_config = {"mode": "id", "id": self._settings.voice}
 

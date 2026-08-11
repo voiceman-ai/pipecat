@@ -905,6 +905,17 @@
       "location": "pipecat/services/cartesia/stt.py"
     },
     {
+      "subject": "CartesiaHttpTTSService.cartesia_version",
+      "module": "pipecat.services.cartesia.tts",
+      "kind": "parameter",
+      "deprecated_in": "1.8.0",
+      "removed_in": "2.0.0",
+      "relation": "none",
+      "replacement": null,
+      "message": "No replacement. The API version is pinned to the one this service implements. Will be removed in 2.0.0.",
+      "location": "pipecat/services/cartesia/tts.py"
+    },
+    {
       "subject": "CartesiaHttpTTSService.model",
       "module": "pipecat.services.cartesia.tts",
       "kind": "parameter",
@@ -946,6 +957,17 @@
       "relation": "use_existing",
       "replacement": "text_aggregation_mode",
       "message": "Use ``text_aggregation_mode`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/services/cartesia/tts.py"
+    },
+    {
+      "subject": "CartesiaTTSService.cartesia_version",
+      "module": "pipecat.services.cartesia.tts",
+      "kind": "parameter",
+      "deprecated_in": "1.8.0",
+      "removed_in": "2.0.0",
+      "relation": "none",
+      "replacement": null,
+      "message": "No replacement. The API version is pinned to the one this service implements. Will be removed in 2.0.0.",
       "location": "pipecat/services/cartesia/tts.py"
     },
     {
@@ -1213,6 +1235,17 @@
       "location": "pipecat/services/elevenlabs/tts.py"
     },
     {
+      "subject": "ElevenLabsHttpTTSService.pronunciation_dictionary_locators",
+      "module": "pipecat.services.elevenlabs.tts",
+      "kind": "parameter",
+      "deprecated_in": "1.6.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "text_transforms",
+      "message": "Use the ``text_transforms`` parameter with :func:`pipecat.utils.text.transforms.replace_text` instead. Pronunciation dictionary substitutions can rewrite the spoken words in ways that no longer match the text sent to synthesis, which breaks the alignment-based word-completion tracking used to attribute spoken text back to the conversation context. ``replace_text`` transforms happen client-side, so they're tracked correctly. Will be removed in 2.0.0.",
+      "location": "pipecat/services/elevenlabs/tts.py"
+    },
+    {
       "subject": "ElevenLabsHttpTTSService.voice_id",
       "module": "pipecat.services.elevenlabs.tts",
       "kind": "parameter",
@@ -1268,6 +1301,17 @@
       "location": "pipecat/services/elevenlabs/tts.py"
     },
     {
+      "subject": "ElevenLabsTTSService.pronunciation_dictionary_locators",
+      "module": "pipecat.services.elevenlabs.tts",
+      "kind": "parameter",
+      "deprecated_in": "1.6.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "text_transforms",
+      "message": "Use the ``text_transforms`` parameter with :func:`pipecat.utils.text.transforms.replace_text` instead. Pronunciation dictionary substitutions can rewrite the spoken words in ways that no longer match the text sent to synthesis, which breaks the alignment-based word-completion tracking used to attribute spoken text back to the conversation context. ``replace_text`` transforms happen client-side, so they're tracked correctly. Will be removed in 2.0.0.",
+      "location": "pipecat/services/elevenlabs/tts.py"
+    },
+    {
       "subject": "ElevenLabsTTSService.voice_id",
       "module": "pipecat.services.elevenlabs.tts",
       "kind": "parameter",
@@ -1276,6 +1320,17 @@
       "relation": "use_existing",
       "replacement": "settings=ElevenLabsTTSService.Settings(voice=...)",
       "message": "Use ``settings=ElevenLabsTTSService.Settings(voice=...)`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/services/elevenlabs/tts.py"
+    },
+    {
+      "subject": "PronunciationDictionaryLocator",
+      "module": "pipecat.services.elevenlabs.tts",
+      "kind": "class",
+      "deprecated_in": "1.6.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "text_transforms",
+      "message": "`PronunciationDictionaryLocator` is deprecated since 1.6.0 and will be removed in 2.0.0. Use `text_transforms` -> `replace_text` instead.",
       "location": "pipecat/services/elevenlabs/tts.py"
     },
     {
@@ -3138,6 +3193,28 @@
       "location": "pipecat/services/sarvam/tts.py"
     },
     {
+      "subject": "LLMSettings.filter_incomplete_user_turns",
+      "module": "pipecat.services.settings",
+      "kind": "parameter",
+      "deprecated_in": "1.7.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "user_turn_strategies=FilterIncompleteUserTurnStrategies()",
+      "message": "Use ``user_turn_strategies=FilterIncompleteUserTurnStrategies()`` on :class:`~pipecat.processors.aggregators.llm_response_universal.LLMUserAggregatorParams` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/services/settings.py"
+    },
+    {
+      "subject": "LLMSettings.user_turn_completion_config",
+      "module": "pipecat.services.settings",
+      "kind": "parameter",
+      "deprecated_in": "1.7.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "FilterIncompleteUserTurnStrategies(config=...)",
+      "message": "Pass the config to ``FilterIncompleteUserTurnStrategies(config=...)`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/services/settings.py"
+    },
+    {
       "subject": "SimliVideoService.InputParams",
       "module": "pipecat.services.simli.video",
       "kind": "class",
@@ -3523,6 +3600,17 @@
       "location": "pipecat/services/xai/realtime/llm.py"
     },
     {
+      "subject": "XTTSService",
+      "module": "pipecat.services.xtts.tts",
+      "kind": "class",
+      "deprecated_in": "1.7.0",
+      "removed_in": "2.0.0",
+      "relation": "none",
+      "replacement": null,
+      "message": "`XTTSService` is deprecated since 1.7.0 and will be removed in 2.0.0. No replacement. `KokoroTTSService` and `PiperTTSService` are the maintained local TTS services.",
+      "location": "pipecat/services/xtts/tts.py"
+    },
+    {
       "subject": "XTTSService.language",
       "module": "pipecat.services.xtts.tts",
       "kind": "parameter",
@@ -3542,6 +3630,17 @@
       "relation": "use_existing",
       "replacement": "settings=XTTSService.Settings(voice=...)",
       "message": "Use ``settings=XTTSService.Settings(voice=...)`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/services/xtts/tts.py"
+    },
+    {
+      "subject": "pipecat.services.xtts.tts",
+      "module": "pipecat.services.xtts.tts",
+      "kind": "module",
+      "deprecated_in": "1.7.0",
+      "removed_in": "2.0.0",
+      "relation": "none",
+      "replacement": null,
+      "message": "No replacement. :class:`~pipecat.services.kokoro.tts.KokoroTTSService` and :class:`~pipecat.services.piper.tts.PiperTTSService` are the maintained local TTS services. Will be removed in 2.0.0.",
       "location": "pipecat/services/xtts/tts.py"
     },
     {
@@ -3631,6 +3730,50 @@
       "replacement": "(connection,)",
       "message": "The single-argument ``(connection,)`` signature is deprecated. Use ``(connection, call: WhatsAppConnectCall)`` instead. Will be removed in 2.0.0.",
       "location": "pipecat/transports/whatsapp/client.py"
+    },
+    {
+      "subject": "BaseUserTurnStartStrategy.enable_user_speaking_frames",
+      "module": "pipecat.turns.user_start.base_user_turn_start_strategy",
+      "kind": "parameter",
+      "deprecated_in": "1.8.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "trigger_user_turn_started",
+      "message": "Use :meth:`trigger_user_turn_started`'s ``enable_user_speaking_frames`` argument instead. Will be removed in 2.0.0.",
+      "location": "pipecat/turns/user_start/base_user_turn_start_strategy.py"
+    },
+    {
+      "subject": "BaseUserTurnStartStrategy.reset",
+      "module": "pipecat.turns.user_start.base_user_turn_start_strategy",
+      "kind": "method",
+      "deprecated_in": "1.6.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "handle_user_turn_started",
+      "message": "Use :meth:`handle_user_turn_started` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/turns/user_start/base_user_turn_start_strategy.py"
+    },
+    {
+      "subject": "BaseUserTurnStopStrategy.enable_user_speaking_frames",
+      "module": "pipecat.turns.user_stop.base_user_turn_stop_strategy",
+      "kind": "parameter",
+      "deprecated_in": "1.8.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "trigger_user_turn_stopped",
+      "message": "Use :meth:`trigger_user_turn_stopped`'s ``enable_user_speaking_frames`` argument instead. Will be removed in 2.0.0.",
+      "location": "pipecat/turns/user_stop/base_user_turn_stop_strategy.py"
+    },
+    {
+      "subject": "BaseUserTurnStopStrategy.reset",
+      "module": "pipecat.turns.user_stop.base_user_turn_stop_strategy",
+      "kind": "method",
+      "deprecated_in": "1.6.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "handle_user_turn_started",
+      "message": "Use :meth:`handle_user_turn_started` and :meth:`handle_user_turn_stopped` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/turns/user_stop/base_user_turn_stop_strategy.py"
     },
     {
       "subject": "TaskManager.setup",

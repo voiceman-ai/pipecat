@@ -90,7 +90,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     llm = DeepSeekLLMService(
         api_key=os.environ["DEEPSEEK_API_KEY"],
         settings=DeepSeekLLMService.Settings(
-            model="deepseek-chat",
             system_instruction="""You are a helpful assistant in a voice conversation. Your responses will be spoken aloud, so avoid emojis, bullet points, or other formatting that can't be spoken. Respond to what the user said in a creative, helpful, and brief way.
 
 You have one functions available:
@@ -136,6 +135,10 @@ Start by asking me for my location. Then, use 'get_current_weather' to give me a
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
 
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+
+    await runner.add_workers(worker)
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
@@ -148,11 +151,8 @@ Start by asking me for my location. Then, use 'get_current_weather' to give me a
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
-        await worker.cancel()
+        await runner.cancel()
 
-    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
-
-    await runner.add_workers(worker)
     await runner.run()
 
 

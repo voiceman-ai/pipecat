@@ -19,7 +19,6 @@ from typing import Any, cast
 
 from loguru import logger
 from websockets import Subprotocol
-from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -37,12 +36,13 @@ from pipecat.services.aws.utils import (
     get_presigned_url,
     resolve_credentials,
 )
-from pipecat.services.settings import STTSettings, assert_given
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import AWS_TRANSCRIBE_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import assert_given
 
 
 @dataclass
@@ -223,8 +223,6 @@ class AWSTranscribeSTTService(WebsocketSTTService):
 
                 # Send the formatted event message
                 await self._websocket.send(event_message)
-                # Start metrics after first chunk sent
-                await self.start_processing_metrics()
             except Exception as e:
                 yield ErrorFrame(error=f"Error sending audio: {e}")
 
@@ -322,7 +320,7 @@ class AWSTranscribeSTTService(WebsocketSTTService):
             logger.debug(f"{self} Connecting to WebSocket with URL: {presigned_url[:100]}...")
 
             # Connect with the required headers and settings
-            self._websocket = await websocket_connect(
+            self._websocket = await self._websocket_connect(
                 presigned_url,
                 additional_headers=additional_headers,
                 subprotocols=[Subprotocol("mqtt")],
@@ -551,6 +549,10 @@ class AWSTranscribeSTTService(WebsocketSTTService):
                                     "Language | None", assert_given(self._settings.language)
                                 )
                                 if is_final:
+                                    # Report usage before the transcription
+                                    # frame so tracing can attach it to the
+                                    # STT span the frame closes.
+                                    await self.emit_stt_usage_metrics()
                                     await self.push_frame(
                                         TranscriptionFrame(
                                             transcript,
@@ -565,7 +567,6 @@ class AWSTranscribeSTTService(WebsocketSTTService):
                                         is_final,
                                         language,
                                     )
-                                    await self.stop_processing_metrics()
                                 else:
                                     await self.push_frame(
                                         InterimTranscriptionFrame(

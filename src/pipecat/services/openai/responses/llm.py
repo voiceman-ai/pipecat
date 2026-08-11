@@ -10,26 +10,33 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from loguru import logger
-from openai import NOT_GIVEN, AsyncOpenAI, AsyncStream, DefaultAsyncHttpxClient
+from openai import NOT_GIVEN as OPENAI_NOT_GIVEN
+from openai import AsyncOpenAI, AsyncStream, DefaultAsyncHttpxClient
 from openai._types import NotGiven as OpenAINotGiven
 from openai.types.responses import (
     ResponseCompletedEvent,
+    ResponseErrorEvent,
+    ResponseFailedEvent,
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseFunctionToolCall,
+    ResponseIncompleteEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
+    ResponseReasoningItem,
+    ResponseReasoningSummaryTextDeltaEvent,
     ResponseStreamEvent,
     ResponseTextDeltaEvent,
 )
-from websockets.asyncio.client import connect as websocket_connect
+from pydantic import BaseModel
 from websockets.exceptions import ConnectionClosed
 
 from pipecat.adapters.services.open_ai_responses_adapter import (
@@ -41,6 +48,10 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMMessagesAppendFrame,
+    LLMThoughtEndFrame,
+    LLMThoughtStartFrame,
+    LLMThoughtTextFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -51,9 +62,9 @@ from pipecat.services.llm_service import (
     WebsocketLLMService,
     WebsocketReconnectedError,
 )
-from pipecat.services.settings import NOT_GIVEN as _NOT_GIVEN
-from pipecat.services.settings import LLMSettings, _NotGiven, assert_given
+from pipecat.services.settings import LLMSettings
 from pipecat.utils.tracing.service_decorators import traced_llm
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 # ---------------------------------------------------------------------------
 # Private retry exception classes
@@ -83,24 +94,99 @@ class _ConnectionLimitReachedError(_RetryableError):
 # ---------------------------------------------------------------------------
 
 
+class OpenAIResponsesReasoningConfig(BaseModel):
+    """Reasoning configuration for reasoning-capable OpenAI Responses models.
+
+    Only reasoning-capable models use this — the gpt-5.x series and the o-series.
+    The service's default model, ``gpt-4.1``, does not reason, so this config has
+    no effect there; select a reasoning-capable model to use it. See OpenAI's
+    reasoning guide (https://platform.openai.com/docs/guides/reasoning) and model
+    list (https://platform.openai.com/docs/models) to choose one and to check
+    which effort levels it accepts.
+
+    Reasoning models use internal reasoning tokens before producing a response.
+    This controls how much reasoning they do and whether a human-readable summary
+    of it is returned.
+
+    Parameters:
+        effort: How much reasoning effort the model applies. ``None`` (the
+            default) leaves the field unset, so the model's own default applies;
+            ``"none"`` disables reasoning for latency-sensitive use. At lower
+            efforts (e.g. ``"low"``) the model reasons only when a turn calls for
+            it, so simple prompts may produce no summary at all.
+        summary: Verbosity of the reasoning summary to return. ``None`` (the
+            default) requests no summary. Any summary is surfaced via thought
+            frames (the ``on_assistant_thought`` event); the encrypted reasoning
+            itself is preserved across turns regardless of this setting.
+    """
+
+    # ``| str`` for forward compatibility: if OpenAI adds new levels, users can
+    # pass the new string without waiting for a Pipecat release.
+    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | str | None = None
+    summary: Literal["auto", "concise", "detailed"] | str | None = None
+
+
 @dataclass
 class OpenAIResponsesLLMSettings(LLMSettings):
     """Settings for OpenAI Responses API LLM services.
 
     Parameters:
         max_completion_tokens: Maximum completion tokens to generate.
+        reasoning: Reasoning configuration for reasoning-capable models. ``None``
+            (the default) leaves reasoning unconfigured — the service then disables
+            reasoning by default for whatever models possible, to keep latency low
+            for real-time voice. Note that the default model, ``gpt-4.1``, does
+            not reason.
     """
 
-    # Override inherited LLMSettings fields to also accept openai's NotGiven
-    # sentinel. The service stores openai's NOT_GIVEN in these fields so they
-    # can be passed through unchanged to the AsyncOpenAI client.
-    temperature: float | None | _NotGiven | OpenAINotGiven = field(
-        default_factory=lambda: _NOT_GIVEN
+    # Override inherited LLMSettings fields to also accept the OpenAI SDK's
+    # sentinel, which the service stores here so these fields can be passed
+    # through unchanged to the AsyncOpenAI client.
+    temperature: float | None | NotGiven | OpenAINotGiven = field(default_factory=lambda: NOT_GIVEN)
+    top_p: float | None | NotGiven | OpenAINotGiven = field(default_factory=lambda: NOT_GIVEN)
+    max_completion_tokens: int | NotGiven | OpenAINotGiven = field(
+        default_factory=lambda: NOT_GIVEN
     )
-    top_p: float | None | _NotGiven | OpenAINotGiven = field(default_factory=lambda: _NOT_GIVEN)
-    max_completion_tokens: int | _NotGiven | OpenAINotGiven = field(
-        default_factory=lambda: _NOT_GIVEN
+    reasoning: OpenAIResponsesReasoningConfig | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
     )
+
+
+# ---------------------------------------------------------------------------
+# Model classification
+# ---------------------------------------------------------------------------
+
+
+def _is_o_series(model: str) -> bool:
+    """Whether the model is an o-series reasoning model (o1, o3, o4-mini, ...)."""
+    return bool(re.match(r"o\d", model.lower()))
+
+
+def _model_supports_reasoning(model: str) -> bool | None:
+    """Classify whether an OpenAI model supports reasoning.
+
+    Assumes that future (beyond gpt-5.x) mainline gpt series models will also
+    support reasoning. This can be revisited if OpenAI changes their model lineup
+    or reasoning support in the future.
+
+    Args:
+        model: The model name (e.g. ``"gpt-5.4"``, ``"o3"``, ``"gpt-4.1"``).
+
+    Returns:
+        ``True`` for reasoning-capable models — the o-series and the mainline gpt
+        series from gpt-5 onward. ``False`` for models known *not* to reason:
+        gpt-4.x and earlier, and the ``gpt-5-chat`` non-reasoning variant.
+        ``None`` when the model is unrecognized and we can't tell either way.
+    """
+    model = model.lower()
+    if _is_o_series(model):
+        return True
+    # Mainline gpt series: reasons from gpt-5 onward. ``gpt-5-chat`` is the
+    # non-reasoning variant of the series.
+    match = re.match(r"gpt-(\d+)", model)
+    if match:
+        return int(match.group(1)) >= 5 and "chat" not in model
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +204,8 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
 
     Settings = OpenAIResponsesLLMSettings
     _settings: Settings
+
+    ReasoningConfig = OpenAIResponsesReasoningConfig
 
     adapter_class = OpenAIResponsesLLMAdapter
 
@@ -151,11 +239,12 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
             frequency_penalty=None,
             presence_penalty=None,
             seed=None,
-            temperature=NOT_GIVEN,
-            top_p=NOT_GIVEN,
+            temperature=OPENAI_NOT_GIVEN,
+            top_p=OPENAI_NOT_GIVEN,
             top_k=None,
             max_tokens=None,
-            max_completion_tokens=NOT_GIVEN,
+            max_completion_tokens=OPENAI_NOT_GIVEN,
+            reasoning=None,
             filter_incomplete_user_turns=False,
             user_turn_completion_config=None,
             extra={},
@@ -174,6 +263,9 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
         # variant connects via raw websockets and needs the key explicitly.
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self._service_tier = service_tier
+        # Tracks the model we've already warned about (reasoning configured on a
+        # non-reasoning model) so we log it once per model rather than per turn.
+        self._reasoning_unsupported_warned_for: str | None = None
         self._client = self._create_client(
             api_key=api_key,
             base_url=base_url,
@@ -261,8 +353,22 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
 
         # Tools
         tools = invocation_params.get("tools")
-        if tools is not None and not isinstance(tools, type(NOT_GIVEN)):
+        if tools is not None and not isinstance(tools, type(OPENAI_NOT_GIVEN)):
             params["tools"] = tools
+
+        # Reasoning
+        reasoning = assert_given(self._settings.reasoning)
+        reasoning_params = reasoning.model_dump(exclude_none=True) if reasoning else {}
+        if reasoning_params:
+            params["reasoning"] = reasoning_params
+            # Ask for the encrypted reasoning so it can be sent back on later
+            # turns, preserving reasoning context across the conversation.
+            params["include"] = ["reasoning.encrypted_content"]
+            self._warn_if_reasoning_unsupported()
+        else:
+            # No reasoning configured: disable it by default on the gpt-5.x series
+            # for real-time latency (see the helper).
+            self._maybe_disable_reasoning(params)
 
         # Extra settings
         params.update(self._settings.extra)
@@ -371,6 +477,81 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
             )
         return fc_list
 
+    # -- reasoning ------------------------------------------------------------
+
+    def _maybe_disable_reasoning(self, params: dict):
+        """Disable reasoning by default on the mainline gpt series for real-time voice.
+
+        When the caller hasn't configured ``reasoning``, request ``effort="none"``
+        for whatever models possible. Note that this is a no-op for models like
+        ``gpt-5.4`` that already default to ``none``. Some models are left at the
+        provider default: the reasoning-first o-series doesn't accept
+        ``effort="none"`` (and choosing one is a deliberate decision to reason),
+        and gpt-4.x and earlier don't reason at all. Mirrors Gemini's
+        ``_maybe_unset_thinking_budget``, which disables or minimizes thinking on
+        its latency-sensitive models.
+
+        Args:
+            params: The response params dict (modified in place).
+        """
+        model = assert_given(self._settings.model)
+        # Lower reasoning only for models that reason *and* accept effort="none".
+        # The o-series reasons but rejects "none" (and choosing it is a deliberate
+        # decision to reason), so exclude it.
+        if model and _model_supports_reasoning(model) and not _is_o_series(model):
+            params["reasoning"] = {"effort": "none"}
+
+    def _warn_if_reasoning_unsupported(self):
+        """Log a clear error when reasoning is configured on a model that can't use it.
+
+        The raw API error in this case ("Encrypted content is not supported with
+        this model") is cryptic, so surface an actionable one instead. Only fires
+        for models *known* not to reason; unrecognized models are left alone.
+        Logs once per model rather than on every turn.
+        """
+        model = assert_given(self._settings.model)
+        if not model or _model_supports_reasoning(model) is not False:
+            # No model, reasoning-capable, or unrecognized — say nothing.
+            return
+        if model == self._reasoning_unsupported_warned_for:
+            return
+        self._reasoning_unsupported_warned_for = model
+        logger.error(
+            f"{self}: `reasoning` is configured but model '{model}' does not support "
+            "reasoning, so requests will fail. Reasoning is supported only by "
+            "reasoning-capable models — the gpt-5.x series and the o-series; see "
+            "OpenAI's reasoning guide (https://platform.openai.com/docs/guides/reasoning). "
+            "Remove the `reasoning` setting or select a reasoning-capable model."
+        )
+
+    async def _append_reasoning_message(
+        self, item_id: str | None, summary: list[dict], encrypted_content: str | None
+    ):
+        """Persist a reasoning item so it round-trips on the next request.
+
+        The encrypted reasoning is sent back on later requests to preserve
+        reasoning context. Store it as an LLM-specific message the adapter
+        re-emits as a Responses reasoning input item — positioned, by append
+        order, before the assistant message or function call it produced.
+
+        Args:
+            item_id: The reasoning item id.
+            summary: The reasoning summary parts (``summary_text`` dicts).
+            encrypted_content: The encrypted reasoning payload.
+        """
+        if not encrypted_content:
+            # Nothing to round-trip (e.g. reasoning disabled / effort="none").
+            return
+        message = {
+            "type": "reasoning",
+            "id": item_id,
+            "summary": summary,
+            "encrypted_content": encrypted_content,
+        }
+        await self.push_frame(
+            LLMMessagesAppendFrame([self.get_llm_adapter().create_llm_specific_message(message)])
+        )
+
 
 # ---------------------------------------------------------------------------
 # WebSocket variant (default / recommended)
@@ -401,7 +582,6 @@ class OpenAIResponsesLLMService(
         llm = OpenAIResponsesLLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
             settings=OpenAIResponsesLLMService.Settings(
-                model="gpt-4.1",
                 system_instruction="You are a helpful assistant.",
             ),
         )
@@ -444,7 +624,7 @@ class OpenAIResponsesLLMService(
         try:
             if self._websocket:
                 return
-            self._websocket = await websocket_connect(
+            self._websocket = await self._websocket_connect(
                 uri=self._ws_url,
                 additional_headers={
                     "Authorization": f"Bearer {self._api_key}",
@@ -610,6 +790,13 @@ class OpenAIResponsesLLMService(
                 if input_item.get("type") != "function_call" or input_item.get(
                     "call_id"
                 ) != output_item.get("call_id"):
+                    return False
+            elif output_type == "reasoning":
+                # Reasoning items round-trip via an LLMSpecificMessage; match by
+                # the server-assigned id so the optimization can skip them too.
+                if input_item.get("type") != "reasoning" or input_item.get("id") != output_item.get(
+                    "id"
+                ):
                     return False
             else:
                 # Unknown output type — can't confirm match
@@ -861,6 +1048,7 @@ class OpenAIResponsesLLMService(
         """
         function_calls: dict[str, dict[str, str]] = {}
         current_arguments: dict[str, str] = {}
+        reasoning_summary_open = False
 
         while True:
             event = await self._ws_recv()
@@ -874,6 +1062,13 @@ class OpenAIResponsesLLMService(
             if event_type == "response.output_text.delta":
                 await self.stop_ttfb_metrics()
                 await self._push_llm_text(event.get("delta", ""))
+
+            elif event_type == "response.reasoning_summary_text.delta":
+                await self.stop_ttfb_metrics()
+                if not reasoning_summary_open:
+                    await self.push_frame(LLMThoughtStartFrame())
+                    reasoning_summary_open = True
+                await self.push_frame(LLMThoughtTextFrame(text=event.get("delta", "")))
 
             elif event_type == "response.output_item.added":
                 await self.stop_ttfb_metrics()
@@ -905,6 +1100,18 @@ class OpenAIResponsesLLMService(
                         function_calls[item_id]["name"] = item.get("name", "")
                         function_calls[item_id]["call_id"] = item.get("call_id", "")
                         function_calls[item_id]["arguments"] = item.get("arguments", "")
+                elif item.get("type") == "reasoning":
+                    if reasoning_summary_open:
+                        await self.push_frame(LLMThoughtEndFrame())
+                        reasoning_summary_open = False
+                    await self._append_reasoning_message(
+                        item.get("id"),
+                        [
+                            {"type": "summary_text", "text": s.get("text", "")}
+                            for s in (item.get("summary") or [])
+                        ],
+                        item.get("encrypted_content"),
+                    )
 
             elif event_type == "response.completed":
                 response = event.get("response", {})
@@ -985,7 +1192,6 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
         llm = OpenAIResponsesHttpLLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
             settings=OpenAIResponsesHttpLLMService.Settings(
-                model="gpt-4.1",
                 system_instruction="You are a helpful assistant.",
             ),
         )
@@ -1037,6 +1243,8 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
         # Track function calls across stream events
         function_calls: dict[str, dict[str, str]] = {}  # item_id -> {name, call_id, arguments}
         current_arguments: dict[str, str] = {}  # item_id -> accumulated arguments
+        reasoning_summary_open = False
+        stream_errored = False
 
         # Ensure stream and its async iterator are closed on cancellation/exception
         # to prevent socket leaks and uvloop crashes. Closing the iterator first
@@ -1064,6 +1272,13 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
                 if isinstance(event, ResponseTextDeltaEvent):
                     await self.stop_ttfb_metrics()
                     await self._push_llm_text(event.delta)
+
+                elif isinstance(event, ResponseReasoningSummaryTextDeltaEvent):
+                    await self.stop_ttfb_metrics()
+                    if not reasoning_summary_open:
+                        await self.push_frame(LLMThoughtStartFrame())
+                        reasoning_summary_open = True
+                    await self.push_frame(LLMThoughtTextFrame(text=event.delta))
 
                 elif isinstance(event, ResponseOutputItemAddedEvent):
                     await self.stop_ttfb_metrics()
@@ -1095,6 +1310,18 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
                             function_calls[item_id]["name"] = item.name
                             function_calls[item_id]["call_id"] = item.call_id
                             function_calls[item_id]["arguments"] = item.arguments
+                    elif isinstance(item, ResponseReasoningItem):
+                        if reasoning_summary_open:
+                            await self.push_frame(LLMThoughtEndFrame())
+                            reasoning_summary_open = False
+                        await self._append_reasoning_message(
+                            item.id,
+                            [
+                                {"type": "summary_text", "text": s.text}
+                                for s in (item.summary or [])
+                            ],
+                            item.encrypted_content,
+                        )
 
                 elif isinstance(event, ResponseCompletedEvent):
                     response = event.response
@@ -1126,6 +1353,43 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
                     # model name in tracing spans
                     self._full_model_name = response.model
 
+                elif isinstance(event, ResponseFailedEvent):
+                    # As with usage above, the detail objects and their fields
+                    # are only as reliable as the server; coalesce to a generic
+                    # message so a sparse payload still reports something.
+                    error = event.response.error
+                    message = error.message if error else None
+                    await self.push_error(
+                        error_msg=f"LLM response error: {message or 'Response failed'}"
+                    )
+                    stream_errored = True
+                    break
+
+                elif isinstance(event, ResponseIncompleteEvent):
+                    details = event.response.incomplete_details
+                    reason = details.reason if details else None
+                    await self.push_error(
+                        error_msg=f"LLM response error: {reason or 'Response incomplete'}"
+                    )
+                    stream_errored = True
+                    break
+
+                elif isinstance(event, ResponseErrorEvent):
+                    await self.push_error(error_msg=f"Responses API error: {event.message}")
+                    stream_errored = True
+                    break
+
+        # A stream that ended in a terminal error may have announced a function
+        # call whose arguments never finished streaming — drop those rather than
+        # run them with fabricated empty arguments. `arguments` is only written
+        # by the Done events, so a non-empty string means the call completed
+        # (e.g. parallel tool calls finished before a later item was truncated)
+        # and it still runs.
+        if stream_errored:
+            function_calls = {
+                item_id: call for item_id, call in function_calls.items() if call["arguments"]
+            }
+
         # Process any function calls
         if function_calls:
             fc_list = self._process_function_calls(context, function_calls)
@@ -1136,4 +1400,5 @@ __all__ = [
     "OpenAIResponsesLLMService",
     "OpenAIResponsesHttpLLMService",
     "OpenAIResponsesLLMSettings",
+    "OpenAIResponsesReasoningConfig",
 ]

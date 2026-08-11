@@ -175,8 +175,6 @@ class NvidiaSageMakerHTTPTTSService(TTSService):
         Yields:
             :class:`TTSAudioRawFrame` chunks of signed 16-bit mono PCM.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         text = text.strip()
         if not text or not any(c.isalnum() for c in text):
             return
@@ -377,7 +375,7 @@ class NvidiaSageMakerTTSService(InterruptibleTTSService):
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         self._reset_audio_buffer()
-        if self._bot_speaking and self._client:
+        if (self._bot_speaking or self._tts_started) and self._client:
             logger.debug(
                 f"{self}: interruption detected, sending input_text.done and waiting for speech.completed"
             )
@@ -485,8 +483,6 @@ class NvidiaSageMakerTTSService(InterruptibleTTSService):
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
         """Send text to NIM; audio arrives asynchronously via _receive_messages."""
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         text = text.strip()
         if not text or not any(c.isalnum() for c in text):
             return

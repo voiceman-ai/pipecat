@@ -12,6 +12,7 @@ supporting multiple languages, voices, and SSML features.
 
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from xml.sax.saxutils import escape
 
 from loguru import logger
 from pydantic import BaseModel
@@ -23,11 +24,12 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
 )
 from pipecat.services.aws.utils import resolve_credentials
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_tts
+from pipecat.utils.types import NOT_GIVEN, NotGiven
 
 try:
     import aiobotocore.session
@@ -136,11 +138,11 @@ class AWSPollyTTSSettings(TTSSettings):
         lexicon_names: List of pronunciation lexicons to apply.
     """
 
-    engine: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    pitch: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    rate: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    volume: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    lexicon_names: list[str] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    engine: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pitch: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    rate: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    volume: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    lexicon_names: list[str] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class AWSPollyTTSService(TTSService):
@@ -312,7 +314,9 @@ class AWSPollyTTSService(TTSService):
         if prosody_attrs:
             ssml += f"<prosody {' '.join(prosody_attrs)}>"
 
-        ssml += text
+        # Escape XML-reserved characters so arbitrary text can't break the
+        # SSML document (Polly rejects it with InvalidSsmlException).
+        ssml += escape(text)
 
         if prosody_attrs:
             ssml += "</prosody>"
@@ -336,8 +340,6 @@ class AWSPollyTTSService(TTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         try:
             # Construct the parameters dictionary
             ssml = self._construct_ssml(text)

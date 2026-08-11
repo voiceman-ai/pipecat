@@ -74,12 +74,24 @@ class ProcessingMetricsData(MetricsData):
 class LLMTokenUsage(BaseModel):
     """Token usage statistics for LLM operations.
 
+    Services differ in whether their input count is reported net or gross of the
+    prompt cache. ``total_tokens`` is the gross figure either way, so it stays
+    comparable across services, and it is therefore not always ``prompt_tokens +
+    completion_tokens``. Read the cache fields for the breakdown rather than
+    subtracting.
+
     Parameters:
-        prompt_tokens: Number of tokens in the input prompt.
+        prompt_tokens: Number of tokens in the input prompt. Net of the cache on
+            services that report cache reads separately.
         completion_tokens: Number of tokens in the generated completion.
-        total_tokens: Total number of tokens used (prompt + completion).
+        total_tokens: Total number of tokens used, including any cached input
+            tokens.
         cache_read_input_tokens: Number of tokens read from cache, if applicable.
         cache_creation_input_tokens: Number of tokens used to create cache entries, if applicable.
+        reasoning_tokens: Number of completion tokens used for reasoning, if applicable.
+        input_audio_tokens: Number of prompt tokens that were audio, if applicable.
+        output_audio_tokens: Number of completion tokens that were audio, if applicable.
+        cache_read_input_audio_tokens: Number of cache-read tokens that were audio, if applicable.
     """
 
     prompt_tokens: int
@@ -88,6 +100,9 @@ class LLMTokenUsage(BaseModel):
     cache_read_input_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
     reasoning_tokens: int | None = None
+    input_audio_tokens: int | None = None
+    output_audio_tokens: int | None = None
+    cache_read_input_audio_tokens: int | None = None
 
 
 class LLMUsageMetricsData(MetricsData):
@@ -98,6 +113,36 @@ class LLMUsageMetricsData(MetricsData):
     """
 
     value: LLMTokenUsage
+
+
+class STTUsage(BaseModel):
+    """Usage statistics for STT operations.
+
+    Reports raw usage, not cost. Values are incremental deltas since the
+    previous usage report; consumers sum them across a session.
+
+    Continuous STT services stream all input audio (including silence), so
+    their summed ``audio_seconds`` approximates the stream duration — which
+    is what most streaming providers bill. Segmented STT services submit
+    only the detected speech segments, so their sum covers just those
+    segments.
+
+    Parameters:
+        audio_seconds: Client-measured seconds of audio submitted to the
+            service since the last usage report.
+    """
+
+    audio_seconds: float
+
+
+class STTUsageMetricsData(MetricsData):
+    """Speech-to-Text usage metrics data.
+
+    Parameters:
+        value: Usage statistics for the STT operation.
+    """
+
+    value: STTUsage
 
 
 class TTSUsageMetricsData(MetricsData):

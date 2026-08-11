@@ -43,6 +43,7 @@ suite:
       - interruption_audio
       - interruption_text
       - language_switch
+      - language_switch_audio
   - bot: voice/voice-cartesia-http.py
     scenarios: [capital_question]
   - bot: voice/voice-cartesia-turns.py
@@ -103,6 +104,8 @@ suite:
     scenarios: [capital_question]
   - bot: voice/voice-nvidia.py
     scenarios: [capital_question]
+  - bot: voice/voice-nvidia-segmented.py
+    scenarios: [capital_question]
   - bot: voice/voice-openai.py
     scenarios: [capital_question]
   - bot: voice/voice-openai-http.py
@@ -127,6 +130,10 @@ suite:
     scenarios: [capital_question]
   - bot: voice/voice-soniox.py
     scenarios: [capital_question]
+  - bot: voice/voice-soniox-turn-detection.py
+    scenarios: [capital_question]
+  - bot: voice/voice-speechify-http.py
+    scenarios: [capital_question]
   - bot: voice/voice-speechmatics.py
     scenarios: [capital_question]
   - bot: voice/voice-speechmatics-vad.py
@@ -135,6 +142,29 @@ suite:
     scenarios: [capital_question]
   - bot: voice/voice-xai-http.py
     scenarios: [capital_question]
+
+  #
+  # Realtime (speech-to-speech): one bot per provider, each exercising a
+  # function call end to end inside the provider's own realtime session. These
+  # are audio scenarios, audio being the modality these services consume.
+  # Ultravox runs its async-tool example because that's the one with the
+  # weather function the scenario expects.
+  #
+  - bot: realtime/realtime-aws-nova-sonic.py
+    scenarios: [weather_function_call_audio]
+  # Needs a deployed Azure realtime model for $AZURE_REALTIME_BASE_URL to resolve.
+  # - bot: realtime/realtime-azure.py
+  #   scenarios: [weather_function_call_audio]
+  - bot: realtime/realtime-gemini-live.py
+    scenarios: [weather_function_call_audio]
+  - bot: realtime/realtime-grok.py
+    scenarios: [weather_function_call_audio]
+  - bot: realtime/realtime-inworld.py
+    scenarios: [weather_function_call_audio]
+  - bot: realtime/realtime-openai.py
+    scenarios: [weather_function_call_audio]
+  - bot: realtime/realtime-ultravox-async-tool.py
+    scenarios: [weather_function_call_audio]
 
   #
   # Function calling: exercise one or more function calls.
@@ -153,7 +183,11 @@ suite:
       - weather_and_restaurant
   - bot: function-calling/function-calling-azure.py
     scenarios: [weather_function_call]
+  - bot: function-calling/function-calling-baseten.py
+    scenarios: [weather_function_call]
   - bot: function-calling/function-calling-cerebras.py
+    scenarios: [weather_function_call]
+  - bot: function-calling/function-calling-crusoe.py
     scenarios: [weather_function_call]
   - bot: function-calling/function-calling-deepseek.py
     scenarios: [weather_function_call]
@@ -201,6 +235,21 @@ suite:
     scenarios: [weather_function_call]
   - bot: function-calling/function-calling-sarvam.py
     scenarios: [weather_function_call]
+
+  #
+  # Async function calling: the tool keeps running after the LLM's turn ends
+  # (cancel_on_interruption=False). Its result lands ~20s later, by which point
+  # the conversation has moved on — so the bot has to deliver the weather as an
+  # aside on a later turn.
+  #
+  - bot: function-calling/function-calling-anthropic-async.py
+    scenarios: [weather_function_call_async_audio, weather_function_call_async_deferred_audio]
+  - bot: function-calling/function-calling-google-async.py
+    scenarios: [weather_function_call_async_audio, weather_function_call_async_deferred_audio]
+  - bot: function-calling/function-calling-openai-async.py
+    scenarios: [weather_function_call_async_audio, weather_function_call_async_deferred_audio]
+  - bot: function-calling/function-calling-openai-responses-async.py
+    scenarios: [weather_function_call_async_audio, weather_function_call_async_deferred_audio]
 
   #
   # Function calling with video: the bot calls a vision function that requests a
@@ -261,6 +310,14 @@ suite:
     scenarios: [filter_incomplete_turns]
 
   #
+  # Turn management: the user goes silent instead of trailing off. The bot's
+  # idle handler asks the LLM for a check-in, and that response has to be spoken
+  # even though no user speech preceded it.
+  #
+  - bot: turn-management/turn-management-filter-incomplete-turns-user-idle.py
+    scenarios: [filter_incomplete_turns_user_idle]
+
+  #
   # DTMF: the caller drives a keypad phone menu (IVR) with DTMF tones instead of
   # speech. The bot's DTMFAggregator turns each keypress into a transcription the
   # LLM responds to, so the harness can assert on the resulting transcription and
@@ -274,3 +331,29 @@ suite:
   #
   - bot: video-avatar/video-avatar-tavus-video-service.py
     scenarios: [capital_question]
+
+  #
+  # Flows: structured-conversation examples (examples/flows/). Text-only
+  # scenarios asserting on node transitions, function calls, and context
+  # strategies. The bots pick their LLM from $LLM_PROVIDER (default
+  # openai_responses; hello_world always uses Google).
+  #
+  - bot: flows/hello_world.py
+    scenarios: [hello_world]
+  - bot: flows/food_ordering.py
+    scenarios: [food_ordering_pizza]
+  - bot: flows/food_ordering_advanced_functionschema.py
+    scenarios: [food_ordering_sushi]
+  - bot: flows/multi_worker_handoff.py
+    scenarios: [multi_worker_handoff, multi_worker_handoff_back_and_forth]
+  - bot: flows/patient_intake.py
+    scenarios: [patient_intake]
+  - bot: flows/restaurant_reservation.py
+    scenarios: [restaurant_reservation_available, restaurant_reservation_no_availability]
+  - bot: flows/insurance_quote.py
+    scenarios: [insurance_quote]
+  # Constructs and switches between OpenAI, Google, and Anthropic, so all
+  # three API keys must be set.
+  - bot: flows/llm_switching.py
+    scenarios: [llm_switching]
+

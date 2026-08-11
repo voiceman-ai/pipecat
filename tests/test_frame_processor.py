@@ -5,9 +5,12 @@
 #
 
 import asyncio
+import io
 import unittest
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+
+from loguru import logger
 
 from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
@@ -31,7 +34,7 @@ from pipecat.processors.frame_processor import (
     FrameProcessorSetup,
 )
 from pipecat.tests.utils import SleepFrame, run_test
-from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
+from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.utils.frame_queue import FrameQueue
 
 
@@ -480,6 +483,91 @@ class TestFrameProcessor(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(code_after_ran, "Code after broadcast_interruption() should execute")
 
+    async def test_pause_frames_until_holds_then_delivers_in_order(self):
+        """Frames arriving before the condition is met are delivered once it is."""
+        ready = asyncio.Event()
+        received = []
+
+        class HoldingProcessor(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, StartFrame):
+                    await self.pause_processing_all_frames_until(ready.wait)
+                elif isinstance(frame, TextFrame):
+                    received.append(frame.text)
+                await self.push_frame(frame, direction)
+
+        async def release_later():
+            await asyncio.sleep(0.2)
+            self.assertEqual(received, [], "frames should be held while not ready")
+            ready.set()
+
+        release = asyncio.create_task(release_later())
+        await run_test(
+            HoldingProcessor(),
+            frames_to_send=[TextFrame(text="a"), TextFrame(text="b"), SleepFrame(sleep=0.4)],
+            expected_down_frames=[TextFrame, TextFrame],
+        )
+        await release
+
+        self.assertEqual(received, ["a", "b"])
+
+    async def test_pause_frames_until_resumes_when_never_ready(self):
+        """A condition that is never met must not leave the processor paused.
+
+        The pause holds both frame queues, so a processor left paused could
+        not process the frames that shut it down.
+        """
+        never = asyncio.Event()
+        received = []
+
+        class HoldingProcessor(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, StartFrame):
+                    await self.pause_processing_all_frames_until(never.wait, timeout=0.2)
+                elif isinstance(frame, TextFrame):
+                    received.append(frame.text)
+                await self.push_frame(frame, direction)
+
+        await asyncio.wait_for(
+            run_test(
+                HoldingProcessor(),
+                frames_to_send=[TextFrame(text="a"), SleepFrame(sleep=0.5)],
+                expected_down_frames=[TextFrame],
+            ),
+            timeout=10,
+        )
+
+        self.assertEqual(received, ["a"])
+
+    async def test_pause_frames_until_holds_both_queues(self):
+        """Data frames already routed to the process queue must be held too.
+
+        The two queues pause independently, so frames that have already moved
+        to the process queue keep draining unless it is held as well.
+        """
+        processor = FrameProcessor()
+        processor.create_task = lambda coro, name=None: asyncio.create_task(coro)
+
+        await processor.pause_processing_all_frames_until(asyncio.Event().wait, timeout=5.0)
+
+        self.assertTrue(processor._FrameProcessor__should_block_system_frames)
+        self.assertTrue(processor._FrameProcessor__should_block_frames)
+
+    async def test_pause_frames_until_is_a_no_op_in_direct_mode(self):
+        """Direct mode bypasses the queues the pause acts on, so the call warns."""
+        ready = asyncio.Event()
+        processor = FrameProcessor(enable_direct_mode=True)
+
+        sink = io.StringIO()
+        handler_id = logger.add(sink, format="{message}")
+        try:
+            await processor.pause_processing_all_frames_until(ready.wait)
+            self.assertIn("direct mode", sink.getvalue())
+        finally:
+            logger.remove(handler_id)
+
 
 class TestHeartbeatSurvivesInterruptions(unittest.IsolatedAsyncioTestCase):
     """A barge-in must not destroy the pipeline's health probe.
@@ -595,8 +683,9 @@ class TestHeartbeatIgnoresProcessingPause(unittest.IsolatedAsyncioTestCase):
 
     async def _make_processor(self):
         processor = IdentityFilter()
+        # Upstream 1.5.0 deprecated TaskManager.setup()/TaskManagerParams; the
+        # constructor now binds the running loop itself.
         task_manager = TaskManager()
-        task_manager.setup(TaskManagerParams(loop=asyncio.get_event_loop()))
         await processor.setup(
             FrameProcessorSetup(
                 clock=SystemClock(),
