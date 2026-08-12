@@ -765,8 +765,26 @@ DECISION RULES:
         if custom_system_prompt is not None:
             self._validate_prompt(custom_system_prompt)
 
-        # Set the system prompt as LLM system_instruction instead of a context message
+        # Set the system prompt as LLM system_instruction instead of a context message.
+        #
+        # It must ALSO be recorded as the base the composer rebuilds from. Every
+        # LLMContextFrame syncs the tool handlers, and that sync ends in
+        # _compose_system_instruction(), which discards the live value and rebuilds
+        # from _base_system_instruction:
+        #
+        #     composed = "\n\n".join(p for p in parts if p)
+        #     self._settings.system_instruction = composed or None
+        #
+        # A classifier whose base was never set therefore has its prompt replaced by
+        # None on its very first context frame. It then answers the transcript
+        # conversationally, classify_verdict() finds no VOICEMAIL/CONVERSATION marker,
+        # no decision is ever made, and the LLMGate holding the main LLM never opens --
+        # every caller turn stalls until the api's ResponseGuard retries it 5s later.
+        # (Setting _settings.system_instruction alone is not enough: the base is
+        # snapshotted only in __init__ or on an LLMUpdateSettingsFrame, and this
+        # detector uses neither.)
         self._classifier_llm._settings.system_instruction = self._prompt
+        self._classifier_llm._base_system_instruction = self._prompt
 
         # Create the LLM context and aggregators for conversation management
         self._messages = []
