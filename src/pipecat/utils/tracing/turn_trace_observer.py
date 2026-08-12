@@ -309,25 +309,3 @@ class TurnTraceObserver(BaseObserver):
         except Exception as e:
             logger.warning(f"Failed to get trace ID: {e}")
             return None
-
-    def get_trace_url(self) -> str | None:
-        """Get the Langfuse URL for the current conversation trace.
-
-        This URL can be used to view the trace in the Langfuse UI.
-        The trace is public and can be shared without authentication.
-
-        Returns:
-            The Langfuse URL for the trace, or None if unavailable.
-        """
-        trace_id = self.get_trace_id()
-        if trace_id is None:
-            return None
-
-        try:
-            from langfuse import get_client
-
-            langfuse = get_client()
-            return langfuse.get_trace_url(trace_id=trace_id)
-        except Exception as e:
-            logger.warning(f"Failed to get trace URL: {e}")
-            return None

@@ -14,6 +14,8 @@ WhatsApp call events.
 import asyncio
 import hashlib
 import hmac
+import inspect
+import warnings
 from collections.abc import Awaitable, Callable
 
 import aiohttp
@@ -184,7 +186,7 @@ class WhatsAppClient:
     async def handle_webhook_request(
         self,
         request: WhatsAppWebhookRequest,
-        connection_callback: Callable[[SmallWebRTCConnection], Awaitable[None]] | None = None,
+        connection_callback: Callable[..., Awaitable[None]] | None = None,
         raw_body: bytes | None = None,
         sha256_signature: str | None = None,
     ) -> bool:
@@ -236,7 +238,23 @@ class WhatsAppClient:
                                     # Invoke callback if provided
                                     if connection_callback and connection:
                                         try:
-                                            await connection_callback(connection)
+                                            if (
+                                                len(
+                                                    inspect.signature(
+                                                        connection_callback
+                                                    ).parameters
+                                                )
+                                                >= 2
+                                            ):
+                                                await connection_callback(connection, call)
+                                            else:
+                                                warnings.warn(
+                                                    "connection_callback with a single (connection) argument is deprecated. "
+                                                    "Update it to accept (connection, call: WhatsAppConnectCall).",
+                                                    DeprecationWarning,
+                                                    stacklevel=2,
+                                                )
+                                                await connection_callback(connection)
                                             logger.debug(
                                                 f"Connection callback executed successfully for call {call.id}"
                                             )

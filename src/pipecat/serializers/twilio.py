@@ -10,7 +10,6 @@ import base64
 import json
 from typing import TYPE_CHECKING, cast
 
-import aiohttp
 from loguru import logger
 
 from pipecat.audio.dtmf.types import KeypadEntry

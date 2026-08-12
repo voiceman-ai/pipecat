@@ -158,8 +158,6 @@ class SimpleTextAggregator(BaseTextAggregator):
                 yield Aggregation(text=text, type=AggregationType.TOKEN)
             return
 
-        logger.debug(f"aggregator: received token {text!r} (buffer={len(self._text)} chars)")
-
         # 1a. Collapse runs of dots (".." / "..." ellipsis) to a single period so
         #     the TTS gets a clean sentence end instead of an odd trailing-off pause.
         text = re.sub(r"\.{2,}", ".", text)

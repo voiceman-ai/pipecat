@@ -1107,28 +1107,6 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         """
         return True
 
-    @property
-    def reasoning_suppressed_chars_total(self) -> int:
-        """Total characters of model reasoning this service has suppressed.
-
-        Returns:
-            Cumulative suppressed character count since the service was created.
-        """
-        return self._reasoning_suppressed_chars_total
-
-    @property
-    def reasoning_bounded_releases_total(self) -> int:
-        """How many times a held reasoning block was released on the size bound.
-
-        A non-zero and growing value means ``REASONING_HOLD_MAX_CHARS`` is being
-        hit — either the model is emitting lone openers (expected on Gemma-4) or
-        the bound is too tight for genuine chain-of-thought on this model.
-
-        Returns:
-            Cumulative bounded-release count since the service was created.
-        """
-        return self._reasoning_bounded_releases_total
-
     def set_full_model_name(self, full_model_name: str):
         """Set the full AI model name.
 

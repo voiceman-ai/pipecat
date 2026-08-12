@@ -1432,9 +1432,7 @@ class ElevenLabsHttpTTSService(TTSService):
             "model_id": model_id,
         }
 
-        # Include previous text as context when the model supports it. Some
-        # models (e.g. eleven_v3) reject previous_text/next_text
-        # ("unsupported_model"), so never send it for those.
+        # Include previous text as context when the model supports it
         if self._previous_text and model_id not in ELEVENLABS_CONTEXT_UNSUPPORTED_MODELS:
             payload["previous_text"] = self._previous_text
 

@@ -49,23 +49,6 @@ class ExternalUserTurnStartStrategy(BaseUserTurnStartStrategy):
             enable_interruptions: If True, broadcast an interruption when a
                 proposal opens a turn. Ignored on the adopt path, where the
                 emitter has already broadcast one.
-
-                The default is True because on the proposal path nothing else
-                broadcasts the interruption — the proposing emitter has
-                deliberately handed that job to this strategy. Several
-                turn-detecting services take that path (Deepgram Flux, Soniox
-                and Gladia among them): they emit
-                :class:`~pipecat.frames.frames.ProposedUserStartedSpeakingFrame`
-                and never interrupt themselves, so ``False`` there silently
-                kills barge-in. Deepgram Flux is the one the VoiceMan api wires
-                this strategy for by hand.
-
-                It has no effect for the realtime services this fork drives
-                (OpenAI Realtime, Grok/xAI Realtime): both broadcast the real
-                :class:`~pipecat.frames.frames.UserStartedSpeakingFrame` plus
-                their own interruption, which puts them on the adopt path where
-                this flag is ignored.
-
             **kwargs: Additional keyword arguments.
         """
         super().__init__(enable_interruptions=enable_interruptions, **kwargs)
