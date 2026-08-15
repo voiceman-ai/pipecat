@@ -201,8 +201,10 @@ def _prepare_language_hints(
         return None
 
     prepared_languages = [language_to_soniox_language(lang) for lang in language_hints]
-    # Remove duplicates (in case of language_hints with multiple regions).
-    return list(set(prepared_languages))
+    # Remove duplicates (in case of language_hints with multiple regions), keeping
+    # the caller's order: the hint list is a priority order on the wire, and a set
+    # would re-order it per process under hash randomisation.
+    return list(dict.fromkeys(prepared_languages))
 
 
 def _language_from_tokens(tokens: list[dict]) -> Language | None:
