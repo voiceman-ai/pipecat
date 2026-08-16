@@ -55,6 +55,7 @@ os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 try:
     import google.genai as genai
     from google.api_core.exceptions import DeadlineExceeded
+    from google.genai.errors import APIError
     from google.genai.types import (
         FinishReason,
         GenerateContentConfig,
@@ -307,6 +308,10 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         # Store pending function calls that need to be executed after TTS
         self._pending_function_calls = []
 
+        # Models that answered the low-latency thinking default with a 400; the
+        # default is not applied to them again for the life of this service.
+        self._thinking_default_rejected_models: set[str] = set()
+
         # Initialize the API client. Subclasses can override this if needed.
         self.create_client()
 
@@ -380,6 +385,11 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         if max_tokens is not None:
             generation_params["max_output_tokens"] = max_tokens
 
+        # Same low-latency thinking default as the streaming path. Without it a
+        # thinking model runs at its own default and most of the completion —
+        # billed at the output rate — is thought rather than answer.
+        thinking_defaulted = self._maybe_unset_thinking_budget(generation_params)
+
         generation_config = GenerateContentConfig(**generation_params)
 
         # Use the new google-genai client's async method
@@ -388,11 +398,31 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         model = assert_given(self._settings.model)
         assert model is not None
 
-        response = await self._client.aio.models.generate_content(
-            model=model,
-            contents=cast(Any, messages),
-            config=generation_config,
-        )
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=model,
+                contents=cast(Any, messages),
+                config=generation_config,
+            )
+        except APIError as e:
+            # A model that does not accept the default thinking config answers
+            # 400 before generating anything. Retry once without the default and
+            # stop applying it to this model, so the failure costs one request
+            # per model per service rather than every out-of-band inference.
+            if not (thinking_defaulted and self._is_thinking_config_rejection(e)):
+                raise
+            logger.warning(
+                f"{self}: {model} rejected the default thinking config "
+                f"({e.message}); retrying without it and not applying it to this model again"
+            )
+            self._thinking_default_rejected_models.add(model)
+            generation_params.pop("thinking_config", None)
+            generation_config = GenerateContentConfig(**generation_params)
+            response = await self._client.aio.models.generate_content(
+                model=model,
+                contents=cast(Any, messages),
+                config=generation_config,
+            )
 
         usage = None
         if response.usage_metadata:
@@ -458,24 +488,46 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
         return generation_params
 
-    def _maybe_unset_thinking_budget(self, generation_params: dict[str, Any]):
+    def _maybe_unset_thinking_budget(self, generation_params: dict[str, Any]) -> bool:
+        """Apply the low-latency thinking default for the configured model.
+
+        Mutates ``generation_params`` in place. An explicit ``thinking_config``
+        always wins, and a model that previously rejected the default is left
+        alone.
+
+        Returns:
+            True if a default ``thinking_config`` was added.
+        """
         try:
             model = assert_given(self._settings.model)
             # If we have an image model, we don't apply a thinking default.
             if model is None or "image" in model:
-                return
+                return False
             # If thinking_config is already set, don't override it.
             if "thinking_config" in generation_params:
-                return
+                return False
+            if model in self._thinking_default_rejected_models:
+                return False
             # Apply model-aware low-latency thinking defaults.
             # Gemini 2.5 Flash: disable thinking via thinking_budget.
             # Gemini 3+ Flash: use minimal thinking via thinking_level.
             if model.startswith("gemini-2.5-flash"):
                 generation_params["thinking_config"] = {"thinking_budget": 0}
-            elif model.startswith("gemini-3") and "flash" in model:
+                return True
+            if model.startswith("gemini-3") and "flash" in model:
                 generation_params["thinking_config"] = {"thinking_level": "minimal"}
+                return True
         except Exception as e:
             logger.error(f"Failed to unset thinking budget: {e}")
+        return False
+
+    @staticmethod
+    def _is_thinking_config_rejection(error: APIError) -> bool:
+        """Whether an API error is the model refusing the request's thinking config."""
+        if getattr(error, "code", None) != 400:
+            return False
+        message = str(getattr(error, "message", "") or error)
+        return "thinking" in message.lower()
 
     async def _stream_content(self, context: LLMContext) -> AsyncIterator[GenerateContentResponse]:
         adapter = self.get_llm_adapter()
