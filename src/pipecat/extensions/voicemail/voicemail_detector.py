@@ -47,9 +47,42 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.services.llm_service import LLMService
-from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
+from pipecat.turns.user_start import ExternalUserTurnStartStrategy
+from pipecat.turns.user_stop import ExternalUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.sync.base_notifier import BaseNotifier
 from pipecat.utils.sync.event_notifier import EventNotifier
+
+
+class ClassifierUserTurnStopStrategy(ExternalUserTurnStopStrategy):
+    """Turn stop strategy for the classifier branch's aggregator.
+
+    The classifier branch sits upstream of the conversation aggregator and
+    adopts that aggregator's ``UserStartedSpeakingFrame`` /
+    ``UserStoppedSpeakingFrame`` broadcasts as its own turn boundaries. When
+    the conversation aggregator opens a turn *from a transcript* (a
+    transcript-driven start strategy, no VAD onset), that transcript passes
+    through this branch before the start it triggers arrives here. Transcript
+    state therefore survives the turn-start callback — text seen since the
+    previous turn ended belongs to the turn now starting — and is cleared
+    only when the turn ends. Signal state resets on start as in the base
+    class.
+
+    Scoped to the classifier rather than changed in
+    :class:`~pipecat.turns.user_stop.ExternalUserTurnStopStrategy`: an
+    aggregator that also opens turns from VAD, ahead of the external start
+    signal, would finalize a new turn on stale text during that window. The
+    classifier's aggregator opens turns only on start signals, which set the
+    speaking state in the same frame, so no such window exists here.
+    """
+
+    async def handle_user_turn_started(self):
+        """Ready the strategy for the turn now starting, keeping transcript state."""
+        text = self._text
+        seen_interim_results = self._seen_interim_results
+        await super().handle_user_turn_started()
+        self._text = text
+        self._seen_interim_results = seen_interim_results
 
 
 class NotifierGate(FrameProcessor):
@@ -792,9 +825,18 @@ DECISION RULES:
 
         # Set OTel span name for tracing
         self._context.set_otel_span_name("llm-voicemail-detector")
+        # Turn boundaries are adopted from the conversation aggregator downstream
+        # (the ``ExternalUserTurnStrategies`` shape), with the classifier's stop
+        # variant so a transcript that lands before the adopted start still
+        # finalizes the turn — see ClassifierUserTurnStopStrategy.
         self._context_aggregator = LLMContextAggregatorPair(
             self._context,
-            user_params=LLMUserAggregatorParams(user_turn_strategies=ExternalUserTurnStrategies()),
+            user_params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[ExternalUserTurnStartStrategy()],
+                    stop=[ClassifierUserTurnStopStrategy()],
+                )
+            ),
         )
 
         # Create notification system for coordinating between components
