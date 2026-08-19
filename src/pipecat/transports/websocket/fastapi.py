@@ -44,7 +44,7 @@ from pipecat.utils.security.allowed_origins import default_allowed_origins, is_o
 
 try:
     from fastapi import WebSocket
-    from starlette.websockets import WebSocketState
+    from starlette.websockets import WebSocketDisconnect, WebSocketState
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error(
@@ -225,7 +225,28 @@ class FastAPIWebsocketClient:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"{self} exception while closing the websocket: {e}")
+            # The peer closing first is the ORDINARY end of a call, not a
+            # fault: we were closing anyway, so nothing is lost and nothing is
+            # actionable. At ERROR it was 2,345 Sentry events across two issues
+            # (107 and 178, the latter being the same race with an empty
+            # message) drowning real transport failures.
+            #
+            # Scoped by exception TYPE as well as text — 178's variant carries
+            # no message at all, so a text-only match would miss it.
+            benign = isinstance(e, WebSocketDisconnect) or (
+                isinstance(e, RuntimeError)
+                and (
+                    not str(e)
+                    or "close message has been sent" in str(e)
+                    or "websocket.close" in str(e)
+                )
+            )
+            if benign:
+                logger.debug(
+                    f"{self} websocket already closed by the peer while closing: {e}"
+                )
+            else:
+                logger.error(f"{self} exception while closing the websocket: {e}")
 
     async def trigger_client_disconnected(self):
         """Trigger the client disconnected callback."""

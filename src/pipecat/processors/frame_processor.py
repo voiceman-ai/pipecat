@@ -1372,7 +1372,16 @@ class FrameProcessor(BaseObject):
 
             self.__process_current_frame = None
 
-            (frame, direction, callback) = await self.__process_queue.get()
+            # Bind the queue for THIS iteration. `__interrupt_process_task`
+            # replaces `__process_queue` outright when an interruption's cancel
+            # exceeds PROCESS_TASK_ORPHAN_TIMEOUT_SECS, so reading the attribute
+            # again for `task_done()` below can land on a DIFFERENT queue than
+            # the one this frame came from — which raises
+            # "task_done() called too many times" and kills the processor's
+            # frame task mid-call.
+            queue = self.__process_queue
+
+            (frame, direction, callback) = await queue.get()
 
             self.__process_current_frame = frame
 
@@ -1406,4 +1415,6 @@ class FrameProcessor(BaseObject):
 
             await self.__process_frame(frame, direction, callback)
 
-            self.__process_queue.task_done()
+            # ...and mark it done on that same object, never on whatever
+            # `__process_queue` points at now.
+            queue.task_done()
