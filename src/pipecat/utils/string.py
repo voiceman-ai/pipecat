@@ -33,6 +33,10 @@ from loguru import logger
 
 _load_lock = threading.Lock()
 
+# Guarded by ``_load_lock``. Caps the punkt_tab download at one attempt per
+# process; see ``_sent_tokenizer``.
+_download_attempted = False
+
 
 @cache
 def _sent_tokenizer() -> Callable[[str], list[str]]:
@@ -49,10 +53,12 @@ def _sent_tokenizer() -> Callable[[str], list[str]]:
     off the path once the tokenizer is loaded.
 
     Raises:
-        RuntimeError: if ``punkt_tab`` is unavailable and cannot be downloaded.
+        RuntimeError: if ``punkt_tab`` is missing and cannot be downloaded.
             Raising rather than returning leaves the ``@cache`` unpopulated, so
             a later caller retries instead of inheriting a tokenizer that raises
-            ``LookupError`` on every use for the life of the process.
+            ``LookupError`` on every use for the life of the process. The
+            download itself is capped at one attempt per process, so that retry
+            costs nothing on the wire.
     """
     with _load_lock:
         import nltk
@@ -71,9 +77,18 @@ def _sent_tokenizer() -> Callable[[str], list[str]]:
             except LookupError:
                 return False
 
+        global _download_attempted
+
         if not loadable():
+            # At most one download per process. Raising below leaves the
+            # ``@cache`` unpopulated so a later caller re-enters — which is what
+            # lets a repaired mount recover — but without this flag that
+            # re-entry would also re-download, putting a network round trip on
+            # every turn of an already-degraded pipeline.
             try:
-                nltk.download("punkt_tab", quiet=True)
+                if not _download_attempted:
+                    _download_attempted = True
+                    nltk.download("punkt_tab", quiet=True)
             except (OSError, PermissionError) as e:
                 logger.error(
                     f"Failed to download NLTK 'punkt_tab' tokenizer data: {e}. "
@@ -88,8 +103,13 @@ def _sent_tokenizer() -> Callable[[str], list[str]]:
             # raising, and returns True for some no-op paths, so its result
             # cannot be trusted — re-ask instead.
             if not loadable():
+                # Wording note: downstream call-control commonly pattern-matches
+                # error text to decide retry-vs-fatal, and words like
+                # "unavailable" / "timeout" are typical transient markers. This
+                # condition is neither transient nor retryable, so the message
+                # deliberately avoids them.
                 raise RuntimeError(
-                    "NLTK 'punkt_tab' tokenizer data is unavailable and could not be "
+                    "NLTK 'punkt_tab' tokenizer data is missing and could not be "
                     "downloaded, so sentence boundaries cannot be detected. Bundle it at "
                     "build time (`python -m nltk.downloader punkt_tab`) or point NLTK_DATA "
                     "at a directory that already contains tokenizers/punkt_tab. "
