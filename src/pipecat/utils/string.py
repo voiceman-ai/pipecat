@@ -47,14 +47,31 @@ def _sent_tokenizer() -> Callable[[str], list[str]]:
     waits on the lock rather than loading alongside it, so the one-time
     ``punkt_tab`` download cannot run twice at once. The cache keeps the lock
     off the path once the tokenizer is loaded.
+
+    Raises:
+        RuntimeError: if ``punkt_tab`` is unavailable and cannot be downloaded.
+            Raising rather than returning leaves the ``@cache`` unpopulated, so
+            a later caller retries instead of inheriting a tokenizer that raises
+            ``LookupError`` on every use for the life of the process.
     """
     with _load_lock:
         import nltk
         from nltk.tokenize import sent_tokenize
 
-        try:
-            nltk.data.find("tokenizers/punkt_tab")
-        except LookupError:
+        def loadable() -> bool:
+            # Ask the question the caller will ask. Probing for the
+            # ``tokenizers/punkt_tab`` directory is NOT equivalent: the tokenizer
+            # loads ``tokenizers/punkt_tab/<language>/``, so an interrupted unzip
+            # leaves a parent directory that satisfies the probe while every
+            # tokenize still raises — and, because the probe passed, the download
+            # below never runs to repair it.
+            try:
+                sent_tokenize("A one. A two.")
+                return True
+            except LookupError:
+                return False
+
+        if not loadable():
             try:
                 nltk.download("punkt_tab", quiet=True)
             except (OSError, PermissionError) as e:
@@ -65,6 +82,18 @@ def _sent_tokenizer() -> Callable[[str], list[str]]:
                     "To resolve: pre-install the data in a location with appropriate read "
                     "permissions, or set the NLTK_DATA environment variable to point to a "
                     "writable directory. See https://www.nltk.org/data.html for more information."
+                )
+
+            # nltk.download() reports failure by RETURNING False rather than
+            # raising, and returns True for some no-op paths, so its result
+            # cannot be trusted — re-ask instead.
+            if not loadable():
+                raise RuntimeError(
+                    "NLTK 'punkt_tab' tokenizer data is unavailable and could not be "
+                    "downloaded, so sentence boundaries cannot be detected. Bundle it at "
+                    "build time (`python -m nltk.downloader punkt_tab`) or point NLTK_DATA "
+                    "at a directory that already contains tokenizers/punkt_tab. "
+                    "See https://www.nltk.org/data.html for more information."
                 )
 
         return sent_tokenize
