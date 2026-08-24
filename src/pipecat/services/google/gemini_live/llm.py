@@ -15,6 +15,7 @@ import asyncio
 import base64
 import io
 import json
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -111,9 +112,26 @@ except ModuleNotFoundError as e:
     raise ImportError(f"Missing module: {e}") from e
 
 
-# Connection management constants
-MAX_CONSECUTIVE_FAILURES = 3
+# Connection management constants.
+#
+# The retry budget used to be spent in milliseconds: _reconnect() disconnected
+# and immediately reconnected with no delay between attempts, so a transient
+# Google-side abort (a 1011 or an aborted stream that clears in under a second)
+# burned all three attempts back-to-back and killed a live call that would have
+# recovered on its own. Three instant retries are one retry.
+#
+# With the attempts actually spread over time the budget is worth more, so it
+# is raised to 5. The delays are deliberately short — a realtime session is a
+# person waiting in silence — and the total worst case before giving up is
+# ~5s of reconnecting rather than ~0s.
+MAX_CONSECUTIVE_FAILURES = 5
 CONNECTION_ESTABLISHED_THRESHOLD = 10.0  # seconds
+
+# Backoff before reconnect attempt N (1-indexed); the last value repeats.
+_RECONNECT_BACKOFF_S = (0.25, 0.75, 1.5, 2.5)
+# Jitter fraction, so a fleet-wide Google blip does not have every live call
+# reconnect in lockstep.
+_RECONNECT_JITTER = 0.25
 
 
 def _audio_token_count(details: list[ModalityTokenCount] | None) -> int | None:
@@ -1381,9 +1399,23 @@ class GeminiLiveLLMService(LLMService[GeminiLiveLLMAdapter]):
             )
             return True
 
+    def _reconnect_delay(self) -> float:
+        """Backoff before the next reconnect attempt, with jitter."""
+        index = min(self._consecutive_failures, len(_RECONNECT_BACKOFF_S)) - 1
+        base = _RECONNECT_BACKOFF_S[max(index, 0)]
+        return base * (1.0 + random.uniform(-_RECONNECT_JITTER, _RECONNECT_JITTER))
+
     async def _reconnect(self):
-        """Reconnect to Gemini Live API."""
+        """Reconnect to Gemini Live API, after a backoff.
+
+        The wait is what makes the retry budget mean anything: without it all
+        MAX_CONSECUTIVE_FAILURES attempts land inside the same failing instant
+        and the session is torn down for a fault that had not finished yet.
+        """
         await self._disconnect()
+        delay = self._reconnect_delay()
+        logger.info(f"Reconnecting to Gemini Live in {delay:.2f}s")
+        await asyncio.sleep(delay)
         await self._connect(session_resumption_handle=self._session_resumption_handle)
 
     async def _disconnect(self):
