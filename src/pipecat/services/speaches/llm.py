@@ -7,6 +7,13 @@ from loguru import logger
 
 from pipecat.services.openai.base_llm import OpenAILLMSettings
 from pipecat.services.openai.llm import OpenAILLMService
+# Top-level, NOT lazily inside the except block below: this import was wrong
+# (`pipecat.services.settings` does not export assert_given — it lives in
+# pipecat.utils.types), and because it only ran on the failure path the
+# ImportError replaced the very 400 the block exists to heal. Importing it here
+# means a name that moves fails at import time, and in CI, instead of two
+# months later on a live call.
+from pipecat.utils.types import assert_given
 
 
 def _stringify_content(content) -> str:
@@ -433,8 +440,6 @@ class SpeachesLLMService(OpenAILLMService):
                 raise e
             safe = normalize_for_gemma(_strip_specific_messages(raw))
             adapter = self.get_llm_adapter()
-            from pipecat.services.settings import assert_given
-
             params_from_context = adapter.get_llm_invocation_params(
                 context,
                 system_instruction=assert_given(self._settings.system_instruction),

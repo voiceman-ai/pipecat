@@ -50,10 +50,14 @@ def _load_normalizer():
         )
         sys.modules["loguru"] = loguru_stub
 
-    # Stub the two pipecat imports the module makes at top level.
+    # Stub the pipecat imports the module makes at top level.
     for name, attrs in (
         ("pipecat.services.openai.base_llm", {"OpenAILLMSettings": object}),
         ("pipecat.services.openai.llm", {"OpenAILLMService": object}),
+        # assert_given moved to a top-level import so an unresolvable name
+        # fails at import time rather than only when a 400 arrives — see
+        # tests/test_speaches_400_recovery_imports.py.
+        ("pipecat.utils.types", {"assert_given": lambda value: value}),
     ):
         if name not in sys.modules:
             mod = types.ModuleType(name)
