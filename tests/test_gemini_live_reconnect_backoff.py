@@ -72,9 +72,7 @@ class TestReconnectBackoff(unittest.TestCase):
         their patience. Total worst-case wait before giving up."""
         schedule = list(self.consts["_RECONNECT_BACKOFF_S"])
         attempts = self.consts["MAX_CONSECUTIVE_FAILURES"]
-        worst = sum(
-            schedule[min(i, len(schedule) - 1)] for i in range(attempts)
-        )
+        worst = sum(schedule[min(i, len(schedule) - 1)] for i in range(attempts))
         self.assertLess(worst, 15.0, f"reconnect budget is {worst:.1f}s of silence")
 
     def test_jitter_is_applied(self):
@@ -86,10 +84,7 @@ class TestReconnectBackoff(unittest.TestCase):
         source = _LLM_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.AsyncFunctionDef)
-                and node.name == "_reconnect"
-            ):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_reconnect":
                 body = ast.get_source_segment(source, node) or ""
                 self.assertIn(
                     "asyncio.sleep",

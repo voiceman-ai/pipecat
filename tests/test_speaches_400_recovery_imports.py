@@ -28,12 +28,7 @@ import unittest
 from pathlib import Path
 
 _LLM_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "src"
-    / "pipecat"
-    / "services"
-    / "speaches"
-    / "llm.py"
+    Path(__file__).resolve().parents[1] / "src" / "pipecat" / "services" / "speaches" / "llm.py"
 )
 
 

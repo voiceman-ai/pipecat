@@ -7,6 +7,7 @@ from loguru import logger
 
 from pipecat.services.openai.base_llm import OpenAILLMSettings
 from pipecat.services.openai.llm import OpenAILLMService
+
 # Top-level, NOT lazily inside the except block below: this import was wrong
 # (`pipecat.services.settings` does not export assert_given — it lives in
 # pipecat.utils.types), and because it only ran on the failure path the
@@ -174,9 +175,7 @@ def normalize_for_gemma(messages: list) -> list:
         if opener:
             note = f'\n\nYou already opened the call by saying: "{opener}"'
             if system_msgs:
-                system_msgs[0]["content"] = (
-                    _stringify_content(system_msgs[0].get("content")) + note
-                )
+                system_msgs[0]["content"] = _stringify_content(system_msgs[0].get("content")) + note
             else:
                 system_msgs = [{"role": "system", "content": note.strip()}]
 
