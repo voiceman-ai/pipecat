@@ -96,6 +96,30 @@ class RawAudioTrack(AudioStreamTrack):
         self._start = time.time()
         # Queue of (bytes, future), broken into 10ms sub chunks as needed
         self._chunk_queue = deque()
+        # Optional async observer of transmitted audio; see set_transmit_tap().
+        self._transmit_tap: (
+            Callable[[bytes, int, int, float], Awaitable[None]] | None
+        ) = None
+
+    def set_transmit_tap(
+        self, tap: Callable[[bytes, int, int, float], Awaitable[None]] | None
+    ):
+        """Install an async observer of the audio actually handed to the RTP sender.
+
+        Called as ``await tap(chunk, sample_rate, pts_ns, at)`` when ``recv()``
+        pops a queued chunk: ``chunk`` is the raw PCM, ``pts_ns`` its position
+        on this track's media clock in nanoseconds — the schedule the receiver
+        plays the audio back on, regardless of how bursty the hand-off was —
+        and ``at`` is ``time.monotonic()`` at the pop. Two things never reach
+        the tap, and that is the point of tapping here rather than at
+        ``write_audio_frame``: auto-generated silence (nothing was queued), and
+        audio discarded by ``mark_pending_futures_done`` at connection close
+        (queued but never sent).
+
+        Args:
+            tap: The observer coroutine, or None to remove it.
+        """
+        self._transmit_tap = tap
 
     def add_audio_bytes(self, audio_bytes: bytes):
         """Add audio bytes to the buffer for transmission.
@@ -149,9 +173,11 @@ class RawAudioTrack(AudioStreamTrack):
             if wait > 0:
                 await asyncio.sleep(wait)
 
+        queued = True
         if not self._chunk_queue:
             if self._auto_silence:
                 chunk = bytes(self._bytes_per_10ms)
+                queued = False
             else:
                 while not self._chunk_queue:
                     await asyncio.sleep(0.005)
@@ -162,6 +188,17 @@ class RawAudioTrack(AudioStreamTrack):
             chunk, future = self._chunk_queue.popleft()
             if future and not future.done():
                 future.set_result(True)
+
+        if queued and self._transmit_tap:
+            try:
+                await self._transmit_tap(
+                    chunk,
+                    self._sample_rate,
+                    self._timestamp * 1_000_000_000 // self._sample_rate,
+                    time.monotonic(),
+                )
+            except Exception as e:  # never break the RTP path for an observer
+                logger.debug(f"RawAudioTrack transmit tap raised: {e}")
 
         # Convert the byte data to an ndarray of int16 samples
         samples = np.frombuffer(chunk, dtype=np.int16)
@@ -255,6 +292,10 @@ class SmallWebRTCClient:
         # Audio resampler - will be configured during setup with target sample rate/layout
         self._audio_in_resampler = None
         self._audio_in_layout = None
+
+        # Held here rather than on the track because the output track is
+        # recreated on every (re)connection; see set_audio_transmit_tap().
+        self._audio_transmit_tap = None
 
         @self._webrtc_connection.event_handler("connected")
         async def on_connected(connection: SmallWebRTCConnection):
@@ -451,11 +492,34 @@ class SmallWebRTCClient:
                     num_channels=self._audio_in_channels,
                 )
                 audio_frame.pts = frame.pts
+                # The raw `pts` above is in the source track's time_base and
+                # unreadable without it. This one is absolute: the capture
+                # instant on the sender's media clock, in nanoseconds — the
+                # only clock that survives network jitter, DTX gaps and
+                # delivery bursts. Wire-fidelity capture anchors on it.
+                if frame.pts is not None and frame.time_base is not None:
+                    audio_frame.media_pts_ns = int(
+                        frame.pts * frame.time_base * 1_000_000_000
+                    )
                 del pcm_bytes  # reference kept in audio_frame
 
                 yield audio_frame
 
             del frame  # free original AudioFrame
+
+    def set_audio_transmit_tap(self, tap):
+        """Observe the audio actually handed to the RTP sender.
+
+        See ``RawAudioTrack.set_transmit_tap`` for the callback contract. The
+        tap survives reconnections: it is re-applied to every output track
+        this client creates.
+
+        Args:
+            tap: The observer coroutine, or None to remove it.
+        """
+        self._audio_transmit_tap = tap
+        if self._audio_output_track:
+            self._audio_output_track.set_transmit_tap(tap)
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         """Write an audio frame to the WebRTC connection.
@@ -559,6 +623,7 @@ class SmallWebRTCClient:
                 sample_rate=self._out_sample_rate,
                 auto_silence=self._params.audio_out_auto_silence,
             )
+            self._audio_output_track.set_transmit_tap(self._audio_transmit_tap)
             self._webrtc_connection.replace_audio_track(self._audio_output_track)
 
         if self._params.video_out_enabled:
@@ -884,6 +949,20 @@ class SmallWebRTCOutputTransport(BaseOutputTransport):
 
         # Whether we have seen a StartFrame already.
         self._initialized = False
+
+    def set_audio_transmit_tap(self, tap):
+        """Observe the audio actually handed to the RTP sender.
+
+        The capability wire-fidelity recorders probe for: unlike the
+        post-``write_audio_frame`` frame push — which fires when bytes are
+        buffered, and fires even for audio a closing connection will never
+        send — the tap reports each chunk with its position on the outbound
+        media clock. See ``RawAudioTrack.set_transmit_tap``.
+
+        Args:
+            tap: The observer coroutine, or None to remove it.
+        """
+        self._client.set_audio_transmit_tap(tap)
 
     async def start(self, frame: StartFrame):
         """Start the output transport and establish WebRTC connection.
