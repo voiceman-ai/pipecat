@@ -198,6 +198,11 @@ class SimpleTextAggregator(BaseTextAggregator):
                 and not self._needs_lookahead
                 and char in (",", "،", "؛", ";", "—", "–")
                 and len(self._text) >= 12
+                # A separator glued to a digit is part of a number, not a
+                # clause break: the thousands comma in "8,500", the dash of a
+                # range ("10–15") or a phone ("050-…"). Splitting there sends
+                # "יש לך 8" and "500 דולר" to the TTS as two sentences.
+                and not self._text[-2].isdigit()
             ):
                 phrase = _clean_sentence(self._text)
                 if phrase and any(c.isalpha() or c.isdigit() for c in phrase):
@@ -237,6 +242,14 @@ class SimpleTextAggregator(BaseTextAggregator):
         search_from = len(self._text) // 3
         for i in range(len(self._text) - 1, search_from, -1):
             if self._text[i] in (",", "،", "؛", ";", "-", "–", "—"):
+                if (
+                    i + 1 < len(self._text)
+                    and self._text[i - 1].isdigit()
+                    and self._text[i + 1].isdigit()
+                ):
+                    # Inside a number ("8,500", "050-7879518", "10-15") —
+                    # not a pause. Keep looking further back.
+                    continue
                 return i + 1  # include the comma
         if allow_space:
             last_space = self._text.rfind(" ", search_from)
