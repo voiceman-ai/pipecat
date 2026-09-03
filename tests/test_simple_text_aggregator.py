@@ -218,3 +218,35 @@ class TestSimpleTextAggregatorTokenMode(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSeparatorsInsideNumbers(unittest.IsolatedAsyncioTestCase):
+    """A comma or dash glued to digits is part of a number, never a split point."""
+
+    def setUp(self):
+        self.aggregator = SimpleTextAggregator()
+
+    async def test_fast_opener_does_not_split_a_thousands_comma(self):
+        text = "במסגרת הויזה יש לך 8,500 דולר, ובמאסטרקארד עוד 8,500 דולר."
+        results = [agg async for agg in self.aggregator.aggregate(text)]
+        # The opener may split at the clause comma, never inside "8,500".
+        assert all("8,500" in r.text or "8," not in r.text for r in results)
+        joined = " ".join(r.text for r in results)
+        pending = await self.aggregator.flush()
+        if pending:
+            joined = f"{joined} {pending.text}".strip()
+        assert "8,500 דולר" in joined
+        assert not any(r.text.endswith("8,") for r in results)
+
+    async def test_fast_opener_does_not_split_a_phone_dash(self):
+        text = "המספר שלך הוא 050–7879518, נכון?"
+        results = [agg async for agg in self.aggregator.aggregate(text)]
+        assert not any(r.text.endswith("050–") for r in results)
+
+    async def test_long_sentence_split_skips_separators_inside_numbers(self):
+        # Build a sentence past the split threshold whose ONLY late separator
+        # is the thousands comma; the fallback must not cut there.
+        filler = "מילה " * 60
+        self.aggregator._text = f"{filler}סכום של 8,500 דולר"
+        pos = self.aggregator._find_phrase_split(allow_space=False)
+        assert pos == 0, "split inside 8,500"
