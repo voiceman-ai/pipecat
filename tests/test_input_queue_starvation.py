@@ -499,11 +499,70 @@ def _audio(speech: bool = False) -> InputAudioRawFrame:
     return InputAudioRawFrame(audio=marker * FRAME_BYTES, sample_rate=SAMPLE_RATE, num_channels=1)
 
 
+class ServiceOrder:
+    """When each frame reached a processor's input queue, and the order it was served in.
+
+    Lets the load tests assert the bound's guarantee in arrival order instead
+    of wall-clock allowances. Under host load the 21ms sleep that models the
+    VAD hop runs 40-50ms, the audio backlog ahead of a frame doubles, and a
+    latency budget built from the nominal service time fails on the base
+    commit and the branch alike, while the order below holds at any speed.
+    """
+
+    def __init__(self):
+        self.enqueued: dict[int, float] = {}
+        self.served: list[tuple[str, int]] = []
+
+    def watch(self, processor: FrameProcessor):
+        original = processor.queue_frame
+
+        async def queue_frame(frame, direction=FrameDirection.DOWNSTREAM, callback=None):
+            self.enqueued.setdefault(frame.id, time.monotonic())
+            await original(frame, direction, callback)
+
+        processor.queue_frame = queue_frame  # type: ignore[method-assign]
+
+    def serve(self, frame: Frame):
+        if isinstance(frame, InputAudioRawFrame):
+            self.served.append(("audio", frame.id))
+        elif isinstance(frame, (TextFrame, HeartbeatFrame)):
+            self.served.append((type(frame).__name__, frame.id))
+
+    def newer_audio_served_first(self, frame_id: int) -> int | None:
+        """Audio that reached the queue at least the bound after ``frame_id`` yet was served first.
+
+        The bound allows at most the audio frame the input task starts right
+        after moving the frame to the process queue (the process task runs at
+        that frame's first suspension); strict priority serves all of it first.
+        None if ``frame_id`` was never served.
+        """
+        limit = self.enqueued[frame_id] + BOUND
+        count = 0
+        for kind, fid in self.served:
+            if fid == frame_id:
+                return count
+            if kind == "audio" and self.enqueued[fid] >= limit:
+                count += 1
+        return None
+
+    def served_while_audio_flows(self, frame_id: int) -> bool:
+        ids = [fid for _, fid in self.served]
+        return frame_id in ids and any(
+            kind == "audio" for kind, _ in self.served[ids.index(frame_id) + 1 :]
+        )
+
+
 class SlowSystemFrameProcessor(FrameProcessor):
     """Serves each audio frame like LLMUserAggregator's VAD hop on a busy pod."""
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.order = ServiceOrder()
+        self.order.watch(self)
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        self.order.serve(frame)
         if isinstance(frame, InputAudioRawFrame):
             await asyncio.sleep(SLOW_SERVICE_SECS)
         await self.push_frame(frame, direction)
@@ -556,17 +615,14 @@ async def _run_slow_system_pipeline(stream_secs: float):
     async def on_heartbeat(worker, latency_secs):
         heartbeats.append((time.monotonic(), latency_secs))
 
-    result: dict = {"queued": {}, "max_system_backlog": 0}
+    result: dict = {"queued": {}, "frame_ids": {}, "order": slow.order}
 
     async def driver():
         await asyncio.sleep(0.2)
         result["stream_start"] = time.monotonic()
 
         async def on_tick(t):
-            system_depth = slow.input_queue_depth - slow.input_queue_non_system_depth
-            result["max_system_backlog"] = max(result["max_system_backlog"], system_depth)
             if t >= 1.0 and "text" not in result["queued"]:
-                result["system_backlog_at_text"] = system_depth
                 for text in ("text", "transcript"):
                     frame = (
                         TextFrame(text=text)
@@ -575,6 +631,7 @@ async def _run_slow_system_pipeline(stream_secs: float):
                     )
                     await worker.queue_frame(frame)
                     result["queued"][text] = time.monotonic()
+                    result["frame_ids"][text] = frame.id
 
         result["stream_end"] = await _stream_audio(worker, stream_secs, on_tick)
         result["bounded_serves"] = slow.input_queue_bounded_serves
@@ -767,30 +824,31 @@ class TestSlowSystemFramesDoNotStarveTheRest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(during_stream, [], "no heartbeat should cross while audio flows")
         self.assertEqual(result["bounded_serves"], 0)
+        # In arrival order: every audio frame that came a bound after the text went first.
+        self.assertGreater(
+            result["order"].newer_audio_served_first(result["frame_ids"]["text"]), 10
+        )
 
     async def test_bound_delivers_text_transcripts_and_heartbeats_while_audio_flows(self):
         FrameProcessorQueue.set_starvation_bound(BOUND)
         result = await _run_slow_system_pipeline(self.STREAM_SECS)
+        order: ServiceOrder = result["order"]
 
-        end = result["stream_end"]
-        # A frame waits at most the bound behind newer audio, plus the older
-        # audio already queued ahead of it and the frame in service.
-        older_backlog = result["system_backlog_at_text"] * SLOW_SERVICE_SECS
-        allowed = BOUND + older_backlog + 2 * SLOW_SERVICE_SECS + 0.1
+        # A frame waits behind the audio that was already queued ahead of it
+        # (arrival order) and behind newer audio only until it has aged past
+        # the bound: nothing that arrived a bound later goes first, save the
+        # one frame started right after the move. The strict-priority control
+        # serves every newer audio frame first.
         for text in ("text", "transcript"):
-            arrived = result["arrivals"][text]
-            self.assertLess(arrived, end, f"{text} must not wait for the audio to stop")
-            self.assertLessEqual(arrived - result["queued"][text], allowed, text)
+            frame_id = result["frame_ids"][text]
+            self.assertLessEqual(order.newer_audio_served_first(frame_id), 1, text)
+            self.assertTrue(order.served_while_audio_flows(frame_id), text)
 
-        during_stream = [
-            latency
-            for at, latency in result["heartbeats"]
-            if result["stream_start"] + 0.6 < at < end
-        ]
-        self.assertGreaterEqual(len(during_stream), 3, result["heartbeats"])
-        max_backlog = result["max_system_backlog"] * SLOW_SERVICE_SECS
-        for latency in during_stream:
-            self.assertLessEqual(latency, BOUND + max_backlog + 2 * SLOW_SERVICE_SECS + 0.1)
+        heartbeats = [fid for kind, fid in order.served if kind == "HeartbeatFrame"]
+        during_stream = [fid for fid in heartbeats if order.served_while_audio_flows(fid)]
+        self.assertGreaterEqual(len(during_stream), 3, order.served)
+        for fid in during_stream:
+            self.assertLessEqual(order.newer_audio_served_first(fid), 1)
         self.assertGreater(result["bounded_serves"], 0)
 
 
@@ -831,7 +889,8 @@ async def _run_user_aggregator(stream_secs: float):
             user_turn_stop_timeout=USER_TURN_STOP_FUSE_SECS,
         ),
     )
-    events: dict = {"stopped": [], "timeouts": [], "transcript_seen": None}
+    events: dict = {"stopped": [], "timeouts": [], "transcript_seen": None, "order": ServiceOrder()}
+    events["order"].watch(aggregator)
 
     @aggregator.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(aggregator, strategy, message):
@@ -843,6 +902,7 @@ async def _run_user_aggregator(stream_secs: float):
 
     @aggregator.event_handler("on_before_process_frame")
     async def on_before_process_frame(aggregator, frame):
+        events["order"].serve(frame)
         if isinstance(frame, TranscriptionFrame) and events["transcript_seen"] is None:
             events["transcript_seen"] = time.monotonic()
 
@@ -859,11 +919,11 @@ async def _run_user_aggregator(stream_secs: float):
         async def on_tick(t):
             if t >= 1.0 and "transcript_queued" not in events:
                 events["transcript_queued"] = time.monotonic()
-                await worker.queue_frame(
-                    TranscriptionFrame(
-                        text="מה שלומך, מאיה?", user_id="caller", timestamp="", finalized=True
-                    )
+                transcript = TranscriptionFrame(
+                    text="מה שלומך, מאיה?", user_id="caller", timestamp="", finalized=True
                 )
+                events["transcript_id"] = transcript.id
+                await worker.queue_frame(transcript)
 
         events["stream_end"] = await _stream_audio(
             worker, stream_secs, on_tick, speech=lambda t: 0.2 <= t < 0.8
@@ -897,10 +957,9 @@ class TestUserAggregatorHearsTheCallerUnderLoad(unittest.IsolatedAsyncioTestCase
         FrameProcessorQueue.set_starvation_bound(BOUND)
         events = await _run_user_aggregator(self.STREAM_SECS)
 
-        waited = events["transcript_seen"] - events["transcript_queued"]
-        # Bound + the ~55ms of audio backlog a 21ms-per-frame VAD has built by
-        # t=1s + the frame in service + scheduling slack; far inside the fuse.
-        self.assertLess(waited, BOUND + 0.25)
+        # Only the audio already queued ahead of it and one frame past the
+        # bound go first (see ServiceOrder), and it lands far inside the fuse.
+        self.assertLessEqual(events["order"].newer_audio_served_first(events["transcript_id"]), 1)
         self.assertEqual(events["timeouts"], [], "the turn-stop fuse must not fire")
         self.assertEqual(events["stopped"][0][1], "מה שלומך, מאיה?")
         self.assertLess(events["stopped"][0][0], events["stream_end"])
