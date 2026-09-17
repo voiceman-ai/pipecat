@@ -37,6 +37,7 @@ from pipecat.processors.filters.identity_filter import IdentityFilter
 from pipecat.processors.frame_processor import (
     FrameDirection,
     FrameProcessor,
+    FrameProcessorQueue,
     FrameProcessorSetup,
 )
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -278,8 +279,17 @@ class StarvingProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+@pytest.fixture
+def strict_priority():
+    """Pin strict system-frame priority, whatever PIPECAT_INPUT_QUEUE_STARVATION_BOUND_MS says."""
+    saved = FrameProcessorQueue.starvation_bound_secs
+    FrameProcessorQueue.set_starvation_bound(0)
+    yield
+    FrameProcessorQueue.starvation_bound_secs = saved
+
+
 @pytest.mark.asyncio
-async def test_non_system_wait_names_the_starved_processor():
+async def test_non_system_wait_names_the_starved_processor(strict_priority):
     """A heartbeat-timeout handler must be able to say who holds the frames, and for how long."""
     starving = StarvingProcessor()
     worker = PipelineWorker(
