@@ -92,6 +92,11 @@ class SentryMetrics(FrameProcessorMetrics):
                 f"{self} Sentry transaction started (ID: {self._ttfb_metrics_tx.span_id} Name: {self._ttfb_metrics_tx.name})"
             )
 
+    async def reset_ttfb_metrics(self):
+        """Abandon the in-progress TTFB measurement and its unsent transaction."""
+        await super().reset_ttfb_metrics()
+        self._ttfb_metrics_tx = None
+
     async def stop_ttfb_metrics(self, *, end_time: float | None = None):
         """Stop tracking time-to-first-byte metrics.
 

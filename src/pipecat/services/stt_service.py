@@ -596,10 +596,20 @@ class STTService(AIService):
         Cancels any pending TTFB timeout, resets TTFB tracking state, and marks user as speaking.
         Also resets finalization state to prevent stale finalization from a previous utterance.
 
+        The TTFB start taken at the previous VAD stop is abandoned too. When no
+        final transcript arrived within the TTFB timeout, that start used to
+        survive the next utterance, and the next final (for new speech) was
+        measured against the old stop: prod run 5155948 logged
+        "STT TTFB 4364ms" and "5996ms" on Soniox sessions whose normal turns
+        measured 222-257ms, each exactly the gap back to an earlier VAD stop.
+        A final that arrives after the user resumed speaking is no longer an
+        answer to that stop anyway, so nothing truthful is lost.
+
         Args:
             frame: The VAD user started speaking frame.
         """
         await self._reset_stt_ttfb_state()
+        await self.reset_ttfb_metrics()
         self._user_speaking = True
         self._can_reconnect = False
         self._finalize_requested = False

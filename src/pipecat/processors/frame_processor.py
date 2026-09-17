@@ -637,6 +637,10 @@ class FrameProcessor(BaseObject):
                 start_time=start_time, report_only_initial_ttfb=self._report_only_initial_ttfb
             )
 
+    async def reset_ttfb_metrics(self):
+        """Abandon an in-progress time-to-first-byte measurement without reporting it."""
+        await self._metrics.reset_ttfb_metrics()
+
     async def stop_ttfb_metrics(self, *, end_time: float | None = None):
         """Stop time-to-first-byte metrics collection and push results.
 
