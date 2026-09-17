@@ -248,14 +248,17 @@ class VADAnalyzer(ABC):
         # analysis has finished: a cancelled await can leave its
         # `_run_analyzer` still running on the worker, and appending beside it
         # would race on `_vad_buffer`, so that case keeps the executor, which
-        # queues behind it in order. A subclass that overrides `_run_analyzer`
-        # always keeps the executor.
+        # queues behind it in order. "Finished" means done and NOT cancelled:
+        # a second cancelled await can cancel its own analysis while it is
+        # still queued behind the first, and that future is done without ever
+        # having run, so it says nothing about the one still on the worker.
+        # A subclass that overrides `_run_analyzer` always keeps the executor.
         num_required_bytes = getattr(self, "_vad_frames_num_bytes", None)
         pending = self._pending_analysis
         if (
             self._partial_window_fast_path
             and num_required_bytes is not None
-            and (pending is None or pending.done())
+            and (pending is None or (pending.done() and not pending.cancelled()))
             and len(self._vad_buffer) + len(buffer) < num_required_bytes
         ):
             self._vad_buffer += buffer

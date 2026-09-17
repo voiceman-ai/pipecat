@@ -209,6 +209,61 @@ async def test_fast_path_waits_for_an_analysis_still_running_on_the_worker():
 
 
 @pytest.mark.asyncio
+async def test_fast_path_waits_behind_a_running_analysis_when_the_queued_one_was_cancelled():
+    """A cancelled queued analysis is `done()` but never ran: it proves nothing about the one ahead of it.
+
+    Two cancelled awaits in a row: the first leaves its analysis running on the
+    worker, the second cancels its own analysis while it is still queued behind
+    that one. The last submitted future is then done (cancelled) while the
+    worker is still inside the first `_run_analyzer`, so the fast path must not
+    take it as "the previous analysis has finished".
+    """
+    release = threading.Event()
+    started = threading.Event()
+
+    class BlockingAnalyzer(EnergyVADAnalyzer):
+        def voice_confidence(self, buffer: bytes) -> float:
+            started.set()
+            release.wait(5)
+            return 0.0
+
+    analyzer = _make(BlockingAnalyzer, 8000, PARAM_SETS[0])
+    window = b"\x01\x00" * 256
+    partial = b"\x02\x00" * 10
+
+    running = asyncio.create_task(analyzer.analyze_audio(window))
+    await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    queued = asyncio.create_task(analyzer.analyze_audio(partial))
+    await asyncio.sleep(0.01)
+    assert analyzer._executor.submits == 2
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    await asyncio.sleep(0)
+    assert analyzer._pending_analysis.cancelled(), "the queued analysis never started"
+
+    # The worker is still inside the first analysis: this buffer must queue
+    # behind it rather than be appended from the loop thread beside it.
+    follow_up = asyncio.create_task(analyzer.analyze_audio(partial))
+    await asyncio.sleep(0.05)
+    assert analyzer._executor.submits == 3
+    assert not follow_up.done()
+    release.set()
+    assert await asyncio.wait_for(follow_up, 5) == VADState.QUIET
+    # The cancelled queued buffer was dropped (as it always was with
+    # run_in_executor); the first window was consumed.
+    assert analyzer._vad_buffer == partial
+
+    # Once a submitted analysis has really run, the fast path is used again.
+    await analyzer.analyze_audio(partial)
+    assert analyzer._executor.submits == 3
+
+
+@pytest.mark.asyncio
 async def test_shut_down_analyzer_neither_appends_nor_raises():
     analyzer = _make(EnergyVADAnalyzer, 8000, PARAM_SETS[0])
     await analyzer.analyze_audio(b"\x00\x00" * 100)
