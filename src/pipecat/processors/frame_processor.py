@@ -19,6 +19,7 @@ import os
 import time
 import traceback
 import warnings
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -126,55 +127,199 @@ class FrameProcessorSetup:
         return object.__getattribute__(self, name)
 
 
-class FrameProcessorQueue(asyncio.PriorityQueue):
+# The starvation bound to enable (see FrameProcessorQueue). 80ms because:
+# - it is above the largest single event-loop stall measured on the stalled
+#   api pods (max loop lag per 15s: 21-56ms, versus 3ms on the same pod just
+#   before the stall), so one slow iteration cannot trip it and it only acts on
+#   sustained starvation;
+# - it is four 20ms audio frames, well under the VAD stop window (0.2s) and the
+#   0.55-0.8s a healthy turn takes to release after its final transcript, so a
+#   starved transcript still lands inside the turn it belongs to;
+# - a heartbeat (1s period) crossing one starved processor is held at most
+#   this long plus one system frame's service time.
+INPUT_QUEUE_STARVATION_BOUND_RECOMMENDED_SECS = 0.08
+
+
+def _starvation_bound_from_env() -> float:
+    """Read ``PIPECAT_INPUT_QUEUE_STARVATION_BOUND_MS`` as seconds (0 = off)."""
+    raw = os.getenv("PIPECAT_INPUT_QUEUE_STARVATION_BOUND_MS", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            f"PIPECAT_INPUT_QUEUE_STARVATION_BOUND_MS={raw!r} is not a number; "
+            f"input queues keep strict system-frame priority"
+        )
+        return 0.0
+    return max(0.0, value) / 1000.0
+
+
+class FrameProcessorQueue(asyncio.Queue):
     """A priority queue for systems frames and other frames.
 
     This is a specialized queue for frame processors that separates and
-    prioritizes system frames over other frames. It ensures that `SystemFrame`
-    objects are processed before any other frames by using a priority queue.
+    prioritizes system frames over other frames: a `SystemFrame` is returned
+    before any non-system frame, and each class keeps its own FIFO order.
+    Items are ``(frame, direction, callback)`` tuples; anything whose first
+    element is not a `SystemFrame` is non-system.
 
+    Bounded starvation (opt-in). Strict priority starves non-system frames for
+    as long as a system frame is always waiting at the next ``get()``. On a
+    busy api pod that is what happened: `InputAudioRawFrame` is a system
+    frame arriving every 20ms, and `LLMUserAggregator` hops to a thread
+    executor for VAD on each one, so once loop and GIL contention pushed its
+    per-frame service time to the 20ms arrival interval a system frame was
+    always queued and `TranscriptionFrame`/`HeartbeatFrame` got no service for
+    20-40s while audio and VAD kept flowing (fleet, c78 at 40 dials/s: 77 of
+    1,057 calls stalled and 188 caller utterances were never delivered in 2
+    minutes; 0% on pods with <=5 calls/2min, 12.5% on the busiest). The 5s
+    turn-stop fuse then committed an empty turn and the caller heard 22-39s of
+    dead air.
+
+    With :attr:`starvation_bound_secs` > 0, a non-system item that has waited
+    at least that long is no longer overtaken by system frames that arrived
+    AFTER it: it takes its arrival-order place again. System frames that
+    arrived before it are still served first. So:
+
+    - Nothing changes while the queue keeps up. A fresh item (younger than the
+      bound) is ordered exactly as with strict priority, and a healthy input
+      queue never holds an item anywhere near the bound.
+    - A starved item waits behind newer system frames for at most the bound
+      plus the one system frame already in service. Its total wait is at most
+      that plus the time to serve the system frames that were already queued
+      when it arrived, i.e. what a FIFO would have given it.
+    - Order is never inverted beyond arrival order. An aged item is not
+      allowed to jump ahead of OLDER system frames: an `InterruptionFrame`
+      that arrived first still flushes it, and a `TranscriptionFrame` is never
+      served ahead of audio that reached the user aggregator before it.
+      Letting it overtake older audio would bound its latency even under a
+      growing audio backlog, but it would reorder the aggregator's inputs
+      relative to what it was sent, which strict priority never does for
+      frames that arrived first; a backlog that large is a throughput deficit
+      no queue discipline can fix.
+
+    The input task yields once after moving a bound-served item to the process
+    queue (see :attr:`last_get_was_bounded`), so a system frame queued behind
+    it that starts a turn cannot flush it before the process task runs.
+
+    Serving a non-system item from the input task only moves it to the
+    process queue, so doing so ahead of waiting system frames costs them
+    microseconds, not a frame's processing time.
+
+    The bound is read on every ``get()``, from the instance attribute if one
+    was set and otherwise from the class, whose default comes from the
+    ``PIPECAT_INPUT_QUEUE_STARVATION_BOUND_MS`` environment variable (unset
+    or 0 keeps strict priority). See
+    :data:`INPUT_QUEUE_STARVATION_BOUND_RECOMMENDED_SECS` for the value to
+    use and why.
     """
 
     HIGH_PRIORITY = 1
     LOW_PRIORITY = 2
 
+    #: Seconds a non-system item may be overtaken by newer system frames
+    #: before it regains its arrival-order place. 0 disables the bound
+    #: (strict system-frame priority).
+    starvation_bound_secs: float = _starvation_bound_from_env()
+
     def __init__(self):
         """Initialize the FrameProcessorQueue."""
         super().__init__()
-        self.__high_counter = 0
-        self.__low_counter = 0
+        # Non-system items served ahead of a newer waiting system frame
+        # because they reached the starvation bound. Read-only diagnostic.
+        self._bounded_serves = 0
+        self._last_get_bounded = False
 
-    async def put(self, item: tuple[Frame, FrameDirection, FrameCallback | None]):
-        """Put an item into the priority queue.
+    @classmethod
+    def set_starvation_bound(cls, seconds: float | None) -> None:
+        """Set the process-wide starvation bound for every input queue.
 
-        System frames (`SystemFrame`) have higher priority than any other
-        frames. If a non-frame item (e.g. a watchdog cancellation sentinel) is
-        provided it will have the highest priority.
+        Takes effect on the next ``get()`` of every existing and future queue
+        that has no instance override.
 
         Args:
-            item (Any): The item to enqueue.
-
+            seconds: The bound in seconds; ``None`` or 0 restores strict
+                system-frame priority.
         """
+        cls.starvation_bound_secs = max(0.0, seconds or 0.0)
+
+    # asyncio.Queue storage hooks. Two FIFOs replace the (priority, counter)
+    # heap: popping the system FIFO first is the same order the heap gave,
+    # and the non-system FIFO carries each item's enqueue time so the
+    # starvation bound and the wait diagnostics can read the head's age.
+
+    def _init(self, maxsize):
+        self._seq = 0
+        self._system_items: deque[tuple[int, Any]] = deque()
+        self._non_system_items: deque[tuple[int, float, Any]] = deque()
+
+    def _put(self, item: tuple[Frame, FrameDirection, FrameCallback | None]):
         frame, _, _ = item
+        self._seq += 1
         if isinstance(frame, SystemFrame):
-            self.__high_counter += 1
-            await super().put((self.HIGH_PRIORITY, self.__high_counter, item))
+            self._system_items.append((self._seq, item))
         else:
-            self.__low_counter += 1
-            await super().put((self.LOW_PRIORITY, self.__low_counter, item))
+            self._non_system_items.append((self._seq, time.monotonic(), item))
 
-    async def get(self) -> Any:
-        """Retrieve the next item from the queue.
+    def _get(self) -> Any:
+        self._last_get_bounded = False
+        system_items = self._system_items
+        non_system_items = self._non_system_items
+        if not non_system_items:
+            return system_items.popleft()[1]
+        if not system_items:
+            return non_system_items.popleft()[2]
+        bound = self.starvation_bound_secs
+        if bound > 0:
+            seq, enqueued_at, item = non_system_items[0]
+            # Only an item already overtaken (the waiting system frame is
+            # newer) can be starved; an older system frame goes first anyway.
+            if seq < system_items[0][0] and time.monotonic() - enqueued_at >= bound:
+                non_system_items.popleft()
+                self._bounded_serves += 1
+                self._last_get_bounded = True
+                return item
+        return system_items.popleft()[1]
 
-        System frames are prioritized. If both queues are empty, this method
-        waits until an item is available.
+    def qsize(self) -> int:
+        """Number of items (system and non-system) in the queue."""
+        return len(self._system_items) + len(self._non_system_items)
+
+    def empty(self) -> bool:
+        """Return True if the queue holds no items."""
+        return not self._system_items and not self._non_system_items
+
+    @property
+    def non_system_qsize(self) -> int:
+        """Number of non-system items waiting in the queue."""
+        return len(self._non_system_items)
+
+    @property
+    def oldest_non_system_wait(self) -> float | None:
+        """Seconds the oldest waiting non-system item has been queued.
 
         Returns:
-            Any: The next item from the system or main queue.
-
+            The age in seconds, or None when no non-system item is waiting.
         """
-        _, _, item = await super().get()
-        return item
+        if not self._non_system_items:
+            return None
+        return time.monotonic() - self._non_system_items[0][1]
+
+    @property
+    def bounded_serves(self) -> int:
+        """Non-system items served ahead of newer system frames by the bound."""
+        return self._bounded_serves
+
+    @property
+    def last_get_was_bounded(self) -> bool:
+        """Whether the most recent ``get()`` returned an item the bound served.
+
+        That item left system frames waiting behind it, so its consumer should
+        yield before handling them (see ``FrameProcessor``'s input task).
+        """
+        return self._last_get_bounded
 
 
 # How long a processor holds frames waiting for a readiness condition before
@@ -287,7 +432,10 @@ class FrameProcessor(BaseObject):
         # If a system frame is obtained it will be processed immediately any
         # other type of frame (data and control) will be put in a separate queue
         # for later processing. This guarantees that each frame processor will
-        # always process system frames before any other frame in the queue.
+        # always process system frames before any other frame in the queue —
+        # unless the opt-in starvation bound is set, in which case a non-system
+        # frame that has waited past it is no longer overtaken by newer system
+        # frames (see FrameProcessorQueue).
 
         # The input task that handles all types of frames. It processes system
         # frames right away and queues non-system frames for later processing.
@@ -1166,6 +1314,58 @@ class FrameProcessor(BaseObject):
         return self.__input_queue.qsize()
 
     @property
+    def input_queue_non_system_depth(self) -> int:
+        """Number of non-system frames waiting in this processor's input queue.
+
+        Non-system frames (data and control frames, heartbeats included) wait
+        here until the input task moves them to the process queue. System
+        frames are served first, so a count that stays above zero while
+        `input_queue_non_system_wait` grows means this processor is starving
+        them. Always 0 in direct mode.
+
+        Returns:
+            The number of waiting non-system frames. Read-only diagnostic.
+        """
+        return self.__input_queue.non_system_qsize
+
+    @property
+    def input_queue_non_system_wait(self) -> float | None:
+        """Age of the oldest non-system frame waiting in the input queue.
+
+        The starvation signal the heartbeat timeout cannot give on its own.
+        A heartbeat that never arrives only says some processor holds it;
+        this names which one and says whether it is starved or just behind:
+
+        - a large wait while `input_queue_depth` is barely above
+          `input_queue_non_system_depth` means system frames keep overtaking
+          the waiting frames (starved by priority);
+        - a large wait with many system frames queued as well means the input
+          task is behind on everything (a throughput deficit);
+        - None means nothing non-system is waiting here.
+
+        Costs one clock read. Safe to call from a heartbeat-timeout handler
+        for every processor of the pipeline.
+
+        Returns:
+            Seconds the oldest waiting non-system frame has been queued, or
+            None if none is waiting. Read-only diagnostic.
+        """
+        return self.__input_queue.oldest_non_system_wait
+
+    @property
+    def input_queue_bounded_serves(self) -> int:
+        """Non-system frames the starvation bound served ahead of newer system frames.
+
+        Stays 0 while the bound is disabled or the processor keeps up; a
+        count that grows during a call means the bound (see
+        :class:`FrameProcessorQueue`) is what delivered those frames.
+
+        Returns:
+            The cumulative count for this processor. Read-only diagnostic.
+        """
+        return self.__input_queue.bounded_serves
+
+    @property
     def process_queue_depth(self) -> int:
         """Number of non-system frames waiting in the process queue.
 
@@ -1350,6 +1550,18 @@ class FrameProcessor(BaseObject):
                 await self.__process_frame(frame, direction, callback)
             elif self.__process_queue:
                 await self.__process_queue.put((frame, direction, callback))
+                if self.__input_queue.last_get_was_bounded:
+                    # Let the process task take the frame before the next
+                    # system frame runs. The bound served it while system
+                    # frames were still waiting, and one of those may start a
+                    # turn: `broadcast_interruption()` resets the process
+                    # queue, and would drop a frame that waited this long only
+                    # to be flushed before the process task ever ran (seen in
+                    # the load benchmark as transcripts lost to the next VAD
+                    # turn start). Strict priority never needed this: it only
+                    # serves a non-system frame once no system frame waits,
+                    # so the next get() suspends and the process task runs.
+                    await asyncio.sleep(0)
             else:
                 raise RuntimeError(
                     f"{self}: __process_queue is None when processing frame {frame.name}"
