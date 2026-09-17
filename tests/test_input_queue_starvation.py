@@ -170,6 +170,140 @@ def test_order_matches_the_priority_heap_while_nothing_ages(bound, fake_clock, r
     assert queue.bounded_serves == 0
 
 
+class _LegacyFrameProcessorQueue(asyncio.PriorityQueue):
+    """`FrameProcessorQueue` exactly as c2fef2ac4 shipped it (docstrings trimmed)."""
+
+    HIGH_PRIORITY = 1
+    LOW_PRIORITY = 2
+
+    def __init__(self):
+        super().__init__()
+        self.__high_counter = 0
+        self.__low_counter = 0
+
+    async def put(self, item):
+        frame, _, _ = item
+        if isinstance(frame, SystemFrame):
+            self.__high_counter += 1
+            await super().put((self.HIGH_PRIORITY, self.__high_counter, item))
+        else:
+            self.__low_counter += 1
+            await super().put((self.LOW_PRIORITY, self.__low_counter, item))
+
+    async def get(self):
+        _, _, item = await super().get()
+        return item
+
+
+async def _scripted_queue_trace(queue_cls, frames: list[Frame], seed: int) -> list[tuple]:
+    """Drive a queue through the async API the input task uses and record everything visible.
+
+    Concurrent putters, getters parked on an empty queue (some cancelled while
+    parked, some cancelled right after a put woke them), task_done/join, and a
+    size probe after every step. asyncio scheduling is deterministic, so two
+    queues with the same semantics produce the same trace.
+    """
+    rng = random.Random(seed)
+    queue = queue_cls()
+    index = {id(frame): i for i, frame in enumerate(frames)}
+    trace: list[tuple] = []
+    getters: list[asyncio.Task] = []
+    joins: list[asyncio.Task] = []
+    received = 0
+    next_frame = 0
+
+    def settle():
+        nonlocal received
+        for n, task in enumerate(getters):
+            if task is None or not task.done():
+                continue
+            if task.cancelled():
+                trace.append(("cancelled", n))
+            else:
+                trace.append(("got", n, index[id(task.result()[0])]))
+                received += 1
+            getters[n] = None
+        for n, task in enumerate(joins):
+            if task is not None and task.done():
+                trace.append(("joined", n))
+                joins[n] = None
+
+    async def catch_up():
+        # Consume and finish everything so parked join() waiters wake.
+        nonlocal received
+        while not queue.empty():
+            trace.append(("drain", index[id((await queue.get())[0])]))
+            received += 1
+        while received:
+            queue.task_done()
+            received -= 1
+        await asyncio.sleep(0)
+        settle()
+
+    for step in range(3000):
+        op = rng.random()
+        if step % 500 == 499:
+            await catch_up()
+        elif op < 0.35 and next_frame < len(frames):
+            await queue.put(_item(frames[next_frame]))
+            next_frame += 1
+        elif op < 0.55:
+            getters.append(asyncio.create_task(queue.get()))
+        elif op < 0.62:
+            pending = [t for t in getters if t is not None and not t.done()]
+            if pending:
+                rng.choice(pending).cancel()
+        elif op < 0.72 and received > 0:
+            queue.task_done()
+            received -= 1
+        elif op < 0.75:
+            joins.append(asyncio.create_task(queue.join()))
+        else:
+            await asyncio.sleep(0)
+        settle()
+        trace.append(("size", step, queue.qsize(), queue.empty(), queue.full(), queue.maxsize))
+
+    for task in getters:
+        if task is not None and not task.done():
+            task.cancel()
+    await asyncio.sleep(0)
+    settle()
+    await catch_up()
+    for task in joins:
+        if task is not None:
+            task.cancel()
+    await asyncio.gather(*(t for t in joins if t is not None), return_exceptions=True)
+    return trace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [0.0, BOUND])
+@pytest.mark.parametrize("seed", [1, 2, 3])
+async def test_async_protocol_matches_the_shipped_queue(bound, seed, fake_clock, restore_bound):
+    """Bound off, or on while nothing ages: identical to the c2fef2ac4 class, suspension points included."""
+    FrameProcessorQueue.set_starvation_bound(bound)
+    rng = random.Random(seed)
+    frames = [
+        rng.choice(
+            [
+                lambda: InputAudioRawFrame(audio=b"", sample_rate=SAMPLE_RATE, num_channels=1),
+                lambda: UserSpeakingFrame(),
+                lambda: InterruptionFrame(),
+                lambda: TextFrame(text="t"),
+                lambda: HeartbeatFrame(timestamp=0),
+                lambda: EndFrame(),
+            ]
+        )()
+        for _ in range(1000)
+    ]
+    legacy = await _scripted_queue_trace(_LegacyFrameProcessorQueue, frames, seed)
+    current = await _scripted_queue_trace(FrameProcessorQueue, frames, seed)
+    assert current == legacy
+    # The schedule really exercises the queue.
+    kinds = {entry[0] for entry in legacy}
+    assert {"got", "cancelled", "joined", "drain"} <= kinds
+
+
 def test_fresh_non_system_frame_keeps_strict_priority(fake_clock, restore_bound):
     FrameProcessorQueue.set_starvation_bound(BOUND)
     queue = FrameProcessorQueue()
