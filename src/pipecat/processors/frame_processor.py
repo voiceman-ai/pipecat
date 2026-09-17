@@ -200,9 +200,13 @@ class FrameProcessorQueue(asyncio.Queue):
       frames that arrived first; a backlog that large is a throughput deficit
       no queue discipline can fix.
 
-    The input task yields once after moving a bound-served item to the process
-    queue (see :attr:`last_get_was_bounded`), so a system frame queued behind
-    it that starts a turn cannot flush it before the process task runs.
+    A bound-served item reaches the process queue while system frames are
+    still waiting, so one of them may flush the process queue (a turn start's
+    `broadcast_interruption()`, an `InterruptionFrame`) before the process task
+    has run. The flush therefore first yields once when such an item is still
+    waiting there (see :attr:`last_get_was_bounded`); the input task itself
+    never yields for the bound, so a processor that is merely behind still
+    moves its whole backlog in one step, as with strict priority.
 
     Serving a non-system item from the input task only moves it to the
     process queue, so doing so ahead of waiting system frames costs them
@@ -316,8 +320,9 @@ class FrameProcessorQueue(asyncio.Queue):
     def last_get_was_bounded(self) -> bool:
         """Whether the most recent ``get()`` returned an item the bound served.
 
-        That item left system frames waiting behind it, so its consumer should
-        yield before handling them (see ``FrameProcessor``'s input task).
+        That item left system frames waiting behind it, and one of those may
+        flush it before its consumer runs (see ``FrameProcessor``'s
+        interruption handling, which yields to the process task first).
         """
         return self._last_get_bounded
 
@@ -457,6 +462,9 @@ class FrameProcessor(BaseObject):
         self.__process_event: asyncio.Event | None = None
         self.__process_frame_task: asyncio.Task | None = None
         self.__process_current_frame: Frame | None = None
+        # The last frame the input queue's starvation bound moved to the
+        # process queue (see `__yield_to_bound_served_frame`).
+        self.__bound_served_frame: Frame | None = None
 
         # Read-only diagnostics (see the `input_queue_depth`,
         # `process_queue_depth` and `seconds_since_last_progress` properties).
@@ -1034,6 +1042,7 @@ class FrameProcessor(BaseObject):
     async def broadcast_interruption(self):
         """Broadcast an `InterruptionFrame` both upstream and downstream."""
         logger.debug(f"{self}: broadcasting interruption")
+        await self.__yield_to_bound_served_frame()
         self.__reset_process_task()
         await self.stop_all_metrics()
         await self.broadcast_frame(InterruptionFrame)
@@ -1152,6 +1161,9 @@ class FrameProcessor(BaseObject):
     async def _start_interruption(self):
         """Start handling an interruption by cancelling current tasks."""
         try:
+            # Before `current` is read: the process task may take a waiting
+            # bound-served frame now.
+            await self.__yield_to_bound_served_frame()
             # HeartbeatFrame is uninterruptible so an interruption cannot drain
             # in-flight heartbeats out of the process queue (that is what made
             # the heartbeat monitor a barge-in detector rather than a health
@@ -1278,6 +1290,34 @@ class FrameProcessor(BaseObject):
     def __reset_process_queue(self):
         """Reset non-system frame processing queue."""
         self.__process_queue.reset()
+
+    async def __yield_to_bound_served_frame(self):
+        """Let the process task take a bound-served frame before a flush drops it.
+
+        The starvation bound moves a frame to the process queue while system
+        frames still wait behind it, and one of them may flush the process
+        queue before the process task has run: in the load benchmark,
+        transcripts that had waited past the bound were dropped by the VAD
+        turn start queued right behind them. Strict priority never needed
+        this, since it only serves a non-system frame once no system frame
+        waits, so the input task suspends and the process task runs first.
+
+        Yielding here, at the flush, rather than after every bound-served frame
+        keeps the input task yield-free: a yield per frame capped a processor
+        coming back to an aged backlog at one non-system frame per loop
+        iteration, below a 60/s token or TTS stream on a 20ms-iteration loop
+        (see `TestAgedBacklogDrainsInBulk`). A no-op unless a bound-served
+        frame is still queued, and when the flush runs on the process task
+        itself, which cannot take that frame while it is the caller.
+        """
+        frame, self.__bound_served_frame = self.__bound_served_frame, None
+        if frame is None or asyncio.current_task() is self.__process_frame_task:
+            return
+        # A scan of the process queue, only at a flush while the bound is
+        # delivering frames.
+        queued = self.__process_queue._queue  # pyright: ignore[reportAttributeAccessIssue]
+        if any(item[0] is frame for item in queued):
+            await asyncio.sleep(0)
 
     def has_queued_frame(self, frame_type: type[Frame] | type[UninterruptibleFrame]) -> bool:
         """Return True if a frame of the given type is waiting in the processing queue.
@@ -1555,17 +1595,11 @@ class FrameProcessor(BaseObject):
             elif self.__process_queue:
                 await self.__process_queue.put((frame, direction, callback))
                 if self.__input_queue.last_get_was_bounded:
-                    # Let the process task take the frame before the next
-                    # system frame runs. The bound served it while system
-                    # frames were still waiting, and one of those may start a
-                    # turn: `broadcast_interruption()` resets the process
-                    # queue, and would drop a frame that waited this long only
-                    # to be flushed before the process task ever ran (seen in
-                    # the load benchmark as transcripts lost to the next VAD
-                    # turn start). Strict priority never needed this: it only
-                    # serves a non-system frame once no system frame waits,
-                    # so the next get() suspends and the process task runs.
-                    await asyncio.sleep(0)
+                    # Not a yield here: a processor that is only behind (held
+                    # past the bound, then facing aged frames interleaved with
+                    # 50fps input audio) would move one frame per loop
+                    # iteration. See `__yield_to_bound_served_frame`.
+                    self.__bound_served_frame = frame
             else:
                 raise RuntimeError(
                     f"{self}: __process_queue is None when processing frame {frame.name}"

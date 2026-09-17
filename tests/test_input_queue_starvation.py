@@ -455,32 +455,35 @@ async def _run_slow_system_pipeline(stream_secs: float):
 
 
 class TestBoundServedFrameReachesTheProcessTask(unittest.IsolatedAsyncioTestCase):
-    """A frame the bound served must not be flushed by the next system frame.
+    """A frame the bound served must not be flushed by the system frame queued behind it.
 
     Found by the load benchmark: a starved TranscriptionFrame was served, moved
     to the process queue, and the input task went straight on to a VAD turn
     start queued behind it, whose `broadcast_interruption()` reset the process
     queue before the process task ever ran. With strict priority a non-system
-    frame is only served when no system frame waits, so the input task always
-    yields to the process task first.
+    frame is only served when no system frame waits, so the process task always
+    runs before the next system frame. With the bound, the flush itself first
+    lets the process task take a bound-served frame still waiting for it.
     """
 
     def setUp(self):
         saved = FrameProcessorQueue.starvation_bound_secs
         self.addCleanup(setattr, FrameProcessorQueue, "starvation_bound_secs", saved)
 
-    async def _run(self) -> list[str]:
+    async def _run(self, flush: str) -> tuple[list[str], int]:
         from tests.test_processor_diagnostics import _setup_processor
 
         events: list[str] = []
 
         class TurnStartingProcessor(FrameProcessor):
             async def process_frame(self, frame: Frame, direction: FrameDirection):
+                if isinstance(frame, (UserSpeakingFrame, InterruptionFrame)):
+                    # How many frames the flush is about to hit.
+                    events.append(f"flush (queued={self.process_queue_depth})")
                 await super().process_frame(frame, direction)
                 if isinstance(frame, InputAudioRawFrame):
                     await asyncio.sleep(0.12)
                 elif isinstance(frame, UserSpeakingFrame):
-                    events.append("turn start")
                     await self.broadcast_interruption()
                 elif isinstance(frame, TextFrame):
                     events.append(frame.text)
@@ -495,19 +498,113 @@ class TestBoundServedFrameReachesTheProcessTask(unittest.IsolatedAsyncioTestCase
             await asyncio.sleep(0.01)
             # Both wait behind the slow audio frame; the text arrived first.
             await processor.queue_frame(TranscriptionFrame(text="hello", user_id="", timestamp=""))
-            await processor.queue_frame(UserSpeakingFrame())
+            # A turn start that broadcasts an interruption from the input task,
+            # or an InterruptionFrame arriving from a neighbour.
+            await processor.queue_frame(
+                UserSpeakingFrame() if flush == "broadcast" else InterruptionFrame()
+            )
             await asyncio.sleep(0.4)
+            bounded = processor.input_queue_bounded_serves
         finally:
             await processor.cleanup()
-        return events
+        return events, bounded
 
-    async def test_strict_priority_delivers_it_after_the_turn_start(self):
+    async def test_strict_priority_delivers_it_after_the_flush(self):
         FrameProcessorQueue.set_starvation_bound(0)
-        self.assertEqual(await self._run(), ["turn start", "hello"])
+        for flush in ("broadcast", "interruption_frame"):
+            events, bounded = await self._run(flush)
+            self.assertEqual(events, ["flush (queued=0)", "hello"], flush)
+            self.assertEqual(bounded, 0)
 
-    async def test_bound_delivers_it_before_the_turn_start_can_flush_it(self):
+    async def test_bound_served_frame_survives_a_broadcast_interruption(self):
         FrameProcessorQueue.set_starvation_bound(BOUND)
-        self.assertEqual(await self._run(), ["hello", "turn start"])
+        events, bounded = await self._run("broadcast")
+        # The text was already in the process queue when the turn start ran,
+        # and was still delivered.
+        self.assertEqual(bounded, 1)
+        self.assertEqual(events, ["flush (queued=1)", "hello"])
+
+    async def test_bound_served_frame_survives_an_interruption_frame(self):
+        FrameProcessorQueue.set_starvation_bound(BOUND)
+        events, bounded = await self._run("interruption_frame")
+        self.assertEqual(bounded, 1)
+        self.assertEqual(events, ["flush (queued=1)", "hello"])
+
+
+class TestAgedBacklogDrainsInBulk(unittest.IsolatedAsyncioTestCase):
+    """A processor that is only behind, not starved, must drain an aged backlog in bulk.
+
+    Found in review. Any processor held for longer than the bound (an
+    interruption waiting on its process task, a ParallelPipeline lifecycle
+    sync, `pause_processing_all_frames_until`) comes back to a backlog of aged
+    non-system frames interleaved with the input audio every processor after
+    the transport receives at 50fps. Yielding a loop iteration after every
+    bound-served frame capped that processor at one non-system frame per loop
+    iteration, where strict priority moves the whole backlog in one step. On a
+    loaded loop the cap is below the arrival rate: with ~20ms iterations and a
+    60/s non-system stream (LLM tokens, TTS audio) a single 300ms hold grew the
+    backlog to 238 frames and 4.0s of wait and never recovered, against 0.4s
+    to recover with strict priority (scratchpad review/drain_probe.py).
+    """
+
+    FRAMES = 50
+
+    def setUp(self):
+        saved = FrameProcessorQueue.starvation_bound_secs
+        self.addCleanup(setattr, FrameProcessorQueue, "starvation_bound_secs", saved)
+
+    async def _drain(self) -> tuple[int, list[str], int]:
+        from tests.test_processor_diagnostics import _setup_processor
+
+        release = asyncio.Event()
+        texts: list[str] = []
+
+        class HeldOnce(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, UserSpeakingFrame):
+                    await release.wait()
+                elif isinstance(frame, TextFrame):
+                    texts.append(frame.text)
+
+        processor = HeldOnce()
+        await _setup_processor(processor)
+        processor.push_frame = _discard_push  # type: ignore[method-assign]
+        try:
+            await processor.queue_frame(StartFrame())
+            await asyncio.sleep(0.05)
+            await processor.queue_frame(UserSpeakingFrame())
+            await asyncio.sleep(0.01)
+            for i in range(self.FRAMES):
+                await processor.queue_frame(_audio())
+                await processor.queue_frame(TextFrame(text=str(i)))
+            await asyncio.sleep(BOUND + 0.02)
+
+            release.set()
+            iterations = 0
+            while len(texts) < self.FRAMES and iterations < 10 * self.FRAMES:
+                await asyncio.sleep(0)
+                iterations += 1
+            bounded = processor.input_queue_bounded_serves
+        finally:
+            await processor.cleanup()
+        return iterations, texts, bounded
+
+    async def test_strict_priority_drains_the_backlog_in_one_step(self):
+        FrameProcessorQueue.set_starvation_bound(0)
+        iterations, texts, bounded = await self._drain()
+        self.assertEqual(texts, [str(i) for i in range(self.FRAMES)])
+        self.assertEqual(bounded, 0)
+        self.assertLessEqual(iterations, 5)
+
+    async def test_bound_drains_the_backlog_in_one_step_too(self):
+        FrameProcessorQueue.set_starvation_bound(BOUND)
+        iterations, texts, bounded = await self._drain()
+        self.assertEqual(texts, [str(i) for i in range(self.FRAMES)])
+        # Every text but the last was aged and older than the audio behind it...
+        self.assertEqual(bounded, self.FRAMES - 1)
+        # ...and moving them in arrival order costs no loop iterations.
+        self.assertLessEqual(iterations, 5)
 
 
 async def _discard_push(frame, direction=FrameDirection.DOWNSTREAM):

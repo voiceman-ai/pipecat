@@ -10,10 +10,12 @@
   has waited that long is no longer overtaken by system frames that arrived
   after it; system frames that arrived before it still go first, so nothing is
   reordered past arrival order and an `InterruptionFrame` still flushes the
-  frames queued before it. After moving such a frame to the process queue the
-  input task yields once, so a turn start queued behind it cannot flush it
-  before the process task runs. Unset or 0 (the default) keeps strict
-  priority.
+  frames queued before it. A process-queue flush (`broadcast_interruption()`,
+  an `InterruptionFrame`) first yields once when such a frame is still
+  waiting there, so a turn start queued behind it cannot drop it before the
+  process task runs; the input task itself never yields for the bound, so a
+  processor coming back to an aged backlog still moves it in one step. Unset
+  or 0 (the default) keeps strict priority.
   `INPUT_QUEUE_STARVATION_BOUND_RECOMMENDED_SECS` (80ms) is the value to use.
   The queue's storage moved from a heap to two FIFOs; with the bound off the
   order is identical.
