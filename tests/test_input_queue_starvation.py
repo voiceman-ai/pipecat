@@ -24,7 +24,10 @@ the real user aggregator.
 
 import asyncio
 import heapq
+import os
 import random
+import subprocess
+import sys
 import time
 import unittest
 
@@ -327,6 +330,29 @@ def test_bound_from_env(monkeypatch, raw, expected):
     else:
         monkeypatch.setenv("PIPECAT_INPUT_QUEUE_STARVATION_BOUND_MS", raw)
     assert _starvation_bound_from_env() == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw, expected", [(None, "0.0"), ("80", "0.08")])
+def test_env_bound_is_what_every_queue_starts_with(raw, expected):
+    """The deploy interface: the variable is read at import and is every queue's default.
+
+    Enabling the bound on a pod is only the env var (no api code), so a change
+    that stopped reading it at import would silently leave that pod on strict
+    priority. Checked in a fresh interpreter, where the import really happens.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "PIPECAT_INPUT_QUEUE_STARVATION_BOUND_MS"}
+    if raw is not None:
+        env["PIPECAT_INPUT_QUEUE_STARVATION_BOUND_MS"] = raw
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+    code = (
+        "from pipecat.processors.frame_processor import FrameProcessorQueue as Q\n"
+        "print(Q.starvation_bound_secs, Q().starvation_bound_secs)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[-2:] == [expected, expected]
 
 
 #
