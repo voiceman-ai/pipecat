@@ -13,7 +13,7 @@ management, parameter configuration, and audio analysis framework.
 
 import asyncio
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from enum import Enum
 
 from loguru import logger
@@ -121,6 +121,10 @@ class VADAnalyzer(ABC):
         # held in the pipeline's reference cycles. `shutdown()` releases it
         # deterministically at teardown.
         self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=1)
+        # The last analysis handed to the executor (see analyze_audio's
+        # partial-window fast path, which must not run beside it).
+        self._pending_analysis: Future | None = None
+        self._partial_window_fast_path = type(self)._run_analyzer is VADAnalyzer._run_analyzer
 
     @property
     def sample_rate(self) -> int:
@@ -223,9 +227,46 @@ class VADAnalyzer(ABC):
             # Shut down: the analyzer is torn down but audio is still arriving.
             # Report the last known state rather than raising into the pipeline.
             return self._vad_state
-        loop = asyncio.get_running_loop()
-        state = await loop.run_in_executor(executor, self._run_analyzer, buffer)
-        return state
+
+        # Partial-window fast path. A buffer that cannot complete one model
+        # window only gets appended: `_run_analyzer` returns the unchanged
+        # state before touching the model, the counters or the thresholds.
+        # Doing that append here instead of on the worker thread gives the
+        # identical state sequence and skips the thread hop, which is not free
+        # on a busy loop: the awaiting task only resumes one to two loop
+        # iterations after the worker finishes, and `LLMUserAggregator` pays
+        # that on every 20ms audio frame from its input task. On busy api pods
+        # (loop lag max 21-56ms per 15s) that per-frame cost is what let audio
+        # starve the aggregator's transcripts and heartbeats (see
+        # FrameProcessorQueue). With 20ms frames, 3 of every 8 frames cannot
+        # complete a window (160 samples against 256 at 8kHz, 320 against 512
+        # at 16kHz), so this removes 37.5% of the hops.
+        #
+        # Safe without a lock because every caller awaits `analyze_audio`
+        # sequentially per analyzer (VADController runs it inline on its
+        # processor's input task), and it is only taken when the previous
+        # analysis has finished: a cancelled await can leave its
+        # `_run_analyzer` still running on the worker, and appending beside it
+        # would race on `_vad_buffer`, so that case keeps the executor, which
+        # queues behind it in order. "Finished" means done and NOT cancelled:
+        # a second cancelled await can cancel its own analysis while it is
+        # still queued behind the first, and that future is done without ever
+        # having run, so it says nothing about the one still on the worker.
+        # A subclass that overrides `_run_analyzer` always keeps the executor.
+        num_required_bytes = getattr(self, "_vad_frames_num_bytes", None)
+        pending = self._pending_analysis
+        if (
+            self._partial_window_fast_path
+            and num_required_bytes is not None
+            and (pending is None or (pending.done() and not pending.cancelled()))
+            and len(self._vad_buffer) + len(buffer) < num_required_bytes
+        ):
+            self._vad_buffer += buffer
+            return self._vad_state
+
+        future = executor.submit(self._run_analyzer, buffer)
+        self._pending_analysis = future
+        return await asyncio.wrap_future(future)
 
     def shutdown(self) -> None:
         """Release the analyzer's worker thread. Idempotent.

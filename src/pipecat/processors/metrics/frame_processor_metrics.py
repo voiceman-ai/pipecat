@@ -114,6 +114,19 @@ class FrameProcessorMetrics(BaseObject):
             self._last_ttfb_time = 0
             self._should_report_ttfb = not report_only_initial_ttfb
 
+    async def reset_ttfb_metrics(self):
+        """Abandon an in-progress TTFB measurement without reporting it.
+
+        For a start that no longer has a matching stop: the next stop would
+        otherwise be measured against it. A collector created with
+        ``report_only_initial_ttfb`` still owes its initial measurement after a
+        reset, since the abandoned one was never reported.
+        """
+        if self._start_ttfb_time == 0:
+            return
+        self._start_ttfb_time = 0
+        self._should_report_ttfb = True
+
     async def stop_ttfb_metrics(self, *, end_time: float | None = None):
         """Stop TTFB measurement and generate metrics frame.
 

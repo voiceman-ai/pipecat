@@ -853,8 +853,12 @@ class PipelineWorker(BaseWorker):
         Returns:
             One dict per processor, in pipeline order, with keys
             ``processor``, ``depth``, ``input_queue_depth``,
+            ``input_queue_non_system_depth``, ``input_queue_non_system_wait``,
             ``process_queue_depth``, ``seconds_since_last_progress``,
-            ``processing_frame`` and ``paused``.
+            ``processing_frame`` and ``paused``. A processor holding
+            non-system frames in its input queue also logs
+            ``waiting=<count>/<age>s``, the age of the oldest one (see
+            :attr:`~pipecat.processors.frame_processor.FrameProcessor.input_queue_non_system_wait`).
         """
         entries: list[dict[str, Any]] = []
 
@@ -864,6 +868,8 @@ class PipelineWorker(BaseWorker):
                     "processor": processor.name,
                     "depth": depth,
                     "input_queue_depth": processor.input_queue_depth,
+                    "input_queue_non_system_depth": processor.input_queue_non_system_depth,
+                    "input_queue_non_system_wait": processor.input_queue_non_system_wait,
                     "process_queue_depth": processor.process_queue_depth,
                     "seconds_since_last_progress": processor.seconds_since_last_progress,
                     "processing_frame": processor.processing_frame_name,
@@ -880,6 +886,11 @@ class PipelineWorker(BaseWorker):
             age = e["seconds_since_last_progress"]
             age_str = f"{age:.1f}s ago" if age is not None else "never"
             extras = ""
+            if e["input_queue_non_system_wait"] is not None:
+                extras += (
+                    f" waiting={e['input_queue_non_system_depth']}"
+                    f"/{e['input_queue_non_system_wait']:.2f}s"
+                )
             if e["processing_frame"]:
                 extras += f" frame={e['processing_frame']}"
             if e["paused"]:
@@ -895,6 +906,57 @@ class PipelineWorker(BaseWorker):
         logger.warning(f"{self}: processor diagnostics dump{reason_str}:\n" + "\n".join(lines))
 
         return entries
+
+    def starved_processors(self, *, min_wait_secs: float = 1.0) -> list[dict[str, Any]]:
+        """Return the processors holding a non-system frame past ``min_wait_secs``.
+
+        The cheap, log-free counterpart of :meth:`dump_processor_diagnostics`
+        for an ``on_heartbeat_timeout`` handler. A heartbeat is a non-system
+        frame, so when one goes missing while system frames (audio, VAD) keep
+        flowing, the processor holding it shows up here with the age of the
+        oldest frame it has not served. That turns "heartbeat not received"
+        into "starved at <processor> for <n>s" in one log line, instead of a
+        stall the progress gate reads as healthy because system frames moved.
+
+        Read ``input_queue_depth`` against ``input_queue_non_system_depth`` to
+        tell the two causes apart: roughly equal means only non-system frames
+        are waiting (starved by system-frame priority); a much larger total
+        means the input task is behind on system frames too (a throughput
+        deficit).
+
+        Purely observational; walks the processors once and reads one clock
+        per processor.
+
+        Args:
+            min_wait_secs: Only report processors whose oldest waiting
+                non-system frame is at least this old.
+
+        Returns:
+            One dict per matching processor, oldest wait first, with keys
+            ``processor``, ``input_queue_non_system_wait``,
+            ``input_queue_non_system_depth``, ``input_queue_depth`` and
+            ``input_queue_bounded_serves``.
+        """
+        starved: list[dict[str, Any]] = []
+
+        def _collect(processor: FrameProcessor):
+            wait = processor.input_queue_non_system_wait
+            if wait is not None and wait >= min_wait_secs:
+                starved.append(
+                    {
+                        "processor": processor.name,
+                        "input_queue_non_system_wait": wait,
+                        "input_queue_non_system_depth": processor.input_queue_non_system_depth,
+                        "input_queue_depth": processor.input_queue_depth,
+                        "input_queue_bounded_serves": processor.input_queue_bounded_serves,
+                    }
+                )
+            for p in processor.processors:
+                _collect(p)
+
+        _collect(self._pipeline)
+        starved.sort(key=lambda e: e["input_queue_non_system_wait"], reverse=True)
+        return starved
 
     async def on_bus_message(self, message: BusMessage) -> None:
         """Handle outbound bus messages: TTS playback and RTVI UI translation.

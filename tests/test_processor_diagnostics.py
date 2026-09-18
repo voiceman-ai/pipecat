@@ -37,6 +37,7 @@ from pipecat.processors.filters.identity_filter import IdentityFilter
 from pipecat.processors.frame_processor import (
     FrameDirection,
     FrameProcessor,
+    FrameProcessorQueue,
     FrameProcessorSetup,
 )
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -80,6 +81,9 @@ async def test_fresh_processor_reports_no_progress_and_empty_queues():
     processor = IdentityFilter()
 
     assert processor.input_queue_depth == 0
+    assert processor.input_queue_non_system_depth == 0
+    assert processor.input_queue_non_system_wait is None
+    assert processor.input_queue_bounded_serves == 0
     assert processor.process_queue_depth == 0
     assert processor.seconds_since_last_progress is None
     assert processor.processing_frame_name is None
@@ -227,6 +231,8 @@ async def test_dump_processor_diagnostics_covers_every_processor_and_logs_once()
         "processor",
         "depth",
         "input_queue_depth",
+        "input_queue_non_system_depth",
+        "input_queue_non_system_wait",
         "process_queue_depth",
         "seconds_since_last_progress",
         "processing_frame",
@@ -261,3 +267,69 @@ async def test_dump_is_safe_before_the_pipeline_starts():
         assert entry["input_queue_depth"] == 0
         assert entry["process_queue_depth"] == 0
         assert entry["paused"] is False
+
+
+class StarvingProcessor(FrameProcessor):
+    """Serves each system frame slowly, so a stream of them starves everything else."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, UserStartedSpeakingFrame):
+            await asyncio.sleep(0.03)
+        await self.push_frame(frame, direction)
+
+
+@pytest.fixture
+def strict_priority():
+    """Pin strict system-frame priority, whatever PIPECAT_INPUT_QUEUE_STARVATION_BOUND_MS says."""
+    saved = FrameProcessorQueue.starvation_bound_secs
+    FrameProcessorQueue.set_starvation_bound(0)
+    yield
+    FrameProcessorQueue.starvation_bound_secs = saved
+
+
+@pytest.mark.asyncio
+async def test_non_system_wait_names_the_starved_processor(strict_priority):
+    """A heartbeat-timeout handler must be able to say who holds the frames, and for how long."""
+    starving = StarvingProcessor()
+    worker = PipelineWorker(
+        Pipeline([IdentityFilter(), starving, IdentityFilter()]),
+        cancel_on_idle_timeout=False,
+        enable_rtvi=False,
+    )
+    holder: dict = {}
+    captured_logs: list[str] = []
+    sink_id = logger.add(lambda message: captured_logs.append(str(message)), level="WARNING")
+
+    async def driver():
+        await asyncio.sleep(0.1)
+        await worker.queue_frame(UserStartedSpeakingFrame())
+        await worker.queue_frame(TextFrame(text="starved"))
+        # 30ms service against 20ms arrivals: a system frame is always waiting.
+        for _ in range(30):
+            await worker.queue_frame(UserStartedSpeakingFrame())
+            await asyncio.sleep(0.02)
+        holder["starved"] = worker.starved_processors(min_wait_secs=0.3)
+        holder["entries"] = worker.dump_processor_diagnostics(reason="hb_timeout")
+        holder["wait"] = starving.input_queue_non_system_wait
+        holder["non_system_depth"] = starving.input_queue_non_system_depth
+        await worker.queue_frame(EndFrame())
+
+    runner = WorkerRunner()
+    await runner.add_workers(worker)
+    try:
+        await asyncio.gather(runner.run(), driver())
+    finally:
+        logger.remove(sink_id)
+
+    assert holder["wait"] is not None and holder["wait"] >= 0.3
+    assert holder["non_system_depth"] == 1
+    starved = holder["starved"]
+    assert [e["processor"] for e in starved] == [starving.name], starved
+    assert starved[0]["input_queue_non_system_wait"] >= 0.3
+    assert starved[0]["input_queue_depth"] > starved[0]["input_queue_non_system_depth"]
+
+    entry = next(e for e in holder["entries"] if e["processor"] == starving.name)
+    assert entry["input_queue_non_system_depth"] == 1
+    dump = next(m for m in captured_logs if "processor diagnostics dump" in m)
+    assert f"{starving.name}: in=" in dump and "waiting=1/" in dump
