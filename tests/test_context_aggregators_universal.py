@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import io
 import json
 import unittest
@@ -15,6 +16,7 @@ from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    EndFrame,
     FunctionCallFromLLM,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
@@ -66,7 +68,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
     UserTurnStoppedMessage,
 )
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.turns.user_mute import (
     FirstSpeechUserMuteStrategy,
@@ -909,16 +911,30 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         )
 
         events: list[str] = []
+        inference_triggered = asyncio.Event()
+        turn_stopped = asyncio.Event()
 
         @user_aggregator.event_handler("on_user_turn_inference_triggered")
         async def on_inference_triggered(aggregator, strategy):
             events.append("inference_triggered")
+            inference_triggered.set()
 
         @user_aggregator.event_handler("on_user_turn_stopped")
         async def on_stopped(aggregator, strategy, message):
             events.append("stopped")
+            turn_stopped.set()
 
-        pipeline = Pipeline([user_aggregator])
+        class CompletionBarrier(FrameProcessor):
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, UserTurnInferenceCompletedFrame):
+                    await asyncio.wait_for(inference_triggered.wait(), timeout=5)
+                    assert events == ["inference_triggered"]
+                elif isinstance(frame, EndFrame):
+                    await asyncio.wait_for(turn_stopped.wait(), timeout=5)
+                await self.push_frame(frame, direction)
+
+        pipeline = Pipeline([CompletionBarrier(), user_aggregator])
 
         # Drive the pipeline. Inference fires after the upstream
         # strategy's timeout. Stop fires only when UserTurnInferenceCompletedFrame
@@ -928,12 +944,11 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             TranscriptionFrame(text="Hi", user_id="", timestamp="now"),
             SleepFrame(),
             VADUserStoppedSpeakingFrame(),
-            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
-            # At this point inference_triggered should have fired but NOT stopped.
+            # Wait for the observed inference event before delivering completion.
             UserTurnInferenceCompletedFrame(),
             SleepFrame(),
         ]
-        await run_test(pipeline, frames_to_send=frames_to_send)
+        await asyncio.wait_for(run_test(pipeline, frames_to_send=frames_to_send), timeout=10)
 
         self.assertEqual(events, ["inference_triggered", "stopped"])
 
