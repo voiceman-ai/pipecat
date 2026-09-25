@@ -1986,13 +1986,22 @@ class LLMFullResponseStartFrame(ControlFrame):
 
 @dataclass
 class LLMFullResponseEndFrame(ControlFrame):
-    """Frame indicating the end of an LLM response."""
+    """Frame indicating the end of an LLM response.
+
+    ``deferred_function_calls`` names the function calls this response made
+    that the LLM service DEFERRED until the bot stops speaking (text + a tool
+    call in one response). Their FunctionCallsStartedFrame arrives only after
+    the audio, i.e. after this frame, so a processor that must know at the end
+    of the response whether the turn called a function reads it here.
+    """
 
     skip_tts: bool | None = field(init=False)
+    deferred_function_calls: list | None = field(init=False)
 
     def __post_init__(self):
         super().__post_init__()
         self.skip_tts = None
+        self.deferred_function_calls = None
 
 
 @dataclass

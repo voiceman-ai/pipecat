@@ -2040,6 +2040,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 await self.push_error(error_msg=f"Error during completion: {e}", exception=e)
             finally:
                 await self.stop_processing_metrics()
-                await self.push_frame(LLMFullResponseEndFrame())
+                end_frame = LLMFullResponseEndFrame()
+                if self._pending_function_calls:
+                    end_frame.deferred_function_calls = [
+                        fc.function_name for fc in self._pending_function_calls
+                    ]
+                await self.push_frame(end_frame)
         else:
             await self.push_frame(frame, direction)
