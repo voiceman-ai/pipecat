@@ -373,6 +373,11 @@ class TTSService(AIService):
         # correct PTS to TTSStoppedFrame and LLMFullResponseEndFrame.
         self._word_last_pts: int = 0
         self._llm_response_started: bool = False
+        # Text of a response an interruption cancelled must never be spoken (see
+        # _is_interrupted_response_text). Set by every InterruptionFrame; cleared
+        # only by an LLMFullResponseStartFrame created AFTER that interruption.
+        self._discard_interrupted_text: bool = False
+        self._last_interruption_frame_id: int = -1
         # LLMFullResponseEndFrames received in process_frame, keyed by the turn's
         # context_id, held so each can be re-pushed (with corrected PTS) at end of
         # its context instead of creating a new one. Reusing the original frame
@@ -793,12 +798,18 @@ class TTSService(AIService):
             and not isinstance(frame, InterimTranscriptionFrame)
             and not isinstance(frame, TranscriptionFrame)
         ):
+            if self._is_interrupted_response_text(frame):
+                return
             await self.start_text_aggregation_metrics()
             await self._process_text_frame(frame)
         elif isinstance(frame, InterruptionFrame):
+            self._discard_interrupted_text = True
+            self._last_interruption_frame_id = frame.id
             await self._handle_interruption(frame, direction)
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMFullResponseStartFrame):
+            if frame.id > self._last_interruption_frame_id:
+                self._discard_interrupted_text = False
             self._llm_response_started = True
             # New LLM turn → assign a fresh context ID shared by all sentences
             self._turn_context_id = self.create_context_id()
@@ -1269,6 +1280,35 @@ class TTSService(AIService):
         logger.warning(msg)
         await self.resume_processing_frames()
         await self.push_error(msg)
+
+    def _is_interrupted_response_text(self, frame: TextFrame) -> bool:
+        """Whether ``frame`` is text of a response an interruption already cancelled.
+
+        An ``InterruptionFrame`` is a system frame, so it overtakes the data frames
+        still waiting in this service's input queue — and an interruption only
+        clears the process queue. Two kinds of frame are routinely in that position
+        when a caller resumes speaking: the few tokens the LLM streamed just before
+        it was cancelled (or text an upstream filter flushed on the interruption),
+        and the ``LLMFullResponseEndFrame`` the cancelled LLM still pushes from its
+        ``finally``. They are processed AFTER ``_handle_interruption`` reset
+        everything, the end frame flushes the tokens, and the caller hears a
+        fragment of a reply the interruption was meant to cancel — prod run
+        11408662 played «הבנ» over a caller who had resumed 230 ms earlier, and a
+        fragment left waiting in the aggregator is glued onto the next reply
+        instead («לאאני מבינה.», run 11406240).
+
+        So every interruption starts discarding text, and only a response that
+        STARTED after it stops that: frame ids come from one global counter, and a
+        start frame created before the interruption (cancelled in the same moment,
+        overtaken in the same queue) belongs to the cancelled response. A
+        ``TTSSpeakFrame`` is its own utterance and is never affected.
+        """
+        if not self._discard_interrupted_text:
+            return False
+        logger.debug(
+            f"{self}: dropping text of a response an interruption cancelled: {frame.text!r}"
+        )
+        return True
 
     async def _process_text_frame(self, frame: TextFrame):
         async for aggregate in self._text_aggregator.aggregate(frame.text):
