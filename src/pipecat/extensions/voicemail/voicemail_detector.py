@@ -16,6 +16,8 @@ Note:
 """
 
 import asyncio
+import time
+from collections.abc import Callable
 
 from loguru import logger
 
@@ -343,6 +345,36 @@ def classify_verdict(full_response: str) -> str | None:
     return None
 
 
+def backed_verdict(
+    verdict: str | None,
+    heard: str,
+    voicemail_evidence: Callable[[str], bool] | None,
+) -> tuple[str | None, bool]:
+    """Hold a parsed verdict to an evidence check.
+
+    A "voicemail" verdict on text the check turns down becomes "conversation";
+    every other verdict, a missing check, and a check that raises leave the
+    verdict as it is. Offline evals use this function so they decide what
+    production decides.
+
+    Args:
+        verdict: The parsed verdict (see :func:`classify_verdict`).
+        heard: The text the verdict was given on.
+        voicemail_evidence: The check, or None.
+
+    Returns:
+        The verdict to act on, and whether the check overruled the LLM.
+    """
+    if verdict != "voicemail" or voicemail_evidence is None:
+        return verdict, False
+    try:
+        backed = bool(voicemail_evidence(heard))
+    except Exception as e:  # noqa: BLE001 - a broken check never blocks a verdict
+        logger.warning(f"voicemail evidence check failed ({e})")
+        return verdict, False
+    return ("voicemail", False) if backed else ("conversation", True)
+
+
 class ClassificationProcessor(FrameProcessor):
     """Processor that handles LLM classification responses and triggers events.
 
@@ -364,6 +396,8 @@ class ClassificationProcessor(FrameProcessor):
         gate_notifier: BaseNotifier,
         conversation_notifier: BaseNotifier,
         voicemail_notifier: BaseNotifier,
+        context: LLMContext | None = None,
+        voicemail_evidence: Callable[[str], bool] | None = None,
     ):
         """Initialize the voicemail processor.
 
@@ -374,11 +408,23 @@ class ClassificationProcessor(FrameProcessor):
                 all gated TTS frames for normal conversation flow.
             voicemail_notifier: Notifier to signal the TTSGate to clear
                 gated TTS frames since voicemail was detected.
+            context: The classifier's LLM context — the source of the text a
+                verdict was given on, for ``voicemail_evidence`` and the
+                decision record.
+            voicemail_evidence: Optional check that the classified text holds
+                something only a recording says. A VOICEMAIL verdict on text it
+                rejects becomes CONVERSATION. If it raises, the LLM's verdict
+                stands.
         """
         super().__init__()
         self._gate_notifier = gate_notifier
         self._conversation_notifier = conversation_notifier
         self._voicemail_notifier = voicemail_notifier
+        self._context = context
+        self._voicemail_evidence = voicemail_evidence
+        self._started_at: float | None = None
+        # What was decided, on what text, and when: None until a decision.
+        self.decision: dict | None = None
 
         # Register the conversation and voicemail detected events
         self._register_event_handler("on_conversation_detected")
@@ -402,6 +448,9 @@ class ClassificationProcessor(FrameProcessor):
             direction: The direction of frame flow in the pipeline.
         """
         await super().process_frame(frame, direction)
+
+        if isinstance(frame, StartFrame):
+            self._started_at = time.monotonic()
 
         if isinstance(frame, LLMFullResponseStartFrame):
             # Begin aggregating a new LLM response
@@ -440,6 +489,22 @@ class ClassificationProcessor(FrameProcessor):
         verdict = classify_verdict(full_response)
         logger.debug(f"{self}: Classifying response: '{full_response}'")
 
+        heard = self._heard_text()
+        verdict, overruled = backed_verdict(verdict, heard, self._voicemail_evidence)
+        if overruled:
+            logger.info(f"{self}: VOICEMAIL overruled, no recorded-system cue in {heard!r}")
+        if verdict is not None:
+            self.decision = {
+                "verdict": verdict,
+                "overruled": overruled,
+                "heard": heard,
+                "at_s": (
+                    round(time.monotonic() - self._started_at, 2)
+                    if self._started_at is not None
+                    else None
+                ),
+            }
+
         if verdict == "conversation":
             # Human answered - continue normal conversation flow
             self._decision_made = True
@@ -464,6 +529,28 @@ class ClassificationProcessor(FrameProcessor):
         else:
             # This can happen if the LLM is interrupted before completing the response
             logger.debug(f"{self}: No classification found: '{full_response}'")
+
+    def _heard_text(self) -> str:
+        """Every user message in the classifier's context, joined.
+
+        This is the text the verdict was given on.
+        """
+        if self._context is None:
+            return ""
+        parts: list[str] = []
+        for message in self._context.get_messages():
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                parts.extend(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+        return " ".join(p.strip() for p in parts if p and p.strip())
 
 
 class TTSGate(FrameProcessor):
@@ -772,6 +859,7 @@ DECISION RULES:
         llm: LLMService,
         custom_system_prompt: str | None = None,
         long_speech_timeout: float | None = None,
+        voicemail_evidence: Callable[[str], bool] | None = None,
     ):
         """Initialize the voicemail detector with classification and buffering components.
 
@@ -788,6 +876,11 @@ DECISION RULES:
                 voicemail greetings without waiting for the caller to stop speaking.
                 Requires ``eager_eot_threshold`` on Deepgram Flux for interim
                 transcripts. Defaults to None (disabled).
+            voicemail_evidence: Optional check run on the classified text when
+                the LLM answers VOICEMAIL. Text it rejects is treated as a
+                CONVERSATION, so a call is ended only on text that holds
+                something a recording says. Defaults to None (the LLM's verdict
+                stands).
         """
         self._classifier_llm = llm
         self._prompt = (
@@ -852,6 +945,8 @@ DECISION RULES:
             gate_notifier=self._gate_notifier,
             conversation_notifier=self._conversation_notifier,
             voicemail_notifier=self._voicemail_notifier,
+            context=self._context,
+            voicemail_evidence=voicemail_evidence,
         )
         self._voicemail_gate = TTSGate(self._conversation_notifier, self._voicemail_notifier)
         self._llm_gate = LLMGate(self._conversation_notifier, self._voicemail_notifier)
@@ -945,6 +1040,22 @@ DECISION RULES:
             The LLMGate processor instance.
         """
         return self._llm_gate
+
+    def decision_record(self) -> dict | None:
+        """What the classifier decided, on what text, and how.
+
+        Returns:
+            None until a decision. Otherwise ``verdict`` ("voicemail" or
+            "conversation"), ``overruled`` (the LLM said VOICEMAIL and the
+            evidence check turned it down), ``heard`` (the classified text),
+            ``at_s`` (seconds from the pipeline start) and ``early`` (the
+            long-speech timer forced the decision before the first turn ended).
+        """
+        decision = self._classification_processor.decision
+        if decision is None:
+            return None
+        monitor = self._first_turn_speech_monitor
+        return {**decision, "early": bool(monitor is not None and monitor._triggered)}
 
     def add_event_handler(self, event_name: str, handler):
         """Add an event handler for voicemail detection events.
