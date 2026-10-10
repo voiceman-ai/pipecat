@@ -41,6 +41,7 @@ from pipecat.bus.ui.messages import (
 from pipecat.clocks.base_clock import BaseClock
 from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
+    InputAudioRawFrame,
     BotSpeakingFrame,
     CancelFrame,
     CancelWorkerFrame,
@@ -106,6 +107,9 @@ class IdleFrameObserver(BaseObserver):
     set it means the pipeline is probably idle.
 
     """
+
+    # Never reads the caller's raw audio: skip its ~50 frames/s per hop.
+    ignored_frame_types = (InputAudioRawFrame,)
 
     def __init__(self, *, idle_event: asyncio.Event, idle_timeout_frames: tuple[type[Frame], ...]):
         """Initialize the observer.

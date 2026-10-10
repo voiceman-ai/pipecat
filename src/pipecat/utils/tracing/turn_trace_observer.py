@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 from opentelemetry.context import Context
 
-from pipecat.frames.frames import StartFrame
+from pipecat.frames.frames import InputAudioRawFrame, StartFrame
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
@@ -45,6 +45,9 @@ class TurnTraceObserver(BaseObserver):
     If conversation tracing is enabled, turns become children of a
     conversation span that encapsulates the entire session.
     """
+
+    # Never reads the caller's raw audio: skip its ~50 frames/s per hop.
+    ignored_frame_types = (InputAudioRawFrame,)
 
     def __init__(
         self,

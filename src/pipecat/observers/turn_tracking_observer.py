@@ -16,6 +16,7 @@ from collections import deque
 from loguru import logger
 
 from pipecat.frames.frames import (
+    InputAudioRawFrame,
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
@@ -42,6 +43,9 @@ class TurnTrackingObserver(BaseObserver):
       - The user starts speaking again
       - A timeout period elapses with no more bot speech
     """
+
+    # Never reads the caller's raw audio: skip its ~50 frames/s per hop.
+    ignored_frame_types = (InputAudioRawFrame,)
 
     def __init__(self, max_frames=100, turn_end_timeout_secs=2.5, **kwargs):
         """Initialize the turn tracking observer.
