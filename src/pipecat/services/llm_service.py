@@ -724,7 +724,12 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             await self.push_frame(LLMTextFrame(text))
 
     async def _handle_interruptions(self, _: InterruptionFrame):
-        for function_name, entry in self._functions.items():
+        # Over a snapshot: the loop awaits, and while it does a node transition
+        # (un)registers functions on this same dict. Iterating it live raised
+        # "dictionary changed size during iteration" on a barge-in, which the
+        # app treats as a pipeline error and ends the call (voice-platform
+        # campaigns 105/107: 10 live calls).
+        for function_name, entry in list(self._functions.items()):
             if entry.cancel_on_interruption:
                 await self._cancel_function_call(function_name)
 
@@ -1647,7 +1652,9 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         """
         cancelled_tasks = set()
         cancelled_items = []
-        for task, runner_item in self._function_call_tasks.items():
+        # Over a snapshot: the body awaits, and a call that finishes meanwhile
+        # removes itself from this dict (_function_call_task_finished).
+        for task, runner_item in list(self._function_call_tasks.items()):
             if runner_item.tool_call_id == tool_call_id:
                 name = runner_item.function_name
                 tool_call_id = runner_item.tool_call_id
@@ -1685,7 +1692,8 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
     async def _cancel_function_call(self, function_name: str | None):
         cancelled_tasks = set()
         cancelled_items = []
-        for task, runner_item in self._function_call_tasks.items():
+        # Over a snapshot, for the same reason as the loop above.
+        for task, runner_item in list(self._function_call_tasks.items()):
             if runner_item.registry_item.function_name == function_name:
                 name = runner_item.function_name
                 tool_call_id = runner_item.tool_call_id
