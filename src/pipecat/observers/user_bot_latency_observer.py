@@ -18,6 +18,7 @@ from collections import deque
 from pydantic import BaseModel, Field
 
 from pipecat.frames.frames import (
+    InputAudioRawFrame,
     BotStartedSpeakingFrame,
     ClientConnectedFrame,
     FunctionCallInProgressFrame,
@@ -167,6 +168,9 @@ class UserBotLatencyObserver(BaseObserver):
             ``ClientConnectedFrame``. Measures the time from client connection
             to the first bot speech.
     """
+
+    # Never reads the caller's raw audio: skip its ~50 frames/s per hop.
+    ignored_frame_types = (InputAudioRawFrame,)
 
     def __init__(self, *, max_frames=100, **kwargs):
         """Initialize the user-bot latency observer.

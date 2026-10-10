@@ -74,7 +74,25 @@ class BaseObserver(BaseObject):
     needing to inject processors into the pipeline structure. This enables
     non-intrusive monitoring capabilities such as frame logging, debugging,
     performance analysis, and analytics collection.
+
+    Two class attributes let the worker skip work an observer never wanted
+    (see ``WorkerObserver``). Every frame hop between processors raises one
+    push and one process event, and the caller's raw audio alone is ~50 frames
+    a second through every processor — on a phone call that is thousands of
+    events a second per observer, each queued to its own task.
+
+    Attributes:
+        ignored_frame_types: Frame types this observer never looks at. The
+            worker does not hand it events for them. Leave empty (the default)
+            to see every frame.
+        inline_dispatch: Call this observer directly instead of through its own
+            queue and task. Only for observers whose handlers are a few
+            compares and stores and never await anything slow: they run on the
+            pipeline's own path.
     """
+
+    ignored_frame_types: tuple = ()
+    inline_dispatch: bool = False
 
     async def on_process_frame(self, data: FrameProcessed):
         """Handle the event when a frame is being processed by a processor.

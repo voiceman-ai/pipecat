@@ -933,7 +933,7 @@ class FrameProcessor(BaseObject):
             frame: The frame to process.
             direction: The direction of frame flow.
         """
-        if self._observer:
+        if self._observer and getattr(self._observer, "wants_process_events", True):
             timestamp = self._clock.get_time() if self._clock else 0
             data = FrameProcessed(
                 processor=self,
