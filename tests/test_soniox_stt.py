@@ -525,3 +525,43 @@ async def test_receive_messages_allows_final_transcription_without_language(monk
     assert final_frames[0].language is None
     assert final_frames[0].finalized is True
     assert traced_transcriptions == [("Tell me a joke.", True, None)]
+
+
+@pytest.mark.asyncio
+async def test_error_message_without_tokens_key_is_reported(monkeypatch):
+    events = []
+    service = _instrumented_service(monkeypatch, events)
+
+    async def fake_push_error(*args, error_msg="", **kwargs):
+        events.append(("error", error_msg))
+
+    monkeypatch.setattr(service, "push_error", fake_push_error)
+
+    messages = [json.dumps({"error_code": 402, "error_message": "insufficient balance"})]
+    service._websocket = _FakeWebsocket(messages)
+
+    await service._receive_messages()
+
+    assert ("error", "Error: 402 (_receive_messages) - insufficient balance") in events
+
+
+@pytest.mark.asyncio
+async def test_finalize_ack_hook_fires_on_fin_token(monkeypatch):
+    events = []
+    service = _instrumented_service(monkeypatch, events)
+    acks = []
+
+    async def fake_ack():
+        acks.append(True)
+
+    monkeypatch.setattr(service, "_on_finalize_ack", fake_ack)
+
+    messages = [
+        json.dumps({"tokens": [{"text": "<fin>", "is_final": True}]}),
+        json.dumps({"tokens": [{"text": "hi", "is_final": False}]}),
+    ]
+    service._websocket = _FakeWebsocket(messages)
+
+    await service._receive_messages()
+
+    assert acks == [True]
