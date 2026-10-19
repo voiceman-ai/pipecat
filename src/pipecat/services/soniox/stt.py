@@ -549,6 +549,14 @@ class SonioxSTTService(WebsocketSTTService):
                 await self._websocket.send(FINALIZE_MESSAGE)
                 logger.debug(f"Triggered finalize event on: {frame.name=}, {direction=}")
 
+    async def _on_finalize_ack(self):
+        """Called when the server acknowledges a finalize request with ``<fin>``.
+
+        Fires even when the acknowledgement carries no transcript. Subclasses
+        override it to observe finalize round-trips.
+        """
+        pass
+
     async def _send_stop_recording(self):
         """Send stop recording message to Soniox."""
         if self._websocket and self._websocket.state is State.OPEN:
@@ -705,7 +713,8 @@ class SonioxSTTService(WebsocketSTTService):
             try:
                 content = json.loads(message)
 
-                tokens = content["tokens"]
+                # Error and "finished" messages may carry no ``tokens`` key.
+                tokens = content.get("tokens") or []
 
                 if tokens:
                     if len(tokens) == 1 and tokens[0]["text"] == FINALIZED_TOKEN:
@@ -752,6 +761,9 @@ class SonioxSTTService(WebsocketSTTService):
                             result=self._final_transcription_buffer + non_final_transcription,
                         )
                     )
+
+                if any(token["text"] == FINALIZED_TOKEN for token in tokens):
+                    await self._on_finalize_ack()
 
                 error_code = content.get("error_code")
                 error_message = content.get("error_message")
