@@ -152,9 +152,8 @@ async def test_twenty_ms_frames_skip_three_hops_in_eight(sample_rate):
 @pytest.mark.asyncio
 async def test_real_silero_matches_with_and_without_the_fast_path(monkeypatch):
     silero = pytest.importorskip("pipecat.audio.vad.silero")
-    # The model resets its recurrent state on a wall clock; pin it so both runs
-    # see the same resets however slow the host is.
-    monkeypatch.setattr(silero, "_MODEL_RESET_STATES_TIME", 1e9)
+    # Model resets are counted in windows of audio, not wall clock, so both
+    # runs see the same resets however slow the host is.
 
     class SileroEveryCall(silero.SileroVADAnalyzer):
         def _run_analyzer(self, buffer: bytes) -> VADState:

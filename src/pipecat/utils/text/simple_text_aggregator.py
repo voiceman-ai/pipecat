@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator
 from loguru import logger
 
 from pipecat.utils.string import SENTENCE_ENDING_PUNCTUATION, match_endofsentence
-from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType, BaseTextAggregator
+from pipecat.utils.text.base_text_aggregator import Aggregation, BaseTextAggregator, TextType
 
 # Minimum characters before a sentence boundary is allowed to END a chunk.
 # Below this we keep accumulating (merging consecutive short sentences) so the TTS
@@ -120,7 +120,8 @@ class SimpleTextAggregator(BaseTextAggregator):
             first_chunk_immediate: When True, the FIRST chunk of a turn fires on its
                 first sentence boundary for low latency (subsequent sentences still
                 merge). Set False to merge the first chunk too (one synthesis/turn).
-            **kwargs: Additional arguments passed to BaseTextAggregator (e.g. aggregation_type).
+            **kwargs: Additional arguments passed to BaseTextAggregator (e.g.
+                aggregation_type, language).
         """
         super().__init__(**kwargs)
         self._text = ""
@@ -136,14 +137,14 @@ class SimpleTextAggregator(BaseTextAggregator):
         Returns:
             The text that has been accumulated in the buffer.
         """
-        return Aggregation(text=self._text.strip(" "), type=AggregationType.SENTENCE)
+        return Aggregation(text=self._text.strip(" "), type=TextType.SENTENCE)
 
     async def aggregate(self, text: str) -> AsyncIterator[Aggregation]:
         """Aggregate text and yield completed aggregations.
 
         In SENTENCE mode, processes the input text character-by-character. When
         sentence-ending punctuation is detected, it waits for non-whitespace
-        lookahead before calling NLTK.
+        lookahead before calling sentencex.
 
         In TOKEN mode, yields the text immediately without buffering.
 
@@ -153,17 +154,17 @@ class SimpleTextAggregator(BaseTextAggregator):
         Yields:
             Aggregation objects (sentences in SENTENCE mode, tokens in TOKEN mode).
         """
-        if self._aggregation_type == AggregationType.TOKEN:
+        if self._aggregation_type == TextType.TOKEN:
             if text:
-                yield Aggregation(text=text, type=AggregationType.TOKEN)
+                yield Aggregation(text=text, type=TextType.TOKEN)
             return
 
         # 1a. Collapse runs of dots (".." / "..." ellipsis) to a single period so
         #     the TTS gets a clean sentence end instead of an odd trailing-off pause.
         text = re.sub(r"\.{2,}", ".", text)
 
-        # 1b. Normalise missing spaces after sentence-ending punctuation so NLTK
-        #     can detect boundaries in Hebrew and other scripts that omit spaces.
+        # 1b. Normalise missing spaces after sentence-ending punctuation so the
+        #     tokenizer can detect boundaries in Hebrew and other scripts that omit spaces.
         text = _MISSING_SPACE_RE.sub(r"\1 \2", text)
 
         # 2. Treat newlines as hard sentence separators (LLMs frequently emit
@@ -208,7 +209,7 @@ class SimpleTextAggregator(BaseTextAggregator):
                 if phrase and any(c.isalpha() or c.isdigit() for c in phrase):
                     self._text = ""
                     self._emitted_since_reset = True
-                    yield Aggregation(text=phrase, type=AggregationType.SENTENCE)
+                    yield Aggregation(text=phrase, type=TextType.SENTENCE)
                     continue
 
             # Long sentence handling: past _MAX_PHRASE_CHARS with no sentence
@@ -228,7 +229,7 @@ class SimpleTextAggregator(BaseTextAggregator):
                             f"aggregator: long-sentence split at pos={split_pos} "
                             f"(buffer was {len(phrase) + len(self._text)} chars): {phrase!r}"
                         )
-                        yield Aggregation(text=phrase, type=AggregationType.SENTENCE)
+                        yield Aggregation(text=phrase, type=TextType.SENTENCE)
 
     def _find_phrase_split(self, allow_space: bool = False) -> int:
         """Find a position to split a long buffer at a natural pause.
@@ -257,7 +258,9 @@ class SimpleTextAggregator(BaseTextAggregator):
                 return last_space + 1
         return 0
 
-    async def _check_sentence_with_lookahead(self, char: str) -> Aggregation | None:
+    async def _check_sentence_with_lookahead(
+        self, char: str, *, protected_end: int = 0
+    ) -> Aggregation | None:
         """Check for sentence boundaries using lookahead logic.
 
         When sentence-ending punctuation is detected we wait for the first
@@ -268,12 +271,17 @@ class SimpleTextAggregator(BaseTextAggregator):
            omit the trailing space.
 
         2. **Space gap** (punct then spaces then lookahead, e.g. ``"End. Next"``):
-           Ask NLTK to disambiguate (handles ``"Mr. Smith"`` → not a boundary).
-           If NLTK is unsure but the lookahead char is non-ASCII (non-Latin),
-           treat it as a boundary anyway (Latin abbreviations don't apply).
+           Ask the sentence tokenizer to disambiguate (handles ``"Mr. Smith"``
+           → not a boundary). If it is unsure but the lookahead char is
+           non-ASCII (non-Latin), treat it as a boundary anyway (Latin
+           abbreviations don't apply).
 
         Args:
             char: The most recently added character (used for lookahead check).
+            protected_end: Buffer offset before which no sentence boundary is
+                accepted. Subclasses pass the end of the last closed tag or
+                pattern, so punctuation inside it (``<spell>St. Louis</spell>``)
+                never splits the text.
 
         Returns:
             Aggregation if a sentence boundary is confirmed, else None.
@@ -294,6 +302,8 @@ class SimpleTextAggregator(BaseTextAggregator):
 
             if last_punct_idx == -1:
                 return None  # No punctuation found (shouldn't happen)
+            if last_punct_idx < protected_end:
+                return None  # Punctuation inside a kept tag/pattern
 
             # Text between the triggering punctuation and the current lookahead
             # char. Because _needs_lookahead fires on the *first* non-space char,
@@ -313,11 +323,22 @@ class SimpleTextAggregator(BaseTextAggregator):
                     # Definite sentence boundary (e.g. Hebrew "מצוין.ת", "נתניהו!הוא")
                     eos_marker = last_punct_idx + 1
             else:
-                # Space(s) between punct and next char: let NLTK disambiguate.
-                eos_marker = match_endofsentence(self._text)
+                # Space(s) between punct and next char: let the tokenizer
+                # disambiguate. Punctuation inside a kept tag/pattern is blanked
+                # out with equal-width spaces, so offsets still refer to _text.
+                candidate_text = self._text
+                if protected_end:
+                    candidate_text = (
+                        "".join(
+                            " " if c in SENTENCE_ENDING_PUNCTUATION else c
+                            for c in candidate_text[:protected_end]
+                        )
+                        + candidate_text[protected_end:]
+                    )
+                eos_marker = match_endofsentence(candidate_text, language=self.language)
 
                 if eos_marker == 0 and not char.isascii():
-                    # NLTK couldn't confirm, but the next char is non-Latin
+                    # The tokenizer couldn't confirm, but the next char is non-Latin
                     # (Hebrew, Arabic, etc.) — definitely a new sentence because
                     # those scripts don't use Latin-style abbreviations with ".".
                     eos_marker = last_punct_idx + 1
@@ -358,7 +379,7 @@ class SimpleTextAggregator(BaseTextAggregator):
                         f"aggregator: yielding chunk ({len(result)} chars, "
                         f"has_space_gap={has_space_gap}): {result!r}"
                     )
-                    return Aggregation(text=result, type=AggregationType.SENTENCE)
+                    return Aggregation(text=result, type=TextType.SENTENCE)
                 else:
                     logger.debug(f"aggregator: skipped punct-only fragment: {result!r}")
 
@@ -386,7 +407,7 @@ class SimpleTextAggregator(BaseTextAggregator):
                 result = _clean_sentence(candidate)
                 if result and any(c.isalpha() or c.isdigit() for c in result):
                     self._text = ""
-                    return Aggregation(text=result, type=AggregationType.SENTENCE)
+                    return Aggregation(text=result, type=TextType.SENTENCE)
 
         # Check if we just added sentence-ending punctuation
         if self._text and self._text[-1] in _ALL_ENDERS_SET:
@@ -404,14 +425,14 @@ class SimpleTextAggregator(BaseTextAggregator):
         Returns:
             Any remaining text as a sentence, or None if buffer is empty or in TOKEN mode.
         """
-        if self._aggregation_type == AggregationType.TOKEN:
+        if self._aggregation_type == TextType.TOKEN:
             return None
 
         if self._text:
             result = _clean_sentence(self._text)
             await self.reset()
             logger.debug(f"aggregator: flush remaining ({len(result)} chars): {result!r}")
-            return Aggregation(text=result, type=AggregationType.SENTENCE)
+            return Aggregation(text=result, type=TextType.SENTENCE)
         return None
 
     async def handle_interruption(self):

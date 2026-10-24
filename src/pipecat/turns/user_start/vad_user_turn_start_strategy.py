@@ -107,8 +107,8 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
         # Cleared when the bot stops, hence re-armed on the next utterance.
         self._holding_utterance = False
 
-    async def reset(self):
-        """Reset the strategy to its initial state.
+    async def handle_user_turn_started(self):
+        """Reset the strategy when a user turn starts.
 
         Only the pending deferral is cleared. ``_bot_speaking`` and the
         per-utterance hold deliberately survive a reset: the controller resets
@@ -119,7 +119,7 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
         ``min_words = 1``. Only Bot{Started,Stopped}SpeakingFrame may move that
         state.
         """
-        await super().reset()
+        await super().handle_user_turn_started()
         self._deferred_at = None
         self._debounce_at = None
 

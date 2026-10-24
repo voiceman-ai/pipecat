@@ -1,7 +1,6 @@
 """Speaches STT Service — uses the OpenAI-compatible /v1/audio/transcriptions endpoint."""
 
 from dataclasses import dataclass
-from typing import Optional
 
 from pipecat.services.openai.stt import OpenAISTTService, OpenAISTTSettings
 
@@ -22,6 +21,9 @@ class SpeachesSTTService(OpenAISTTService):
     """
 
     Settings = SpeachesSTTSettings
+    # Not OpenAI: without a key the OpenAI client would fall back to
+    # OPENAI_API_KEY and send it to this provider.
+    _requires_api_key = True
 
     def __init__(
         self,

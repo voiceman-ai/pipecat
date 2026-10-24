@@ -16,9 +16,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from pipecat.adapters.schemas.direct_function import DirectFunction
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.adapters.llm.schemas.direct_function import DirectFunction
+from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
+from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
 from pipecat.processors.aggregators.llm_context import LLMContext
 
 #
@@ -26,7 +26,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 #
 
 # Grok supports configurable sample rates for PCM audio
-SUPPORTED_SAMPLE_RATES = Literal[8000, 16000, 21050, 24000, 32000, 44100, 48000]
+SUPPORTED_SAMPLE_RATES = Literal[8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000]
 
 
 class AudioFormat(BaseModel):
@@ -38,7 +38,7 @@ class AudioFormat(BaseModel):
 class PCMAudioFormat(AudioFormat):
     """PCM audio format configuration with configurable sample rate.
 
-    Grok supports: 8000, 16000, 21050, 24000, 32000, 44100, 48000 Hz
+    Grok supports: 8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000 Hz
 
     Parameters:
         type: Audio format type, always "audio/pcm".
@@ -1138,11 +1138,12 @@ _server_event_types = {
 }
 
 
-def parse_server_event(data: str):
-    """Parse a server event from JSON string.
+def parse_server_event(data: str | bytes):
+    """Parse a server event from JSON.
 
     Args:
-        data: JSON string containing the server event.
+        data: JSON text containing the server event, as delivered by the
+            websocket.
 
     Returns:
         Parsed server event object of the appropriate type.

@@ -17,10 +17,36 @@ from typing import cast
 import numpy as np
 from loguru import logger
 
-from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams
+from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams, VADState
 
-# How often should we reset internal model state
-_MODEL_RESET_STATES_TIME = 5.0
+# Model state resets.
+#
+# The model carries a recurrent state from one window to the next. Non-speech
+# shifts that state so the model under-reports the speech that follows: music
+# strongly at either sample rate, and long silence or noise strongly at 8kHz
+# and slightly at 16kHz. A reset clears it.
+#
+# Seconds of audio between resets. After non-speech that suppresses detection,
+# speech is detected again within about one interval. A shorter interval
+# recovers sooner but puts more resets just ahead of speech, where the model
+# occasionally confirms speech a few hundred milliseconds late.
+_MODEL_RESET_INTERVAL_SECS = 2.0
+# A due reset waits for clear non-speech: the VAD must be quiet and this many
+# consecutive windows (about 160 ms) must score below this confidence. One low
+# window can be a dip inside a word or the soft start of one; a run of them
+# can't. The threshold sits far below the VAD's speech threshold, so borderline
+# windows never count.
+_MODEL_RESET_MAX_CONFIDENCE = 0.1
+_MODEL_RESET_LOW_CONFIDENCE_WINDOWS = 5
+
+# Fork: the bundled models, by name. "v6.2" is upstream's model and the
+# default. "v6" is the model this fork ran before the 1.14 sync, kept so an
+# application can stay on it; it runs with the reset schedule it was tuned
+# with, every _LEGACY_MODEL_RESET_SECS of audio whatever the audio is. v6.2
+# scores quiet and far-field voices higher, so on the same thresholds it
+# reports noticeably more speech.
+_MODEL_FILES = {"v6.2": "silero_vad.onnx", "v6": "silero_vad_v6.onnx"}
+_LEGACY_MODEL_RESET_SECS = 5.0
 
 # Consecutive analysis failures after which the analyzer is declared
 # permanently degraded. VAD runs at ~50 frames/second per leg, so this is
@@ -143,22 +169,41 @@ class SileroVADAnalyzer(VADAnalyzer):
     """Voice Activity Detection analyzer using the Silero VAD model.
 
     Implements VAD analysis using the pre-trained Silero ONNX model for
-    accurate voice activity detection. Supports 8kHz and 16kHz sample rates
-    with automatic model state management and periodic resets.
+    accurate voice activity detection. Supports 8kHz and 16kHz sample rates.
+
+    The model's recurrent state is reset about every two seconds of audio, but
+    only during clear non-speech. Non-speech such as music, or long silence at
+    8kHz, leaves the state unable to detect the speech that follows until it is
+    reset. A reset during speech makes the model briefly lose confidence, which
+    can end the user's speech early, so a due reset waits until the user is
+    quiet.
     """
 
-    def __init__(self, *, sample_rate: int | None = None, params: VADParams | None = None):
+    def __init__(
+        self,
+        *,
+        sample_rate: int | None = None,
+        params: VADParams | None = None,
+        model: str = "v6.2",
+    ):
         """Initialize the Silero VAD analyzer.
 
         Args:
             sample_rate: Audio sample rate (8000 or 16000 Hz). If None, will be set later.
             params: VAD parameters for detection thresholds and timing.
+            model: Which bundled Silero model to run (fork): ``"v6.2"`` (the
+                default) or ``"v6"``, the earlier model with its own reset
+                schedule (every five seconds of audio, speech or not).
         """
         super().__init__(sample_rate=sample_rate, params=params)
 
-        logger.debug("Loading Silero VAD model...")
+        if model not in _MODEL_FILES:
+            raise ValueError(f"Unknown Silero VAD model {model!r}: use one of {list(_MODEL_FILES)}")
+        self._model_version = model
 
-        model_name = "silero_vad.onnx"
+        logger.debug(f"Loading Silero VAD model ({model})...")
+
+        model_name = _MODEL_FILES[model]
         package_path = "pipecat.audio.vad.data"
 
         try:
@@ -176,7 +221,10 @@ class SileroVADAnalyzer(VADAnalyzer):
 
         self._model = SileroOnnxModel(model_file_path, force_onnx_cpu=True)
 
-        self._last_reset_time = 0
+        # Windows scored since the model was last reset, and how many of the
+        # most recent windows in a row scored below _MODEL_RESET_MAX_CONFIDENCE.
+        self._windows_since_reset = 0
+        self._low_confidence_windows = 0
 
         # Analysis-failure accounting. A failure returns 0 confidence, which is
         # indistinguishable from real silence, so a persistent fault presents as
@@ -237,15 +285,8 @@ class SileroVADAnalyzer(VADAnalyzer):
             audio_int16 = np.frombuffer(buffer, np.int16)
             # Divide by 32768 because we have signed 16-bit data.
             audio_float32 = audio_int16.astype(np.float32) / 32768.0
-            new_confidence = self._model(audio_float32, self.sample_rate)[0]
-
-            # We need to reset the model from time to time because it doesn't
-            # really need all the data and memory will keep growing otherwise.
-            curr_time = time.time()
-            diff_time = curr_time - self._last_reset_time
-            if diff_time >= _MODEL_RESET_STATES_TIME:
-                self._model.reset_states()
-                self._last_reset_time = curr_time
+            confidence = self._model(audio_float32, self.sample_rate)[0]
+            self._maybe_reset_model(confidence.item())
 
             if self._consecutive_errors:
                 if self._degraded_reported:
@@ -257,7 +298,7 @@ class SileroVADAnalyzer(VADAnalyzer):
                 self._last_error_message = ""
                 self._degraded_reported = False
 
-            return new_confidence
+            return confidence
         except Exception as e:
             # This comes from an empty audio array
             self._report_analysis_error(e)
@@ -286,3 +327,48 @@ class SileroVADAnalyzer(VADAnalyzer):
                 f"failed analyses at {self.sample_rate} Hz — voice confidence is pinned at 0, "
                 f"so this leg will read as silent. Last error: {message}"
             )
+
+    def _maybe_reset_model(self, confidence: float):
+        """Reset the model's state once a reset is due and the user is quiet.
+
+        Called after each window is scored, so a reset takes effect from the
+        next window. A reset clears the model's recurrent state and the audio
+        context it prepends to each window; the VAD's own state is untouched.
+
+        A reset becomes due after ``_MODEL_RESET_INTERVAL_SECS`` of audio, and
+        happens on the first window after that where the user is quiet and the
+        recent windows are clearly non-speech. ``_vad_state`` is still the
+        state from before this window, since the caller updates it from the
+        confidence returned here. In practice a reset follows soon after the
+        user stops speaking, and recurs every interval during non-speech.
+
+        Time is counted in windows of audio rather than by the wall clock, so
+        where resets land depends only on the audio.
+
+        Args:
+            confidence: The model's speech confidence for the window just scored.
+        """
+        self._windows_since_reset += 1
+        if self._model_version == "v6":
+            # The schedule v6 ran with: a reset every few seconds of audio,
+            # whatever the audio is.
+            if (
+                self._windows_since_reset * self.num_frames_required()
+                >= _LEGACY_MODEL_RESET_SECS * self.sample_rate
+            ):
+                self._model.reset_states()
+                self._windows_since_reset = 0
+            return
+        if confidence < _MODEL_RESET_MAX_CONFIDENCE:
+            self._low_confidence_windows += 1
+        else:
+            self._low_confidence_windows = 0
+
+        if (
+            self._windows_since_reset * self.num_frames_required()
+            >= _MODEL_RESET_INTERVAL_SECS * self.sample_rate
+            and self._vad_state == VADState.QUIET
+            and self._low_confidence_windows >= _MODEL_RESET_LOW_CONFIDENCE_WINDOWS
+        ):
+            self._model.reset_states()
+            self._windows_since_reset = 0

@@ -18,7 +18,6 @@ import dataclasses
 import os
 import time
 import traceback
-import warnings
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -44,13 +43,20 @@ from pipecat.frames.frames import (
     StartFrame,
     SystemFrame,
     TTSAudioRawFrame,
-    UninterruptibleFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage, MetricsData, STTUsage
 from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FramePushed
 from pipecat.processors.metrics.frame_processor_metrics import FrameProcessorMetrics
 from pipecat.utils.asyncio.task_manager import BaseTaskManager
 from pipecat.utils.base_object import BaseObject
+from pipecat.utils.deprecation import deprecated, warn_deprecated
+from pipecat.utils.errors import ErrorCategory, classify_http_exception
+from pipecat.utils.frame_queue import FrameQueue
+
+if TYPE_CHECKING:
+    from pipecat.pipeline.worker import PipelineWorker
+    from pipecat.utils.tracing.tracing_context import TracingContext
+    from pipecat.workers.runner import WorkerRunner
 
 # Frame-push tracing is opt-in: the logger.trace() calls on the per-frame push
 # path run twice per frame hop (thousands of times per second per live
@@ -58,11 +64,6 @@ from pipecat.utils.base_object import BaseObject
 # level is filtered out. Set PIPECAT_TRACE_FRAMES=1 (with a TRACE-level sink)
 # to enable them.
 _TRACE_FRAMES = os.getenv("PIPECAT_TRACE_FRAMES", "").lower() in ("1", "true", "yes")
-from pipecat.utils.deprecation import deprecated
-from pipecat.utils.frame_queue import FrameQueue
-
-if TYPE_CHECKING:
-    from pipecat.pipeline.worker import PipelineWorker
 
 
 class FrameDirection(Enum):
@@ -85,13 +86,18 @@ class FrameProcessorSetup:
     """Configuration parameters for frame processor initialization.
 
     Parameters:
+        audio_in_sample_rate: Input audio sample rate in Hz.
+        audio_out_sample_rate: Output audio sample rate in Hz.
         clock: The clock instance for timing operations.
-        task_manager: The task manager for handling async operations.
-        pipeline_worker: The :class:`PipelineWorker` running this pipeline. Stored
+        enable_metrics: Whether to enable performance metrics collection.
+        enable_tracing: Whether to enable OpenTelemetry tracing.
+        enable_usage_metrics: Whether to enable usage metrics collection.
+        pipeline_worker: The :class:`~pipecat.pipeline.worker.PipelineWorker` running this pipeline. Stored
             on each processor as ``self.pipeline_worker`` so processors can
             reach task-scoped state (e.g. ``self.pipeline_worker.app_resources``).
         observer: Optional observer for monitoring frame processing events.
-        tool_resources: Deprecated. :class:`PipelineWorker` continues to populate
+        task_manager: The task manager for handling async operations.
+        tool_resources: Deprecated. :class:`~pipecat.pipeline.worker.PipelineWorker` continues to populate
             this with ``app_resources`` so that custom :class:`FrameProcessor`
             subclasses whose ``setup()`` overrides read ``setup.tool_resources``
             keep working. New code should read
@@ -100,12 +106,21 @@ class FrameProcessorSetup:
             .. deprecated:: 1.2.0
                 Read ``setup.pipeline_worker.app_resources`` instead. Will be
                 removed in 2.0.0.
+        tracing_context: Pipeline-scoped tracing context for span hierarchy.
     """
 
     clock: BaseClock
     task_manager: BaseTaskManager
     pipeline_worker: PipelineWorker
+    audio_in_sample_rate: int = 16000
+    audio_out_sample_rate: int = 24000
+    enable_metrics: bool = False
+    enable_tracing: bool = False
+    enable_usage_metrics: bool = False
     observer: BaseObserver | None = None
+    report_only_initial_ttfb: bool = False
+    tracing_context: TracingContext | None = None
+    # Deprecated fields
     tool_resources: Any = None
 
     def __getattribute__(self, name: str) -> Any:
@@ -115,14 +130,11 @@ class FrameProcessorSetup:
         if name == "tool_resources":
             value = object.__getattribute__(self, "tool_resources")
             if value is not None:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("always")
-                    warnings.warn(
-                        "`FrameProcessorSetup.tool_resources` is deprecated since 1.2.0; "
-                        "read `setup.pipeline_worker.app_resources` instead.",
-                        DeprecationWarning,
-                        stacklevel=2,
-                    )
+                warn_deprecated(
+                    "`FrameProcessorSetup.tool_resources` is deprecated since 1.2.0 and will "
+                    "be removed in 2.0.0. Use `setup.pipeline_worker.app_resources` instead.",
+                    stacklevel=2,
+                )
             return value
         return object.__getattribute__(self, name)
 
@@ -157,13 +169,12 @@ def _starvation_bound_from_env() -> float:
 
 
 class FrameProcessorQueue(asyncio.Queue):
-    """A priority queue for systems frames and other frames.
+    """A priority queue for the frames arriving at a frame processor.
 
-    This is a specialized queue for frame processors that separates and
-    prioritizes system frames over other frames: a `SystemFrame` is returned
-    before any non-system frame, and each class keeps its own FIFO order.
-    Items are ``(frame, direction, callback)`` tuples; anything whose first
-    element is not a `SystemFrame` is non-system.
+    Frames are dequeued in three tiers: the `StartFrame` first, then
+    `SystemFrame`, then data and control frames. Frames of the same tier keep
+    their arrival order. Items are ``(frame, direction, callback)`` tuples;
+    anything whose first element is not a `SystemFrame` is non-system.
 
     Bounded starvation (opt-in). Strict priority starves non-system frames for
     as long as a system frame is always waiting at the next ``get()``. On a
@@ -220,8 +231,9 @@ class FrameProcessorQueue(asyncio.Queue):
     use and why.
     """
 
-    HIGH_PRIORITY = 1
-    LOW_PRIORITY = 2
+    START_PRIORITY = 1
+    SYSTEM_PRIORITY = 10
+    DEFAULT_PRIORITY = 20
 
     #: Seconds a non-system item may be overtaken by newer system frames
     #: before it regains its arrival-order place. 0 disables the bound
@@ -249,26 +261,34 @@ class FrameProcessorQueue(asyncio.Queue):
         """
         cls.starvation_bound_secs = max(0.0, seconds or 0.0)
 
-    # asyncio.Queue storage hooks. Two FIFOs replace the (priority, counter)
-    # heap: popping the system FIFO first is the same order the heap gave,
-    # and the non-system FIFO carries each item's enqueue time so the
-    # starvation bound and the wait diagnostics can read the head's age.
+    # asyncio.Queue storage hooks. One FIFO per tier replaces a (priority,
+    # counter) heap: popping the start FIFO, then the system FIFO, first is
+    # the same order the heap gives, and the non-system FIFO carries each
+    # item's enqueue time so the starvation bound and the wait diagnostics can
+    # read the head's age.
 
     def _init(self, maxsize):
         self._seq = 0
+        self._start_items: deque[Any] = deque()
         self._system_items: deque[tuple[int, Any]] = deque()
         self._non_system_items: deque[tuple[int, float, Any]] = deque()
 
     def _put(self, item: tuple[Frame, FrameDirection, FrameCallback | None]):
         frame, _, _ = item
         self._seq += 1
-        if isinstance(frame, SystemFrame):
+        if isinstance(frame, StartFrame):
+            self._start_items.append(item)
+        elif isinstance(frame, SystemFrame):
             self._system_items.append((self._seq, item))
         else:
             self._non_system_items.append((self._seq, time.monotonic(), item))
 
     def _get(self) -> Any:
         self._last_get_bounded = False
+        # The StartFrame outranks every other frame, aged ones included: a
+        # processor drops whatever it is handed before it has started.
+        if self._start_items:
+            return self._start_items.popleft()
         system_items = self._system_items
         non_system_items = self._non_system_items
         if not non_system_items:
@@ -289,11 +309,11 @@ class FrameProcessorQueue(asyncio.Queue):
 
     def qsize(self) -> int:
         """Number of items (system and non-system) in the queue."""
-        return len(self._system_items) + len(self._non_system_items)
+        return len(self._start_items) + len(self._system_items) + len(self._non_system_items)
 
     def empty(self) -> bool:
         """Return True if the queue holds no items."""
-        return not self._system_items and not self._non_system_items
+        return not self._start_items and not self._system_items and not self._non_system_items
 
     @property
     def non_system_qsize(self) -> int:
@@ -376,6 +396,14 @@ class FrameProcessor(BaseObject):
     - on_before_push_frame: Called before a frame is pushed
     - on_after_push_frame: Called after a frame is pushed
     - on_error: Called when an error is raised in the frame processing.
+    - on_usable_changed: Called with the new value of `is_usable` when the
+      processor stops or starts being able to do its job.
+
+    Example::
+
+        @processor.event_handler("on_usable_changed")
+        async def on_usable_changed(processor, is_usable):
+            ...
     """
 
     def __init__(
@@ -401,23 +429,8 @@ class FrameProcessor(BaseObject):
         # Enable direct mode to skip queues and process frames right away.
         self._enable_direct_mode = enable_direct_mode
 
-        # Clock
-        self._clock: BaseClock | None = None
-
-        # Observer
-        self._observer: BaseObserver | None = None
-
-        # Pipeline Task. Populated by ``setup()``; accessing the
-        # ``pipeline_worker`` property before setup raises.
-        self._pipeline_worker: PipelineWorker | None = None  # set in setup()
-
-        # Other properties
-        self._enable_metrics = False
-        self._enable_usage_metrics = False
-        self._report_only_initial_ttfb = False
-
-        # Indicates whether we have received the StartFrame.
-        self.__started = False
+        # Processor setup
+        self._setup: FrameProcessorSetup | None = None
 
         # Cancellation is done through CancelFrame (a system frame). This could
         # cause other events being triggered (e.g. closing a transport) which
@@ -451,6 +464,12 @@ class FrameProcessor(BaseObject):
         # Watches the readiness condition passed to
         # pause_processing_all_frames_until() and lifts the pause it took.
         self.__pause_watcher_task: asyncio.Task | None = None
+        # Clear while a pipeline is setting this processor up. The StartFrame
+        # is held until it is set, so a processor never starts before its own
+        # setup is done, while the ones ahead of it in the pipeline can.
+        self.__setup_done = asyncio.Event()
+        self.__setup_done.set()
+        self.__start_received = False
 
         # The process task processes non-system frames.  Non-system frames will
         # be processed as soon as they are received by the processing task
@@ -482,12 +501,17 @@ class FrameProcessor(BaseObject):
         # operation.
         self.__orphaned_process_tasks: set[asyncio.Task] = set()
 
+        # Whether this processor can still do its job. Flipped by the errors it
+        # reports, so it is already up to date by the time an error travels.
+        self._is_usable = True
+
         # Frame processor events.
         self._register_event_handler("on_before_process_frame", sync=True)
         self._register_event_handler("on_after_process_frame", sync=True)
         self._register_event_handler("on_before_push_frame", sync=True)
         self._register_event_handler("on_after_push_frame", sync=True)
         self._register_event_handler("on_error", sync=True)
+        self._register_event_handler("on_usable_changed")
 
     @property
     def id(self) -> int:
@@ -506,6 +530,44 @@ class FrameProcessor(BaseObject):
             The name of this processor instance.
         """
         return self._name
+
+    @property
+    def is_usable(self) -> bool:
+        """Whether this processor can still do its job.
+
+        A processor stays usable through failures it might recover from, and
+        becomes unusable once its work can no longer succeed: a provider has
+        rejected its API key, model or voice, or it has failed enough times to
+        stop trying. Sending it more work would only produce more of the same
+        error, so services stop accepting work and stop reconnecting once this
+        is False.
+
+        Errors set this as they are reported, so an error handler reading
+        ``frame.processor.is_usable`` sees the verdict that came with the error
+        it is handling.
+
+        Returns:
+            True while the processor can still be given work.
+        """
+        return self._is_usable
+
+    async def set_usable(self, is_usable: bool):
+        """Set whether this processor can be given work.
+
+        Call this to bring back a processor that became unusable, once
+        whatever stopped it working has been dealt with — new credentials, or
+        a provider that has come back up. Services also do this for themselves
+        when their settings change, since new settings may be the fix.
+
+        Args:
+            is_usable: Whether the processor can be given work.
+        """
+        if is_usable == self._is_usable:
+            return
+
+        self._is_usable = is_usable
+        logger.debug(f"{self}: {'usable' if is_usable else 'no longer usable'}")
+        await self._call_event_handler("on_usable_changed", is_usable)
 
     @property
     def processors(self) -> list[FrameProcessor]:
@@ -552,46 +614,67 @@ class FrameProcessor(BaseObject):
         return self._prev
 
     @property
-    def metrics_enabled(self):
+    def processor_setup(self) -> FrameProcessorSetup:
+        """Get the configuration this processor was set up with.
+
+        Returns:
+            The :class:`FrameProcessorSetup` given to :meth:`setup`.
+        """
+        if not self._setup:
+            raise Exception(f"{self} is still not set up.")
+        return self._setup
+
+    @property
+    def metrics_enabled(self) -> bool:
         """Check if metrics collection is enabled.
 
         Returns:
             True if metrics collection is enabled.
         """
-        return self._enable_metrics
+        return bool(self._setup and self._setup.enable_metrics)
 
     @property
-    def usage_metrics_enabled(self):
+    def usage_metrics_enabled(self) -> bool:
         """Check if usage metrics collection is enabled.
 
         Returns:
             True if usage metrics collection is enabled.
         """
-        return self._enable_usage_metrics
+        return bool(self._setup and self._setup.enable_usage_metrics)
 
     @property
-    def report_only_initial_ttfb(self):
+    def report_only_initial_ttfb(self) -> bool:
         """Check if only initial TTFB should be reported.
 
         Returns:
             True if only initial time-to-first-byte should be reported.
         """
-        return self._report_only_initial_ttfb
+        return bool(self._setup and self._setup.report_only_initial_ttfb)
 
     @property
     def pipeline_worker(self) -> PipelineWorker:
-        """Get the :class:`PipelineWorker` this processor is running in.
+        """Get the :class:`~pipecat.pipeline.worker.PipelineWorker` this processor is running in.
 
         Provides access to worker-scoped state from inside a processor — most
         notably ``self.pipeline_worker.app_resources`` for the application's
         shared bag of resources (DB handles, clients, feature flags, etc.).
 
         Returns:
-            The :class:`PipelineWorker` instance that set up this processor.
+            The :class:`~pipecat.pipeline.worker.PipelineWorker` instance that set up this processor.
         """
-        if not self._pipeline_worker:
-            raise Exception(f"{self} pipeline worker is still not set.")
-        return self._pipeline_worker
+        return self.processor_setup.pipeline_worker
+
+    @property
+    def worker_runner(self) -> WorkerRunner:
+        """Get the :class:`~pipecat.workers.runner.WorkerRunner` hosting this processor's worker.
+
+        Use it to reach another worker on the runner by name, e.g.
+        ``self.worker_runner.get_worker("ui-jobs")``.
+
+        Returns:
+            The runner this processor's :class:`~pipecat.pipeline.worker.PipelineWorker` is attached to.
+        """
+        return self.pipeline_worker.worker_runner
 
     @property
     @deprecated(
@@ -604,7 +687,7 @@ class FrameProcessor(BaseObject):
         .. deprecated:: 1.3.0
             Use :attr:`pipeline_worker` instead. Will be removed in 2.0.0.
         """
-        return self.pipeline_worker
+        return self.processor_setup.pipeline_worker
 
     def processors_with_metrics(self):
         """Return processors that can generate metrics.
@@ -642,12 +725,13 @@ class FrameProcessor(BaseObject):
         """
         if self.can_generate_metrics() and self.metrics_enabled:
             await self._metrics.start_ttfb_metrics(
-                start_time=start_time, report_only_initial_ttfb=self._report_only_initial_ttfb
+                start_time=start_time, report_only_initial_ttfb=self.report_only_initial_ttfb
             )
 
-    async def reset_ttfb_metrics(self):
-        """Abandon an in-progress time-to-first-byte measurement without reporting it."""
-        await self._metrics.reset_ttfb_metrics()
+    async def cancel_ttfb_metrics(self):
+        """Abandon the current time-to-first-byte measurement without reporting it."""
+        if self.can_generate_metrics() and self.metrics_enabled:
+            await self._metrics.cancel_ttfb_metrics()
 
     async def stop_ttfb_metrics(self, *, end_time: float | None = None):
         """Stop time-to-first-byte metrics collection and push results.
@@ -678,6 +762,18 @@ class FrameProcessor(BaseObject):
             )
             if metrics_frame:
                 await self.push_frame(metrics_frame)
+
+    async def stop_ttfat_metrics(self, *, end_time: float | None = None):
+        """Stop time-to-first-answer-token metrics collection and push results.
+
+        Args:
+            end_time: Optional timestamp to use as the end time. If None, uses
+                the current time.
+        """
+        if self.can_generate_metrics() and self.metrics_enabled:
+            frame = await self._metrics.stop_ttfat_metrics(end_time=end_time)
+            if frame:
+                await self.push_frame(frame)
 
     async def start_processing_metrics(self, *, start_time: float | None = None):
         """Start processing metrics collection.
@@ -755,26 +851,42 @@ class FrameProcessor(BaseObject):
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the processor with required components.
 
+        This is where a processor connects and does its other slow start-up
+        work, so that the pipeline pays for the slowest processor rather than
+        all of them: a pipeline sets its processors up concurrently, so this
+        runs alongside every other processor's. A resource shared with another
+        processor therefore needs guarding, which
+        :func:`~pipecat.utils.shared.acquires` does.
+
         Args:
             setup: Configuration object containing setup parameters.
         """
         await super().setup(setup.task_manager)
-        self._clock = setup.clock
-        self._observer = setup.observer
-        self._pipeline_worker = setup.pipeline_worker
-
-        # Create processing tasks.
-        self.__create_input_task()
+        self._setup = setup
 
         if self._metrics is not None:
             await self._metrics.setup(self.task_manager)
+
+    def _setup_started(self):
+        """Hold the StartFrame until :meth:`_setup_finished` is called.
+
+        Called by the pipeline before setting this processor up.
+        """
+        self.__setup_done.clear()
+
+    def _setup_finished(self):
+        """Let this processor start, once its own setup() has returned."""
+        self.__setup_done.set()
+        self.__maybe_create_input_task()
 
     async def cleanup(self):
         """Release this processor's resources at teardown.
 
         This base implementation cancels only the processor's internal
         input/process tasks; tasks created via :meth:`create_task` are released
-        by an override.
+        by an override. Like :meth:`setup`, this runs concurrently with every
+        other processor's, so a resource shared with another processor is
+        released with :func:`~pipecat.utils.shared.releases`.
         """
         await super().cleanup()
         await self.__cancel_pause_watcher()
@@ -802,9 +914,7 @@ class FrameProcessor(BaseObject):
         Raises:
             Exception: If the clock is not initialized.
         """
-        if not self._clock:
-            raise Exception(f"{self} Clock is still not initialized.")
-        return self._clock
+        return self.processor_setup.clock
 
     def get_event_loop(self) -> asyncio.AbstractEventLoop:
         """Get the event loop used by this processor.
@@ -832,9 +942,20 @@ class FrameProcessor(BaseObject):
             return
 
         if self._enable_direct_mode:
+            if isinstance(frame, StartFrame):
+                await self.__setup_done.wait()
             await self.__process_frame(frame, direction, callback)
-        else:
-            await self.__input_queue.put((frame, direction, callback))
+            return
+
+        await self.__input_queue.put((frame, direction, callback))
+
+        # Nothing drains the queue until the StartFrame arrives and this
+        # processor is set up, so a processor never acts on a frame before it
+        # has been started. Frames pushed before that simply wait, and the
+        # StartFrame is dequeued ahead of them.
+        if isinstance(frame, StartFrame):
+            self.__start_received = True
+            self.__maybe_create_input_task()
 
     async def pause_processing_frames(self):
         """Pause processing of queued frames."""
@@ -933,15 +1054,17 @@ class FrameProcessor(BaseObject):
             frame: The frame to process.
             direction: The direction of frame flow.
         """
-        if self._observer and getattr(self._observer, "wants_process_events", True):
-            timestamp = self._clock.get_time() if self._clock else 0
+        observer = self._setup.observer if self._setup else None
+        # A worker whose observers all ignore process events says so, and then
+        # the event is not even built (see WorkerObserver.wants_process_events).
+        if observer and getattr(observer, "wants_process_events", True):
             data = FrameProcessed(
                 processor=self,
                 frame=frame,
                 direction=direction,
-                timestamp=timestamp,
+                timestamp=self.get_clock().get_time(),
             )
-            await self._observer.on_process_frame(data)
+            await observer.on_process_frame(data)
 
         if isinstance(frame, StartFrame):
             await self.__start(frame)
@@ -955,11 +1078,28 @@ class FrameProcessor(BaseObject):
         elif isinstance(frame, (FrameProcessorResumeFrame, FrameProcessorResumeUrgentFrame)):
             await self.__resume(frame)
 
+    def _classify_error(self, exception: Exception) -> ErrorCategory | None:
+        """Classify an exception this processor knows the shape of.
+
+        Override for providers that signal failures through SDK-specific
+        exceptions rather than an HTTP status code, or whose credentials can be
+        rejected for reasons a reconnection would clear.
+
+        Args:
+            exception: The exception to classify.
+
+        Returns:
+            The category, or None to fall back to :func:`classify_http_exception`.
+        """
+        return None
+
     async def push_error(
         self,
         error_msg: str,
         exception: Exception | None = None,
         fatal: bool = False,
+        category: ErrorCategory | None = None,
+        force_treat_as_permanent: bool = False,
     ):
         """Creates and pushes an ErrorFrame upstream.
 
@@ -975,34 +1115,116 @@ class FrameProcessor(BaseObject):
                 Fatal errors typically cause the entire pipeline to stop processing.
                 Defaults to False for non-fatal errors.
 
+                .. deprecated:: 1.8.0
+                    Use ``force_treat_as_permanent=True`` instead, when the
+                    error leaves its originating processor unable to do its
+                    job: the pipeline worker then applies its
+                    :class:`ProcessorUnusablePolicy`, of which ``CANCEL``
+                    matches what ``fatal=True`` did. For an error that isn't
+                    about that processor's state, push an
+                    :class:`EndWorkerFrame` after the error to end the pipeline.
+                    Will be removed in 2.0.0.
+
+            category: Why the error occurred, when the caller knows. Leave it
+                unset to let the category be worked out from the exception, or
+                pass `ErrorCategory.UNKNOWN` to report an error whose cause
+                can't be attributed — an unexpected one caught by a broad
+                ``except``, say, which may not have come from this processor at
+                all.
+            force_treat_as_permanent: Whether to treat this error as one that will
+                keep recurring, leaving the processor unable to do any more
+                work — having failed too many times to keep trying, say. Only
+                needed for a failure the category doesn't already convey:
+                leaving it False doesn't keep the processor usable, since a
+                permanent category costs it its usability on its own. Either way
+                the processor stops being given work, and the pipeline worker
+                decides what to do about it through its
+                :class:`ProcessorUnusablePolicy`: report the error and keep
+                running (the default), end the pipeline, or cancel it.
+
         Example::
 
             ```python
-            # Non-fatal error
+            # An error this processor can recover from
             await self.push_error("Failed to process audio chunk, skipping")
 
-            # Fatal error with exception context
+            # An error that leaves this processor unable to do any more work
             try:
                 result = some_critical_operation()
             except Exception as e:
-                await self.push_error("Critical operation failed", exception=e, fatal=True)
+                await self.push_error(
+                    "Critical operation failed", exception=e, force_treat_as_permanent=True
+                )
             ```
         """
-        error_frame = ErrorFrame(error=error_msg, fatal=fatal, exception=exception, processor=self)
-        await self.push_error_frame(error=error_frame)
+        if fatal:
+            warn_deprecated(
+                "`push_error(fatal=True)` is deprecated since 1.8.0 and will be removed "
+                "in 2.0.0. Use `force_treat_as_permanent=True` or an `EndWorkerFrame` "
+                "instead. If the error leaves its originating processor unable to do its "
+                "job, `force_treat_as_permanent=True` marks the processor unusable, and the "
+                "PipelineWorker acts on it according to its "
+                "`processor_unusable_policy` (`ProcessorUnusablePolicy.CANCEL` does what "
+                "`fatal=True` did). Otherwise, drop `fatal` and push an "
+                "`EndWorkerFrame` after the error to end the pipeline.",
+                stacklevel=2,
+            )
 
-    async def push_error_frame(self, error: ErrorFrame):
+        error_frame = ErrorFrame(
+            error=error_msg,
+            exception=exception,
+            processor=self,
+            category=category,
+        )
+        # Set after construction so the frame doesn't warn about the deprecated
+        # flag on top of the warning already reported above.
+        error_frame.fatal = fatal
+
+        # Subclasses may override `push_error_frame` with its original
+        # one-argument signature, so only pass the flag when it is set.
+        if force_treat_as_permanent:
+            await self.push_error_frame(error=error_frame, force_treat_as_permanent=True)
+        else:
+            await self.push_error_frame(error=error_frame)
+
+    async def push_error_frame(
+        self,
+        error: ErrorFrame,
+        force_treat_as_permanent: bool = False,
+    ):
         """Push an error frame upstream.
 
         Args:
-            error: The error frame to push.
+            error: The error frame to push. Its deprecated ``fatal`` flag still
+                cancels the pipeline; ``force_treat_as_permanent`` is the replacement.
+            force_treat_as_permanent: Whether to treat this error as one that will
+                keep recurring, leaving the processor unable to do any more
+                work. Leaving it False doesn't keep the processor usable — a
+                permanent category costs it its usability either way. See
+                :meth:`push_error`.
         """
         if not error.processor:
             error.processor = self
+        # Anything still unset by now is going to stay that way, so settle it
+        # here and let handlers read a category off every error they receive.
+        if error.category is None and error.exception:
+            error.category = self._classify_error(error.exception) or classify_http_exception(
+                error.exception
+            )
+        if error.category is None:
+            error.category = ErrorCategory.UNKNOWN
+
+        # Before anything sees the error, so that handlers reading
+        # `frame.processor.is_usable` get the verdict that came with it.
+        if force_treat_as_permanent or error.category.is_permanent:
+            await self.set_usable(False)
+
         await self._call_event_handler("on_error", error)
 
-        if error.exception:
-            tb = traceback.extract_tb(error.exception.__traceback__)
+        # An exception carries a traceback only once it has been raised, so fall
+        # back to the plain message rather than losing the error entirely.
+        tb = traceback.extract_tb(error.exception.__traceback__) if error.exception else []
+        if tb:
             last = tb[-1]
             error_message = (
                 f"{error.processor} exception ({last.filename}:{last.lineno}): {error.error}"
@@ -1028,9 +1250,6 @@ class FrameProcessor(BaseObject):
             and asyncio.current_task() in self.__orphaned_process_tasks
         ):
             logger.debug(f"{self}: dropping {frame.name} pushed by an orphaned process task")
-            return
-
-        if not self._check_started(frame):
             return
 
         await self._call_event_handler("on_before_push_frame", frame)
@@ -1120,11 +1339,6 @@ class FrameProcessor(BaseObject):
         Args:
             frame: The start frame containing initialization parameters.
         """
-        self.__started = True
-        self._enable_metrics = frame.enable_metrics
-        self._enable_usage_metrics = frame.enable_usage_metrics
-        self._report_only_initial_ttfb = frame.report_only_initial_ttfb
-
         self.__create_process_task()
 
     async def __cancel(self, frame: CancelFrame):
@@ -1174,9 +1388,11 @@ class FrameProcessor(BaseObject):
             # are cheap and re-issued every period, so losing the one in flight
             # at the instant of an interruption costs nothing.
             current = self.__process_current_frame
-            current_is_uninterruptible = isinstance(
-                current, UninterruptibleFrame
-            ) and not isinstance(current, HeartbeatFrame)
+            current_is_uninterruptible = (
+                current is not None
+                and not current.interruptible
+                and not isinstance(current, HeartbeatFrame)
+            )
             if current_is_uninterruptible:
                 # The frame currently being processed is uninterruptible, so we
                 # must not cancel it. Just flush non-uninterruptible frames from
@@ -1197,6 +1413,9 @@ class FrameProcessor(BaseObject):
             await self.push_error(
                 error_msg=f"Uncaught exception handling _start_interruption: {e}",
                 exception=e,
+                # A broad catch: this may not have come from this processor at
+                # all, so its cause can't be attributed.
+                category=ErrorCategory.UNKNOWN,
             )
 
     async def __internal_push_frame(self, frame: Frame, direction: FrameDirection):
@@ -1206,13 +1425,14 @@ class FrameProcessor(BaseObject):
             frame: The frame to push.
             direction: The direction to push the frame.
         """
+        observer = self._setup.observer if self._setup else None
         try:
-            timestamp = self._clock.get_time() if self._clock else 0
+            timestamp = self.get_clock().get_time() if self._setup else 0
             if direction == FrameDirection.DOWNSTREAM and self._next:
                 if _TRACE_FRAMES:
                     logger.trace(f"Pushing {frame} downstream from {self} to {self._next}")
 
-                if self._observer:
+                if observer:
                     data = FramePushed(
                         source=self,
                         destination=self._next,
@@ -1220,12 +1440,12 @@ class FrameProcessor(BaseObject):
                         direction=direction,
                         timestamp=timestamp,
                     )
-                    await self._observer.on_push_frame(data)
+                    await observer.on_push_frame(data)
                 await self._next.queue_frame(frame, direction)
             elif direction == FrameDirection.UPSTREAM and self._prev:
                 if _TRACE_FRAMES:
                     logger.trace(f"Pushing {frame} upstream from {self} to {self._prev}")
-                if self._observer:
+                if observer:
                     data = FramePushed(
                         source=self,
                         destination=self._prev,
@@ -1233,23 +1453,30 @@ class FrameProcessor(BaseObject):
                         direction=direction,
                         timestamp=timestamp,
                     )
-                    await self._observer.on_push_frame(data)
+                    await observer.on_push_frame(data)
                 await self._prev.queue_frame(frame, direction)
         except Exception as e:
-            await self.push_error(error_msg=f"Uncaught exception: {e}", exception=e)
+            # Observers and the downstream processor run inside this
+            # block, so the cause of an unexpected failure can't be attributed.
+            await self.push_error(
+                error_msg=f"Uncaught exception: {e}",
+                exception=e,
+                category=ErrorCategory.UNKNOWN,
+            )
 
-    def _check_started(self, frame: Frame):
-        """Check if the processor has been started.
-
-        Args:
-            frame: The frame being processed.
-
-        Returns:
-            True if the processor has been started.
-        """
-        if not self.__started:
-            logger.error(f"{self} Trying to process {frame} but StartFrame not received yet")
-        return self.__started
+    def __maybe_create_input_task(self):
+        """Create the input task once the StartFrame is here and setup is done."""
+        if not self.__start_received or not self.__setup_done.is_set():
+            return
+        if not self._task_manager:
+            # Setting up was cut short before FrameProcessor.setup() ran, so
+            # there is no task manager to start processing frames with.
+            logger.error(
+                f"{self}: can't start, setup ended before FrameProcessor.setup() was "
+                "called (call super().setup() before anything that can block)"
+            )
+            return
+        self.__create_input_task()
 
     def __create_input_task(self):
         """Create the frame input processing task."""
@@ -1319,15 +1546,14 @@ class FrameProcessor(BaseObject):
         if any(item[0] is frame for item in queued):
             await asyncio.sleep(0)
 
-    def has_queued_frame(self, frame_type: type[Frame] | type[UninterruptibleFrame]) -> bool:
+    def has_queued_frame(self, frame_type: type[Frame]) -> bool:
         """Return True if a frame of the given type is waiting in the processing queue.
 
         Delegates to :meth:`FrameQueue.has_frame` so the check is O(distinct
-        enqueued types) with no queue scanning.  ``frame_type`` may be any
-        ``Frame`` subclass or ``UninterruptibleFrame`` (a mixin).
+        enqueued types) with no queue scanning.
 
         Args:
-            frame_type: The frame class (or mixin) to look for.
+            frame_type: The frame class to look for.
 
         Returns:
             True if at least one matching frame is queued.
@@ -1553,7 +1779,13 @@ class FrameProcessor(BaseObject):
 
             await self._call_event_handler("on_after_process_frame", frame)
         except Exception as e:
-            await self.push_error(error_msg=f"Error processing frame: {e}", exception=e)
+            # The frame callback runs inside this block, so the cause of an
+            # unexpected failure can't be attributed.
+            await self.push_error(
+                error_msg=f"Error processing frame: {e}",
+                exception=e,
+                category=ErrorCategory.UNKNOWN,
+            )
 
     async def __input_frame_task_handler(self):
         """Handle frames from the input queue.
@@ -1567,7 +1799,7 @@ class FrameProcessor(BaseObject):
 
             # This gate runs BEFORE the SystemFrame dispatch below, so it holds
             # every frame class, not just system frames. A HeartbeatFrame is
-            # (ControlFrame, UninterruptibleFrame) — not a SystemFrame — so
+            # an uninterruptible ControlFrame — not a SystemFrame — so
             # without this exemption the health probe parks here for the whole
             # hold, which is the same defect the process-queue exemption below
             # exists to prevent, merely moved one queue upstream. Both holders

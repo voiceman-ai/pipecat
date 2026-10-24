@@ -53,9 +53,7 @@ class SentryMetrics(FrameProcessorMetrics):
         await super().setup(task_manager)
         if self._sentry_available:
             self._sentry_queue = asyncio.Queue()
-            self._sentry_task = self.task_manager.create_task(
-                self._sentry_task_handler(), name=f"{self}::_sentry_task_handler"
-            )
+            self._sentry_task = self.create_task(self._sentry_task_handler())
 
     async def cleanup(self):
         """Clean up Sentry resources and flush pending transactions.
@@ -92,9 +90,9 @@ class SentryMetrics(FrameProcessorMetrics):
                 f"{self} Sentry transaction started (ID: {self._ttfb_metrics_tx.span_id} Name: {self._ttfb_metrics_tx.name})"
             )
 
-    async def reset_ttfb_metrics(self):
+    async def cancel_ttfb_metrics(self):
         """Abandon the in-progress TTFB measurement and its unsent transaction."""
-        await super().reset_ttfb_metrics()
+        await super().cancel_ttfb_metrics()
         self._ttfb_metrics_tx = None
 
     async def stop_ttfb_metrics(self, *, end_time: float | None = None):

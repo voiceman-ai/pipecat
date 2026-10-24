@@ -52,7 +52,6 @@ class _Processes(BaseObserver):
 async def _worker(*observers):
     w = WorkerObserver(observers=list(observers))
     await w.setup(TaskManager())
-    await w.start()
     return w
 
 
@@ -67,7 +66,7 @@ class TestFanout(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(w.wants_process_events)
         await w.on_process_frame(_processed(TextFrame("x")))
         self.assertEqual(w._proxies[push_only].queue.qsize(), 0)
-        await w.stop()
+        await w.cleanup()
 
     async def test_an_observer_that_handles_process_events_still_gets_them(self):
         processes = _Processes()
@@ -77,7 +76,7 @@ class TestFanout(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         self.assertEqual(len(processes.processed), 1)
-        await w.stop()
+        await w.cleanup()
 
     async def test_ignored_frame_types_are_skipped_and_others_delivered(self):
         ignores, sees_all = _IgnoresAudio(), _PushOnly()
@@ -88,7 +87,7 @@ class TestFanout(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         self.assertEqual([type(f).__name__ for f in ignores.pushed], ["TextFrame"])
         self.assertEqual(len(sees_all.pushed), 2)
-        await w.stop()
+        await w.cleanup()
 
     async def test_an_inline_observer_is_called_at_once_without_a_queue(self):
         inline = _Inline()
@@ -96,7 +95,7 @@ class TestFanout(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(w._proxies[inline].queue)
         await w.on_push_frame(_pushed(_audio()))
         self.assertEqual(len(inline.pushed), 1)
-        await w.stop()
+        await w.cleanup()
 
     async def test_an_observer_added_later_follows_the_same_rules(self):
         w = await _worker(_PushOnly())
@@ -106,7 +105,7 @@ class TestFanout(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(w.wants_process_events)
         await w.remove_observer(late)
         self.assertFalse(w.wants_process_events)
-        await w.stop()
+        await w.cleanup()
 
 
 if __name__ == "__main__":

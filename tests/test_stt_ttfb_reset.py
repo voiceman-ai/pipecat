@@ -130,13 +130,13 @@ async def test_final_for_the_current_utterance_is_still_measured():
 
 
 @pytest.mark.asyncio
-async def test_reset_discards_a_measurement_and_keeps_the_initial_one_owed():
+async def test_cancel_discards_a_measurement_and_keeps_the_initial_one_owed():
     metrics = FrameProcessorMetrics()
     metrics.set_processor_name("stt")
 
-    await metrics.reset_ttfb_metrics()  # nothing in progress: no-op
+    await metrics.cancel_ttfb_metrics()  # nothing in progress: no-op
     await metrics.start_ttfb_metrics(start_time=time.time() - 5, report_only_initial_ttfb=True)
-    await metrics.reset_ttfb_metrics()
+    await metrics.cancel_ttfb_metrics()
     assert await metrics.stop_ttfb_metrics() is None
     assert metrics.ttfb is None
 
