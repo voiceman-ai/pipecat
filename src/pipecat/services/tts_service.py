@@ -1831,21 +1831,24 @@ class TTSService(AIService):
         if self.supports_processing_metrics and not self._is_streaming_tokens:
             await self.start_processing_metrics()
 
-        prepared_text = await self._transform_text(text, src_frame.text_type)
-        if prepared_text is not None:
+        transformed = await self._transform_text(text, src_frame.text_type)
+        if transformed is not None:
+            spoken_text, prepared_text = transformed
             # A TTSSpeakFrame sets up its context before its text gets here.
             context = self._tts_contexts.setdefault(
                 context_id, TTSContext(interruptible=src_frame.interruptible)
             )
-            # Synthesized-duration accounting: remember the original utterance
+            # Synthesized-duration accounting: remember the spoken utterance
             # text so synthesized_duration_for() can resolve it by text later.
-            self._synth_texts_by_context.setdefault(context_id, []).append(text)
+            self._synth_texts_by_context.setdefault(context_id, []).append(spoken_text)
             await self._announce_text(src_frame, context_id)
             await self._call_event_handler("on_tts_request", context_id, prepared_text)
             await self._start_audio_context(context_id)
             await self._register_spoken_text(src_frame, prepared_text, context_id)
             await self._synthesize_text(prepared_text, context_id)
-            await self._push_spoken_text(src_frame, text, context_id, context.append_to_context)
+            await self._push_spoken_text(
+                src_frame, spoken_text, context_id, context.append_to_context
+            )
 
         await self.stop_processing_metrics()
 
@@ -1867,22 +1870,27 @@ class TTSService(AIService):
             has_text = bool(text.strip())
         return text if has_text else None
 
-    async def _transform_text(self, text: str, text_type: str) -> str | None:
+    async def _transform_text(self, text: str, text_type: str) -> tuple[str, str] | None:
         """Turn text to speak into the text sent to the TTS.
 
-        Filters and transforms only affect the text sent to the TTS, for
-        TTS-specific purposes (e.g. inserting tags for spelling or emotion, or
-        replacing an @ with "at"). The context keeps the text as it arrived.
+        Transforms only affect the text sent to the TTS, for TTS-specific
+        purposes (e.g. inserting tags for spelling or emotion, or replacing an
+        @ with "at"). Filters decide what is said at all, so the text they
+        leave is the spoken text: it is what the TTSTextFrame carries to the
+        context, the recording and everything else that reads what the bot
+        said (voiceman fork; upstream reports the unfiltered text).
 
         Returns:
-            The text to synthesize, or None if nothing is left to say or a
-            transform failed.
+            ``(spoken_text, prepared_text)``: the text after the filters, and
+            the text to synthesize after the transforms; or None if nothing is
+            left to say or a filter or transform failed.
         """
         transformed_text = text
         try:
             for filter in self._text_filters:
                 await filter.reset_interruption()
                 transformed_text = await filter.filter(transformed_text)
+            spoken_text = transformed_text
             for transform_type, transform in self._text_transforms:
                 if transform_type in (text_type, "*") and (
                     not isinstance(transform, PronunciationTransform)
@@ -1915,7 +1923,7 @@ class TTSService(AIService):
         if not has_text:
             return None
         # Apply any final text preparation (e.g., trailing space)
-        return self._prepare_text_for_tts(transformed_text)
+        return spoken_text, self._prepare_text_for_tts(transformed_text)
 
     def _can_apply_pronunciations(self) -> bool:
         """Whether pronunciation transforms apply, warning once when they stop applying."""
@@ -2050,7 +2058,7 @@ class TTSService(AIService):
         """Queue the spoken text behind its audio, for services without word timestamps."""
         # In TTS services that support word timestamps, the TTSTextFrames are pushed
         # as words are spoken. Services without word timestamps (_push_text_frames)
-        # get the original (non-transformed) text after the TTS generation has
+        # get the filtered, non-transformed text after the TTS generation has
         # completed. This way, if we are interrupted, the text is not added to the
         # assistant context and the context that IS added does not include
         # TTS-specific tags or transformations.

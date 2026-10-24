@@ -68,7 +68,7 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMAssistantAggregator
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.services.tts_service import TextAggregationMode, TTSService
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -1790,6 +1790,84 @@ class _RecordingHttpTTSService(MockHttpTTSService):
         self.spoken.append(text)
         async for frame in super().run_tts(text, context_id):
             yield frame
+
+
+class _TextFramesHttpTTSService(TTSService):
+    """An HTTP TTS without word timestamps: the base pushes its TTSTextFrames."""
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            push_start_frame=True, push_stop_frames=True, sample_rate=_SAMPLE_RATE, **kwargs
+        )
+        self.spoken: list[str] = []
+
+    def can_generate_metrics(self) -> bool:
+        return False
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        self.spoken.append(text)
+        yield TTSAudioRawFrame(
+            audio=_FAKE_AUDIO, sample_rate=_SAMPLE_RATE, num_channels=1, context_id=context_id
+        )
+
+
+class _DropSentenceFilter(BaseTextFilter):
+    """Removes one sentence, the way a repeat guard drops a line already said."""
+
+    def __init__(self, sentence: str):
+        self._sentence = sentence
+
+    async def filter(self, text: str) -> str:
+        return " ".join(text.replace(self._sentence, " ").split())
+
+
+@pytest.mark.asyncio
+async def test_filtered_text_is_what_the_service_reports_as_spoken():
+    """A filter decides what is said: the TTSTextFrame and the context carry its output.
+
+    A transform still reaches the TTS only.
+    """
+    dropped = "I already said this."
+
+    async def shout(text: str, text_type: str) -> str:
+        return text.upper()
+
+    with pytest.warns(DeprecationWarning, match="text_filters"):
+        tts = _TextFramesHttpTTSService(
+            text_filters=[_DropSentenceFilter(dropped)],
+            text_transforms=[("*", shout)],
+        )
+    context = LLMContext()
+    assistant = LLMAssistantAggregator(context)
+    spoken_frames: list[str] = []
+
+    class _Tap(FrameProcessor):
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, TTSTextFrame):
+                spoken_frames.append(frame.text)
+            await self.push_frame(frame, direction)
+
+    frames_to_send = [
+        LLMFullResponseStartFrame(),
+        TextFrame(text=f"Hello there. {dropped} How can I help?"),
+        LLMFullResponseEndFrame(),
+        SleepFrame(sleep=0.1),
+    ]
+    await asyncio.wait_for(
+        run_test(Pipeline([tts, _Tap(), assistant]), frames_to_send=frames_to_send),
+        timeout=3.0,
+    )
+
+    assert all(dropped.upper() not in text for text in tts.spoken), tts.spoken
+    assert "HELLO THERE." in " ".join(tts.spoken)
+    assert dropped not in " ".join(spoken_frames), spoken_frames
+    assert "Hello there." in " ".join(spoken_frames)
+    committed = " ".join(
+        m["content"] for m in context.get_messages() if m.get("role") == "assistant"
+    )
+    assert dropped not in committed, committed
+    assert "How can I help?" in committed, committed
 
 
 @pytest.mark.asyncio
