@@ -39,6 +39,15 @@ _MODEL_RESET_INTERVAL_SECS = 2.0
 _MODEL_RESET_MAX_CONFIDENCE = 0.1
 _MODEL_RESET_LOW_CONFIDENCE_WINDOWS = 5
 
+# Fork: the bundled models, by name. "v6.2" is upstream's model and the
+# default. "v6" is the model this fork ran before the 1.14 sync, kept so an
+# application can stay on it; it runs with the reset schedule it was tuned
+# with, every _LEGACY_MODEL_RESET_SECS of audio whatever the audio is. v6.2
+# scores quiet and far-field voices higher, so on the same thresholds it
+# reports noticeably more speech.
+_MODEL_FILES = {"v6.2": "silero_vad.onnx", "v6": "silero_vad_v6.onnx"}
+_LEGACY_MODEL_RESET_SECS = 5.0
+
 # Consecutive analysis failures after which the analyzer is declared
 # permanently degraded. VAD runs at ~50 frames/second per leg, so this is
 # roughly 0.5s of audio — long enough that a single bad buffer does not trip it,
@@ -170,18 +179,31 @@ class SileroVADAnalyzer(VADAnalyzer):
     quiet.
     """
 
-    def __init__(self, *, sample_rate: int | None = None, params: VADParams | None = None):
+    def __init__(
+        self,
+        *,
+        sample_rate: int | None = None,
+        params: VADParams | None = None,
+        model: str = "v6.2",
+    ):
         """Initialize the Silero VAD analyzer.
 
         Args:
             sample_rate: Audio sample rate (8000 or 16000 Hz). If None, will be set later.
             params: VAD parameters for detection thresholds and timing.
+            model: Which bundled Silero model to run (fork): ``"v6.2"`` (the
+                default) or ``"v6"``, the earlier model with its own reset
+                schedule (every five seconds of audio, speech or not).
         """
         super().__init__(sample_rate=sample_rate, params=params)
 
-        logger.debug("Loading Silero VAD model...")
+        if model not in _MODEL_FILES:
+            raise ValueError(f"Unknown Silero VAD model {model!r}: use one of {list(_MODEL_FILES)}")
+        self._model_version = model
 
-        model_name = "silero_vad.onnx"
+        logger.debug(f"Loading Silero VAD model ({model})...")
+
+        model_name = _MODEL_FILES[model]
         package_path = "pipecat.audio.vad.data"
 
         try:
@@ -327,6 +349,16 @@ class SileroVADAnalyzer(VADAnalyzer):
             confidence: The model's speech confidence for the window just scored.
         """
         self._windows_since_reset += 1
+        if self._model_version == "v6":
+            # The schedule v6 ran with: a reset every few seconds of audio,
+            # whatever the audio is.
+            if (
+                self._windows_since_reset * self.num_frames_required()
+                >= _LEGACY_MODEL_RESET_SECS * self.sample_rate
+            ):
+                self._model.reset_states()
+                self._windows_since_reset = 0
+            return
         if confidence < _MODEL_RESET_MAX_CONFIDENCE:
             self._low_confidence_windows += 1
         else:
