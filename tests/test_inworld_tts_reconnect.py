@@ -161,7 +161,9 @@ async def test_a_stalled_send_fails_its_turn_and_the_next_turn_is_spoken(monkeyp
     assert server.handshakes == 2
     assert server.texts_sent(1) == [TURNS[2]]
     assert _turns_with_audio(down) == 2
-    assert any(isinstance(f, ErrorFrame) for f in up)
+    # Fork: the failed turn completes as a silent context, which is logged but
+    # not pushed as an ErrorFrame, so the call carries on to the next turn.
+    assert not any(isinstance(f, ErrorFrame) for f in up)
     assert service.is_usable
 
 
