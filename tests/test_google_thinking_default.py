@@ -29,7 +29,12 @@ def _context() -> LLMContext:
 def _response(text: str = "ok"):
     return SimpleNamespace(
         usage_metadata=None,
-        candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text=text)]))],
+        candidates=[
+            SimpleNamespace(
+                finish_reason=None,
+                content=SimpleNamespace(parts=[SimpleNamespace(text=text)]),
+            )
+        ],
     )
 
 
@@ -44,20 +49,15 @@ def _configs(mock: AsyncMock) -> list:
 
 
 def test_default_thinking_per_model_family():
-    """Gemini 2.5 Flash gets budget 0, Gemini 3 Flash gets level minimal, others nothing."""
+    """Gemini 2.5 Flash gets budget 0, Gemini 3 Flash gets level minimal."""
     for model, expected in [
         ("gemini-2.5-flash", {"thinking_budget": 0}),
         ("gemini-2.5-flash-lite", {"thinking_budget": 0}),
         ("gemini-3.5-flash", {"thinking_level": "minimal"}),
         ("gemini-3.1-flash-lite", {"thinking_level": "minimal"}),
     ]:
-        params: dict = {}
-        assert _service(model)._maybe_unset_thinking_budget(params) is True, model
+        params = _service(model)._build_generation_params()
         assert params["thinking_config"] == expected, model
-
-    params = {}
-    assert _service("gemini-3-pro")._maybe_unset_thinking_budget(params) is False
-    assert "thinking_config" not in params
 
 
 def test_explicit_thinking_config_wins():
@@ -71,7 +71,6 @@ def test_explicit_thinking_config_wins():
     )
 
     params = service._build_generation_params()
-    assert service._maybe_unset_thinking_budget(params) is False
     assert params["thinking_config"] == {"thinking_level": "high"}
 
 

@@ -15,7 +15,7 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -91,10 +91,11 @@ async def main():
             pipeline,
             params=PipelineParams(
                 audio_in_sample_rate=16000,
-                audio_out_sample_rate=16000,
+                audio_out_sample_rate=24000,
                 enable_metrics=True,
                 enable_usage_metrics=True,
             ),
+            processor_unusable_policy=ProcessorUnusablePolicy.END,
         )
 
         runner = WorkerRunner()

@@ -29,7 +29,7 @@ These tests fail (prompt becomes None) without the paired
 
 import unittest
 
-from pipecat.adapters.base_llm_adapter import BaseLLMAdapter
+from pipecat.adapters.llm.base_llm_adapter import BaseLLMAdapter
 from pipecat.extensions.voicemail.voicemail_detector import VoicemailDetector
 from pipecat.services.llm_service import LLMService
 from pipecat.services.settings import LLMSettings

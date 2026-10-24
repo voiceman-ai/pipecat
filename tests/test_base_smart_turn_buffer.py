@@ -165,17 +165,20 @@ async def test_cleanup_releases_the_worker_thread():
     import asyncio
 
     analyzer = _RecordingSmartTurn(sample_rate=16000, params=SmartTurnParams())
-    executor = analyzer._executor
+    # The thread starts the first time the model needs it.
+    assert analyzer._executor is None
+    executor = analyzer._model_executor
     assert executor is not None
 
     await analyzer.cleanup()
     assert analyzer._executor is None
 
-    # Idempotent, and analysis after teardown degrades instead of raising.
+    # Idempotent, and the analyzer stays usable: turn strategies are cleaned up
+    # and re-applied whenever they are updated, so the thread starts again.
     await analyzer.cleanup()
-    state, result = await analyzer.analyze_end_of_turn()
-    assert state == EndOfTurnState.INCOMPLETE
-    assert result is None
+    assert analyzer._model_executor is not executor
+    await analyzer.cleanup()
+    assert analyzer._executor is None
     assert isinstance(asyncio.get_running_loop(), asyncio.AbstractEventLoop)
 
 
@@ -260,3 +263,36 @@ def test_clear_drops_pre_clear_audio_from_next_segment():
     assert analyzer.captured_segment is not None
     # Only the post-clear constant may appear in the segment.
     assert np.allclose(analyzer.captured_segment, 2_000 / 32768.0)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_releases_the_model_thread():
+    """The thread the model runs on is only reclaimed here, so an analyzer that
+    is cleaned up must not leave it behind."""
+    analyzer = _RecordingSmartTurn(sample_rate=16_000, params=SmartTurnParams())
+
+    await analyzer.analyze_end_of_turn()
+    assert analyzer._executor is not None
+
+    await analyzer.cleanup()
+
+    assert analyzer._executor is None
+
+
+@pytest.mark.asyncio
+async def test_analyzing_works_again_after_cleanup():
+    """Cleaning up is not only teardown here.
+
+    A turn strategy is cleaned up and re-applied whenever the strategies are
+    updated, which happens before the first user turn when a realtime service
+    recommends its own. Releasing the thread for good would leave smart turn
+    dead for the rest of the session.
+    """
+    analyzer = _RecordingSmartTurn(sample_rate=16_000, params=SmartTurnParams())
+
+    await analyzer.analyze_end_of_turn()
+    await analyzer.cleanup()
+
+    state, _ = await analyzer.analyze_end_of_turn()
+
+    assert state == EndOfTurnState.INCOMPLETE

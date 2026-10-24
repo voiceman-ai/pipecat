@@ -15,7 +15,11 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
+
+from pipecat.utils.deprecation import deprecated, warn_deprecated
+from pipecat.utils.file_storage import FileStorage
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -143,7 +147,7 @@ class RunnerArguments:
         handle_sigint: Whether the bot should install a SIGINT handler.
         handle_sigterm: Whether the bot should install a SIGTERM handler.
         pipeline_idle_timeout_secs: Seconds the pipeline may stay idle before
-            shutting down.
+            shutting down; ``None`` disables the idle timeout.
         body: Optional request body data passed from the runner entry point.
         call_data: Parsed telephony handshake as a :class:`CallData` model — typed
             attribute access (``call_data.to_number``) that's also dict-compatible
@@ -154,16 +158,25 @@ class RunnerArguments:
         session_id: Identifier for this bot session.
         cli_args: Parsed CLI arguments from the runner, when launched via the
             development runner.
+        file_storage: The storage backend serving the host's upload endpoints,
+            injected by whichever host runs the bot — the one returned by the
+            bot module's ``create_file_storage()`` if it defines one, otherwise
+            the host's default (the development runner's ``-u/--uploads-folder``
+            local storage). Hand it to the LLM service's ``FileResolver``
+            (``file_resolver=FileResolver(file_storage=runner_args.file_storage)``)
+            so send-file messages can resolve the URLs it mints. ``None`` when
+            uploads are disabled.
     """
 
     # Use kw_only so subclasses don't need to worry about ordering.
     handle_sigint: bool = field(init=False, kw_only=True)
     handle_sigterm: bool = field(init=False, kw_only=True)
-    pipeline_idle_timeout_secs: int = field(init=False, kw_only=True)
+    pipeline_idle_timeout_secs: float | None = field(init=False, kw_only=True)
     body: Any | None = field(default_factory=dict, kw_only=True)
     call_data: CallData | None = field(default=None, kw_only=True)
     session_id: str | None = field(default=None, kw_only=True)
     cli_args: argparse.Namespace | None = field(default=None, init=False, kw_only=True)
+    file_storage: FileStorage | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         self.handle_sigint = False
@@ -237,6 +250,7 @@ class LiveKitRunnerArguments(RunnerArguments):
 
     Parameters:
         room_name: LiveKit room name to join
+        url: LiveKit server URL to connect to
         token: Authentication token for the room
         body: Additional request data
     """
@@ -246,14 +260,23 @@ class LiveKitRunnerArguments(RunnerArguments):
     token: str
 
 
+@deprecated(
+    "`EvalRunnerArguments` is deprecated since 1.13.0 and will be removed in 2.0.0. "
+    "Use `WebSocketRunnerArguments` instead."
+)
 @dataclass
 class EvalRunnerArguments(RunnerArguments):
     """Eval transport session arguments for the runner.
 
     Used to launch a bot with a local ``SingleClientWebsocketServerTransport`` speaking RTVI
-    (via ``RTVIEvalSerializer``). The eval harness connects as an RTVI client,
+    (via ``EvalSerializer``). The eval harness connects as an RTVI client,
     sends scripted user input, and asserts on the RTVI events the bot emits.
     Intended for fast pipeline behavioral evaluations.
+
+    .. deprecated:: 1.13.0
+        Use :class:`WebSocketRunnerArguments` instead: the dev runner hands an
+        eval harness's connection to the bot like any WebSocket session.
+        Will be removed in 2.0.0.
 
     Parameters:
         host: Host address to bind the eval transport's WebSocket server to.
@@ -273,9 +296,17 @@ class MOQRunnerArguments(RunnerArguments):
     don't need to thread them by hand.
 
     Parameters:
-        host: MOQ relay/server hostname the browser uses to connect.
-        port: MOQ relay/server port.
-        path: MOQ endpoint path on the relay (client mode).
+        host: MOQ relay/server hostname. Composes the relay URL with
+            ``port`` and ``path`` when ``relay_url`` is unset; in serve
+            mode it is the name the browser dials.
+        port: MOQ relay/server port; see ``host``.
+        path: MOQ endpoint path on the relay when the URL is composed
+            from ``host`` and ``port`` (client mode).
+        relay_url: Full relay URL to dial in client mode, query string
+            included (e.g. ``https://relay.example.com/?jwt=…``). Takes
+            precedence over ``host``/``port``/``path``, with a warning when
+            ``host`` or ``port`` is given as well. Client mode needs either
+            this or ``host`` and ``port``.
         namespace: MOQ namespace (like a room identifier).
         participant_id: This bot's participant id; it broadcasts under
             ``<namespace>/<participant_id>``.
@@ -285,7 +316,14 @@ class MOQRunnerArguments(RunnerArguments):
         serve: When True, the bot binds its own MOQ server instead of
             dialing a relay — useful for local dev with no separate
             ``moq-relay`` process.
-        serve_bind: Address to bind in serve mode (e.g. ``"[::]:4080"``).
+        bind: Local UDP bind address — the listen address in serve mode
+            (e.g. ``"[::]:4080"``), the dial source address in client mode
+            (ephemeral if unset).
+        serve_bind: Serve-mode listen address.
+
+            .. deprecated:: 1.8.0
+                Use ``bind`` instead, which also covers client mode. Will be
+                removed in 2.0.0.
         serve_tls_host: Hostname used for the generated self-signed cert
             when no on-disk cert/key is provided.
         serve_tls_cert: Path to a PEM-encoded TLS cert chain.
@@ -298,17 +336,41 @@ class MOQRunnerArguments(RunnerArguments):
             ``/api/config`` can hand them to the browser for pinning.
     """
 
-    host: str
-    port: int
+    host: str | None = None
+    port: int | None = None
     path: str = "/moq"
+    relay_url: str | None = field(default=None, kw_only=True)
     namespace: str = "pipecat"
-    participant_id: str = "bot0"
-    peer_id: str = "client0"
+    participant_id: str = "response"
+    peer_id: str = "request"
     verify_ssl: bool = True
     serve: bool = False
-    serve_bind: str | None = None
+    bind: str | None = None
+    serve_bind: str | None = field(default=None, kw_only=True)
     serve_tls_host: str = "localhost"
     serve_tls_cert: str | None = None
     serve_tls_key: str | None = None
     ready_event: asyncio.Event | None = field(default=None, kw_only=True)
     cert_fingerprints: list[str] = field(default_factory=list, kw_only=True)
+
+    def __post_init__(self):
+        """Carry the pre-1.8.0 ``serve_bind`` spelling over to ``bind``; check the dial target."""
+        super().__post_init__()
+        if self.serve_bind is not None:
+            warn_deprecated(
+                "`MOQRunnerArguments.serve_bind` is deprecated since 1.8.0 and will be "
+                "removed in 2.0.0. Use `MOQRunnerArguments.bind` instead.",
+                stacklevel=2,
+            )
+            if self.bind is None:
+                self.bind = self.serve_bind
+        if not self.serve and self.relay_url is None and (self.host is None or self.port is None):
+            raise ValueError(
+                "MOQRunnerArguments needs `relay_url`, or `host` and `port`, to dial a relay"
+            )
+        if not self.serve and self.relay_url is not None:
+            if self.host is not None or self.port is not None:
+                logger.warning(
+                    "MOQRunnerArguments: `relay_url` is set, so `host`, `port` and `path` "
+                    "are ignored"
+                )

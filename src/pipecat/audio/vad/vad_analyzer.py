@@ -336,10 +336,8 @@ class VADAnalyzer(ABC):
         return self._vad_state
 
     async def cleanup(self):
-        """Clean up resources.
+        """Release the analyzer's resources, including the thread it runs the model on.
 
         This method should be called when the object is no longer needed.
-        It waits for all currently executing event handler tasks to finish
-        before returning.
         """
         self.shutdown()

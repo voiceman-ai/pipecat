@@ -7,7 +7,7 @@
 import locale
 import unittest
 
-from pipecat.utils.text.transforms._alnum_utils import normalize
+from pipecat.utils.text.alnum_utils import alnum_only
 from pipecat.utils.text.transforms.acronyms import normalize_acronyms
 from pipecat.utils.text.transforms.currency import expand_currency
 from pipecat.utils.text.transforms.dates import normalize_dates
@@ -16,7 +16,7 @@ from pipecat.utils.text.transforms.numbers import expand_numbers
 from pipecat.utils.text.transforms.percentages import expand_percentages
 from pipecat.utils.text.transforms.phone import expand_phone_numbers
 from pipecat.utils.text.transforms.replacements import replace_text
-from pipecat.utils.text.transforms.strip_markdown import strip_markdown
+from pipecat.utils.text.transforms.strip_markdown import StripMarkdown, strip_markdown
 from pipecat.utils.text.transforms.units import expand_units
 from pipecat.utils.text.transforms.voice_formatter import VoiceFormatter
 
@@ -46,12 +46,73 @@ class TestStripMarkdown(unittest.IsolatedAsyncioTestCase):
     async def test_alnum_preserving(self):
         text = "**Hello** and _world_"
         result = await strip_markdown(text, "*")
-        self.assertEqual(normalize(result), normalize(text))
+        self.assertEqual(alnum_only(result), alnum_only(text))
 
     async def test_no_change_to_plain_text(self):
         text = "Hello world"
         result = await strip_markdown(text, "*")
         self.assertEqual(result, text)
+
+    async def test_content_asterisks_kept(self):
+        cases = {
+            "Press * then #": "Press * then #",
+            "5 * 3 = 15": "5 * 3 = 15",
+            "2 * 3 * 4 = 24": "2 * 3 * 4 = 24",
+            "Use the * key, then * again": "Use the * key, then * again",
+            "2*3*4 is 24": "2*3*4 is 24",
+            "2**3 is 8": "2**3 is 8",
+            "Type \\*literal\\* asterisks": "Type *literal* asterisks",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(await strip_markdown(text, "*"), expected, text)
+
+    async def test_list_bullets(self):
+        cases = {
+            "\n- Coffee for three dollars.": "\nCoffee for three dollars.",
+            "- Step one.\n    - Sub step.": "Step one.\n    Sub step.",
+            "* item one\n* item two": "item one\nitem two",
+            "+ plus item": "plus item",
+            "1. First\n2. Second": "1. First\n2. Second",
+            "a - b": "a - b",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(await strip_markdown(text, "*"), expected, text)
+
+    async def test_strikethrough_dropped(self):
+        cases = {
+            "The price was ~~ten~~ eight dollars.": "The price was eight dollars.",
+            "It is ~~not ready~~ ready now.": "It is ready now.",
+            "~~Old.~~ New.": " New.",
+            "About ~~ 5 minutes": "About ~~ 5 minutes",
+            "Roughly ~5 minutes": "Roughly ~5 minutes",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(await strip_markdown(text, "*"), expected, text)
+
+    async def test_links_reduced_to_label(self):
+        cases = {
+            "See [the docs](https://example.com/docs) here.": "See the docs here.",
+            "See ![a cat](cat.png) here.": "See a cat here.",
+            "Go to [example.com](https://example.com).": "Go to example.com.",
+            "Visit https://example.com today": "Visit https://example.com today",
+            "[**bold** link](x)": "bold link",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(await strip_markdown(text, "*"), expected, text)
+
+    async def test_links_kept(self):
+        keep = StripMarkdown(strip_urls=False)
+        text = "See [the docs](https://example.com/docs) here."
+        self.assertEqual(await keep(text, "*"), text)
+
+    async def test_horizontal_rules(self):
+        cases = {
+            "First part.\n\n---\n\nSecond part.": "First part.\n\n\nSecond part.",
+            "* * *\ntext": "text",
+            "___\ntext": "text",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(await strip_markdown(text, "*"), expected, text)
 
 
 class TestExpandPhoneNumbers(unittest.IsolatedAsyncioTestCase):
@@ -66,7 +127,7 @@ class TestExpandPhoneNumbers(unittest.IsolatedAsyncioTestCase):
     async def test_alnum_preserving(self):
         text = "123-456-7890"
         result = await expand_phone_numbers(text, "*")
-        self.assertEqual(normalize(result), normalize(text))
+        self.assertEqual(alnum_only(result), alnum_only(text))
 
     async def test_no_change_to_non_phone(self):
         text = "Hello world"
@@ -92,7 +153,7 @@ class TestNormalizeAcronyms(unittest.IsolatedAsyncioTestCase):
     async def test_alnum_preserving(self):
         text = "NASA and HTTP"
         result = await normalize_acronyms(text, "*")
-        self.assertEqual(normalize(result), normalize(text))
+        self.assertEqual(alnum_only(result), alnum_only(text))
 
     async def test_does_not_split_camelcase(self):
         text = "iPhone"
@@ -145,8 +206,8 @@ class TestReplaceText(unittest.IsolatedAsyncioTestCase):
 
 
 class TestNormalizeCollapsesCaseAndSplitReplacements(unittest.IsolatedAsyncioTestCase):
-    """Whether normalize() treats a case-only or word-splitting replacement as
-    unchanged. normalize() lowercases text and drops whitespace/punctuation, so a
+    """Whether alnum_only() treats a case-only or word-splitting replacement as
+    unchanged. alnum_only() lowercases text and drops whitespace/punctuation, so a
     replacement that only changes case, or that splits one word into several,
     normalizes identically on both sides even though the original text cannot be
     recovered by simple proportional advancement.
@@ -155,30 +216,30 @@ class TestNormalizeCollapsesCaseAndSplitReplacements(unittest.IsolatedAsyncioTes
     async def test_word_split_normalizes_the_same_as_original(self):
         transform = replace_text([(r"\bBODYPUMP\b", "body pump")])
         result = await transform("BODYPUMP", "*")
-        self.assertEqual(normalize(result), normalize("BODYPUMP"))
+        self.assertEqual(alnum_only(result), alnum_only("BODYPUMP"))
 
     async def test_case_change_normalizes_the_same_as_original(self):
         transform = replace_text([(r"\bSQL\b", "sql")])
         result = await transform("SQL", "*")
-        self.assertEqual(normalize(result), normalize("SQL"))
+        self.assertEqual(alnum_only(result), alnum_only("SQL"))
 
     async def test_pronunciation_respelling_does_not_normalize_the_same(self):
         """Contrast case: a genuine 1-to-1 respelling ("leisure" -> "lezher") does
         change the normalized alnum content, so it is correctly flagged as transformed."""
         transform = replace_text([(r"\bleisure\b", "lezher")])
         result = await transform("leisure", "*")
-        self.assertNotEqual(normalize(result), normalize("leisure"))
+        self.assertNotEqual(alnum_only(result), alnum_only("leisure"))
 
     async def test_ssml_phoneme_tag_normalizes_the_same_as_original(self):
         """An SSML phoneme tag wraps the word without altering it, so tag-stripped
         normalization matches the original — unlike a respelling. (The wrapping
         markup itself is still picked up as a transformed segment by
-        TextSegmentMap, not by normalize() here.)"""
+        TextSegmentMap, not by alnum_only() here.)"""
         transform = replace_text(
             [(r"\bSiobhan\b", '<phoneme alphabet="ipa" ph="ʃəˈvɔːn">Siobhan</phoneme>')]
         )
         result = await transform("Siobhan", "*")
-        self.assertEqual(normalize(result), normalize("Siobhan"))
+        self.assertEqual(alnum_only(result), alnum_only("Siobhan"))
 
 
 class TestExpandPercentages(unittest.IsolatedAsyncioTestCase):
@@ -194,7 +255,7 @@ class TestExpandPercentages(unittest.IsolatedAsyncioTestCase):
     async def test_alnum_changes(self):
         text = "50%"
         result = await expand_percentages(text, "*")
-        self.assertNotEqual(normalize(result), normalize(text))
+        self.assertNotEqual(alnum_only(result), alnum_only(text))
 
 
 class TestExpandUnits(unittest.IsolatedAsyncioTestCase):
@@ -321,6 +382,13 @@ class TestVoiceFormatter(unittest.IsolatedAsyncioTestCase):
         formatter = VoiceFormatter(strip_markdown=False)
         result = await formatter("**Hello**", "*")
         self.assertIn("**", result)
+
+    async def test_strip_urls_passthrough(self):
+        text = "See [the docs](https://example.com/docs) here."
+        stripped = await VoiceFormatter()(text, "*")
+        kept = await VoiceFormatter(strip_urls=False)(text, "*")
+        self.assertEqual(stripped, "See the docs here.")
+        self.assertIn("https://example.com/docs", kept)
 
     async def test_custom_replacements_applied(self):
         formatter = VoiceFormatter(

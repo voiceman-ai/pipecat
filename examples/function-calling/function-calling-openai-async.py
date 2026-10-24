@@ -10,7 +10,7 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.adapters.schemas.direct_function import tool_options
+from pipecat.adapters.llm.schemas.direct_function import tool_options
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.evals.transport import EvalTransportParams
 from pipecat.frames.frames import (
@@ -18,7 +18,7 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -32,6 +32,7 @@ from pipecat.services.openai.stt import OpenAIRealtimeSTTService
 from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
+from pipecat.transports.livekit.transport import LiveKitParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.workers.runner import WorkerRunner
 
@@ -52,6 +53,37 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
     await params.result_callback({"conditions": "nice", "temperature": "75"})
 
 
+# A lookup that hangs: it sleeps far past the deadline it was registered with,
+# so the call is always cancelled before it can report anything. The result it
+# would eventually have returned is distinctive on purpose — if the bot ever
+# quotes a share price, a cancelled handler's result reached the conversation.
+@tool_options(cancel_on_interruption=False, timeout_secs=5)
+async def get_stock_price(params: FunctionCallParams, symbol: str):
+    """Get the current share price for a stock.
+
+    Args:
+        symbol: The ticker symbol, e.g. "NVDA".
+    """
+    await asyncio.sleep(20)
+    logger.debug("Returning get_stock_price result.")
+    await params.result_callback({"price": "184.20", "currency": "USD"})
+
+
+@tool_options(cancel_on_interruption=False, cancellable_by_llm=True, timeout_secs=120)
+async def write_report(params: FunctionCallParams, topic: str):
+    """Write a long research report on a topic.
+
+    Args:
+        topic: What the report should cover.
+    """
+    # Long enough to still be running when the LLM asks to stop it: listing what
+    # is running and then calling the cancel tool, with a spoken reply often in
+    # between, outlasts shorter work.
+    await asyncio.sleep(25)
+    logger.debug("Returning write_report result.")
+    await params.result_callback({"report": f"A 5000-word report on {topic}."})
+
+
 async def get_restaurant_recommendation(params: FunctionCallParams, location: str):
     """Get a restaurant recommendation.
 
@@ -69,6 +101,10 @@ transport_params = {
         audio_out_enabled=True,
     ),
     "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
+    "livekit": lambda: LiveKitParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
     ),
@@ -114,7 +150,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     # cancel_on_interruption=False (set via @tool_options) makes this an async
     # function call.
-    context = LLMContext(tools=[get_current_weather, get_restaurant_recommendation])
+    context = LLMContext(
+        tools=[
+            get_current_weather,
+            write_report,
+            get_stock_price,
+            get_restaurant_recommendation,
+        ]
+    )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
@@ -138,6 +181,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        processor_unusable_policy=ProcessorUnusablePolicy.END,
     )
 
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)

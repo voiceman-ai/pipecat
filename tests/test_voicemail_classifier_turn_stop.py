@@ -14,7 +14,7 @@ until the controller's turn-stop timeout — ~5s of dead air on the first answer
 import asyncio
 import unittest
 
-from pipecat.adapters.base_llm_adapter import BaseLLMAdapter
+from pipecat.adapters.llm.base_llm_adapter import BaseLLMAdapter
 from pipecat.extensions.voicemail.voicemail_detector import (
     ClassifierUserTurnStopStrategy,
     VoicemailDetector,
@@ -31,6 +31,7 @@ from pipecat.services.llm_service import LLMService
 from pipecat.services.settings import LLMSettings
 from pipecat.turns.user_stop import ExternalUserTurnStopStrategy
 from pipecat.utils.asyncio.task_manager import TaskManager
+from tests.frame_processor_helpers import frame_processor_setup
 
 
 class _MockLLMService(LLMService):
@@ -101,7 +102,7 @@ class TestClassifierUserTurnStopStrategy(unittest.IsolatedAsyncioTestCase):
 
     async def _strategy(self, **kwargs) -> ClassifierUserTurnStopStrategy:
         strategy = ClassifierUserTurnStopStrategy(**kwargs)
-        await strategy.setup(self.task_manager)
+        await strategy.setup(frame_processor_setup(self.task_manager))
         self.addAsyncCleanup(strategy.cleanup)
         return strategy
 
@@ -116,7 +117,7 @@ class TestClassifierUserTurnStopStrategy(unittest.IsolatedAsyncioTestCase):
     async def test_base_strategy_drops_pre_start_final(self):
         """The base class behavior being guarded against: the pre-start final is lost."""
         strategy = ExternalUserTurnStopStrategy()
-        await strategy.setup(self.task_manager)
+        await strategy.setup(frame_processor_setup(self.task_manager))
         self.addAsyncCleanup(strategy.cleanup)
         rec = _Recorder(strategy)
         await _adopted_turn(strategy, before_start=[_final()])

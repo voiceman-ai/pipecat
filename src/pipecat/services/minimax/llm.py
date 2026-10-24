@@ -68,6 +68,9 @@ class MiniMaxLLMService(OpenAILLMService):
     """
 
     Settings = MiniMaxLLMSettings
+    # Not OpenAI: without a key the OpenAI client would fall back to
+    # OPENAI_API_KEY and send it to this provider.
+    _requires_api_key = True
     _settings: Settings
 
     def __init__(

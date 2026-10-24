@@ -11,13 +11,14 @@ import pytest
 from openai import NotGiven
 from openai._types import NOT_GIVEN as OPENAI_NOT_GIVEN
 
-from pipecat.adapters.services.anthropic_adapter import AnthropicLLMInvocationParams
-from pipecat.adapters.services.bedrock_adapter import AWSBedrockLLMInvocationParams
-from pipecat.adapters.services.gemini_adapter import GeminiLLMInvocationParams
-from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
+from pipecat.adapters.llm.services.anthropic_adapter import AnthropicLLMInvocationParams
+from pipecat.adapters.llm.services.bedrock_adapter import AWSBedrockLLMInvocationParams
+from pipecat.adapters.llm.services.gemini_adapter import GeminiLLMInvocationParams
+from pipecat.adapters.llm.services.open_ai_adapter import OpenAILLMInvocationParams
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.aws.llm import AWSBedrockLLMService
+from pipecat.services.deepseek.llm import DeepSeekLLMService
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.llm_service import LLMService
 from pipecat.services.openai.base_llm import INFERENCE_TIMEOUT_SECS
@@ -27,6 +28,13 @@ from pipecat.services.openai.responses.llm import (
     OpenAIResponsesLLMService,
 )
 from pipecat.services.openrouter.llm import OpenRouterLLMService
+
+
+def _mock_adapter() -> MagicMock:
+    """Adapter mock with an async get_llm_invocation_params."""
+    adapter = MagicMock()
+    adapter.get_llm_invocation_params = AsyncMock()
+    return adapter
 
 
 @pytest.mark.asyncio
@@ -47,7 +55,7 @@ async def test_openai_run_inference_with_llm_context():
 
         # Setup mocks
         mock_context = MagicMock(spec=LLMContext)
-        mock_adapter = MagicMock()
+        mock_adapter = _mock_adapter()
         test_messages = [
             {"role": "system", "content": "You are a helpful assistant"},
             {"role": "user", "content": "Hello, world!"},
@@ -103,7 +111,7 @@ async def test_openai_run_inference_client_exception():
         service._client = AsyncMock()
 
         mock_context = MagicMock(spec=LLMContext)
-        mock_adapter = MagicMock()
+        mock_adapter = _mock_adapter()
         mock_adapter.get_llm_invocation_params.return_value = OpenAILLMInvocationParams(
             messages=[], tools=OPENAI_NOT_GIVEN, tool_choice=OPENAI_NOT_GIVEN
         )
@@ -118,11 +126,13 @@ async def test_openai_run_inference_client_exception():
 async def test_openrouter_run_inference_converts_developer_messages_to_user():
     """Test OpenRouter requests convert developer messages for broad model compatibility."""
     with patch.object(OpenRouterLLMService, "create_client"):
-        service = OpenRouterLLMService(settings=OpenRouterLLMService.Settings(model="gpt-4"))
+        service = OpenRouterLLMService(
+            api_key="test-key", settings=OpenRouterLLMService.Settings(model="gpt-4")
+        )
         service._client = AsyncMock()
 
         mock_context = MagicMock(spec=LLMContext)
-        mock_adapter = MagicMock()
+        mock_adapter = _mock_adapter()
         mock_adapter.get_llm_invocation_params.return_value = OpenAILLMInvocationParams(
             messages=[{"role": "user", "content": "Tool result"}],
             tools=OPENAI_NOT_GIVEN,
@@ -163,7 +173,7 @@ async def test_anthropic_run_inference_with_llm_context():
 
     # Setup mocks
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     test_messages = [{"role": "user", "content": "Hello, world!"}]
     test_system = "You are a helpful assistant"
     mock_adapter.get_llm_invocation_params.return_value = AnthropicLLMInvocationParams(
@@ -188,18 +198,17 @@ async def test_anthropic_run_inference_with_llm_context():
         enable_prompt_caching=False,
         system_instruction=None,
         ensure_last_message_is_user=False,
+        system_prompt_cache_ttl=None,
     )
     service._client.beta.messages.create.assert_called_once_with(
         model="claude-3-sonnet-20240229",
         max_tokens=2048,
         stream=False,
-        temperature=0.6,
-        top_k=50,
-        top_p=0.95,
         messages=test_messages,
         system=test_system,
         tools=[],
         betas=["interleaved-thinking-2025-05-14"],
+        extra_body={"temperature": 0.6, "top_k": 50, "top_p": 0.95},
     )
 
 
@@ -212,7 +221,7 @@ async def test_anthropic_run_inference_client_exception():
     service._client = AsyncMock()
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     mock_adapter.get_llm_invocation_params.return_value = AnthropicLLMInvocationParams(
         messages=[], system="Test system", tools=[]
     )
@@ -234,7 +243,7 @@ async def test_google_run_inference_with_llm_context():
 
     # Setup mocks
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     test_messages = [{"role": "user", "content": "Hello, world!"}]
     test_system = "You are a helpful assistant"
     mock_adapter.get_llm_invocation_params.return_value = GeminiLLMInvocationParams(
@@ -259,7 +268,7 @@ async def test_google_run_inference_with_llm_context():
     assert result == "Hello! How can I help you today?"
     service.get_llm_adapter.assert_called_once()
     mock_adapter.get_llm_invocation_params.assert_called_once_with(
-        mock_context, system_instruction=None
+        mock_context, system_instruction=None, ensure_last_message_is_user=False
     )
     service._client.aio.models.generate_content.assert_called_once()
 
@@ -273,7 +282,7 @@ async def test_google_run_inference_client_exception():
     service._client = AsyncMock()
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     mock_adapter.get_llm_invocation_params.return_value = GeminiLLMInvocationParams(
         messages=[], system_instruction="Test system", tools=NotGiven()
     )
@@ -305,7 +314,7 @@ async def test_aws_bedrock_run_inference_with_llm_context():
 
     # Setup mocks
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     test_messages = [{"role": "user", "content": [{"text": "Hello, world!"}]}]
     test_system = [{"text": "You are a helpful assistant"}]
     mock_adapter.get_llm_invocation_params.return_value = AWSBedrockLLMInvocationParams(
@@ -356,7 +365,7 @@ async def test_aws_bedrock_run_inference_client_exception():
     )
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     mock_adapter.get_llm_invocation_params.return_value = AWSBedrockLLMInvocationParams(
         messages=[], system=[{"text": "Test system"}], tools=[], tool_choice=None
     )
@@ -384,7 +393,7 @@ async def test_aws_bedrock_streaming_captures_all_tool_calls():
     )
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     mock_adapter.get_llm_invocation_params.return_value = AWSBedrockLLMInvocationParams(
         messages=[{"role": "user", "content": [{"text": "What's the weather?"}]}],
         system=[],
@@ -460,7 +469,7 @@ async def test_openai_run_inference_system_instruction_overrides_context():
         service._client = AsyncMock()
 
         mock_context = MagicMock(spec=LLMContext)
-        mock_adapter = MagicMock()
+        mock_adapter = _mock_adapter()
         test_messages = [
             {"role": "system", "content": "Original system message"},
             {"role": "user", "content": "Hello"},
@@ -497,7 +506,7 @@ async def test_openai_run_inference_system_instruction_none_unchanged():
         service._client = AsyncMock()
 
         mock_context = MagicMock(spec=LLMContext)
-        mock_adapter = MagicMock()
+        mock_adapter = _mock_adapter()
         test_messages = [
             {"role": "system", "content": "Original system message"},
             {"role": "user", "content": "Hello"},
@@ -530,7 +539,7 @@ async def test_anthropic_run_inference_system_instruction_overrides_context():
     service._client = AsyncMock()
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     test_messages = [{"role": "user", "content": "Hello"}]
     mock_adapter.get_llm_invocation_params.return_value = AnthropicLLMInvocationParams(
         messages=test_messages, system="Original system", tools=[]
@@ -551,7 +560,32 @@ async def test_anthropic_run_inference_system_instruction_overrides_context():
         enable_prompt_caching=False,
         system_instruction="New system instruction",
         ensure_last_message_is_user=False,
+        system_prompt_cache_ttl=None,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ttl", [None, "1h"])
+async def test_anthropic_run_inference_system_prompt_cache_ttl(ttl):
+    """The system_prompt_cache_ttl setting reaches the system prompt sent to Anthropic."""
+    service = AnthropicLLMService(
+        api_key="test-key",
+        settings=AnthropicLLMService.Settings(
+            model="claude-3-sonnet-20240229",
+            enable_prompt_caching=True,
+            system_prompt_cache_ttl=ttl,
+        ),
+    )
+    service._client = AsyncMock()
+    service._client.beta.messages.create.return_value = MagicMock(content=[])
+
+    await service.run_inference(
+        LLMContext(messages=[{"role": "user", "content": "Hello"}]),
+        system_instruction="Be helpful.",
+    )
+
+    [system_block] = service._client.beta.messages.create.call_args.kwargs["system"]
+    assert system_block["cache_control"].get("ttl") == ttl
 
 
 @pytest.mark.asyncio
@@ -563,7 +597,7 @@ async def test_anthropic_run_inference_system_instruction_none_unchanged():
     service._client = AsyncMock()
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     test_messages = [{"role": "user", "content": "Hello"}]
     mock_adapter.get_llm_invocation_params.return_value = AnthropicLLMInvocationParams(
         messages=test_messages, system="Original system", tools=[]
@@ -591,7 +625,7 @@ async def test_google_run_inference_system_instruction_overrides_context():
     service._client = AsyncMock()
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     test_messages = [{"role": "user", "content": "Hello"}]
     mock_adapter.get_llm_invocation_params.return_value = GeminiLLMInvocationParams(
         messages=test_messages, system_instruction="Original system", tools=NotGiven()
@@ -612,7 +646,7 @@ async def test_google_run_inference_system_instruction_overrides_context():
     assert result == "Response"
     # Verify the adapter was called with the correct system_instruction
     mock_adapter.get_llm_invocation_params.assert_called_once_with(
-        mock_context, system_instruction="New system instruction"
+        mock_context, system_instruction="New system instruction", ensure_last_message_is_user=False
     )
 
 
@@ -625,7 +659,7 @@ async def test_google_run_inference_system_instruction_none_unchanged():
     service._client = AsyncMock()
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     test_messages = [{"role": "user", "content": "Hello"}]
     mock_adapter.get_llm_invocation_params.return_value = GeminiLLMInvocationParams(
         messages=test_messages, system_instruction="Original system", tools=NotGiven()
@@ -657,7 +691,7 @@ async def test_aws_bedrock_run_inference_system_instruction_overrides_context():
     )
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     test_messages = [{"role": "user", "content": [{"text": "Hello"}]}]
     mock_adapter.get_llm_invocation_params.return_value = AWSBedrockLLMInvocationParams(
         messages=test_messages,
@@ -697,7 +731,7 @@ async def test_aws_bedrock_run_inference_system_instruction_none_unchanged():
     )
 
     mock_context = MagicMock(spec=LLMContext)
-    mock_adapter = MagicMock()
+    mock_adapter = _mock_adapter()
     test_messages = [{"role": "user", "content": [{"text": "Hello"}]}]
     mock_adapter.get_llm_invocation_params.return_value = AWSBedrockLLMInvocationParams(
         messages=test_messages,
@@ -1070,9 +1104,9 @@ def _mocked_openai_service():
         service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4"))
     service._client = AsyncMock()
     mock_adapter = MagicMock()
-    mock_adapter.get_llm_invocation_params.return_value = OpenAILLMInvocationParams(
+    mock_adapter.get_llm_invocation_params = AsyncMock(return_value=OpenAILLMInvocationParams(
         messages=[], tools=OPENAI_NOT_GIVEN, tool_choice=OPENAI_NOT_GIVEN
-    )
+    ))
     service.get_llm_adapter = MagicMock(return_value=mock_adapter)
     return service
 
@@ -1113,9 +1147,9 @@ async def test_anthropic_run_inference_with_usage_normalizes_cache_tokens():
     )
     service._client = AsyncMock()
     mock_adapter = MagicMock()
-    mock_adapter.get_llm_invocation_params.return_value = AnthropicLLMInvocationParams(
+    mock_adapter.get_llm_invocation_params = AsyncMock(return_value=AnthropicLLMInvocationParams(
         messages=[{"role": "user", "content": "hi"}], system="sys", tools=[]
-    )
+    ))
     service.get_llm_adapter = MagicMock(return_value=mock_adapter)
 
     mock_response = MagicMock()
@@ -1147,11 +1181,11 @@ async def test_google_run_inference_with_usage_includes_thoughts():
     )
     service._client = AsyncMock()
     mock_adapter = MagicMock()
-    mock_adapter.get_llm_invocation_params.return_value = GeminiLLMInvocationParams(
+    mock_adapter.get_llm_invocation_params = AsyncMock(return_value=GeminiLLMInvocationParams(
         messages=[{"role": "user", "content": "hi"}],
         system_instruction="sys",
         tools=NotGiven(),
-    )
+    ))
     service.get_llm_adapter = MagicMock(return_value=mock_adapter)
 
     mock_response = MagicMock()
@@ -1189,12 +1223,12 @@ async def test_aws_bedrock_run_inference_with_usage_normalizes_cache_tokens():
         )
     )
     mock_adapter = MagicMock()
-    mock_adapter.get_llm_invocation_params.return_value = AWSBedrockLLMInvocationParams(
+    mock_adapter.get_llm_invocation_params = AsyncMock(return_value=AWSBedrockLLMInvocationParams(
         messages=[{"role": "user", "content": [{"text": "hi"}]}],
         system=[{"text": "sys"}],
         tools=[],
         tool_choice=None,
-    )
+    ))
     service.get_llm_adapter = MagicMock(return_value=mock_adapter)
 
     mock_client = AsyncMock()
@@ -1285,3 +1319,315 @@ async def test_run_inference_delegates_to_run_inference_with_usage():
 
     assert result == "hi"
     service._client.chat.completions.create.assert_called_once()
+# A reply schema for the response_schema tests.
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "string", "enum": ["yes", "no"]}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+@pytest.mark.asyncio
+async def test_openai_run_inference_response_schema():
+    """A response schema goes to chat completions as a strict json_schema response format."""
+    with patch.object(OpenAILLMService, "create_client"):
+        service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4o-mini"))
+        service._client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"answer": "yes"}'
+        service._client.chat.completions.create.return_value = mock_response
+
+        result = await service.run_inference(
+            LLMContext(messages=[{"role": "user", "content": "Is water wet?"}]),
+            response_schema=RESPONSE_SCHEMA,
+        )
+
+        assert result == '{"answer": "yes"}'
+        call_kwargs = service._client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {"name": "response", "schema": RESPONSE_SCHEMA, "strict": True},
+        }
+
+
+@pytest.mark.asyncio
+async def test_openai_run_inference_without_response_schema_sends_no_format():
+    with patch.object(OpenAILLMService, "create_client"):
+        service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4o-mini"))
+        service._client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "yes"
+        service._client.chat.completions.create.return_value = mock_response
+
+        await service.run_inference(LLMContext(messages=[{"role": "user", "content": "?"}]))
+
+        assert "response_format" not in service._client.chat.completions.create.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_run_inference_response_schema():
+    """A response schema goes to the Responses API as a strict json_schema text format."""
+    with patch.object(OpenAIResponsesLLMService, "_create_client"):
+        service = OpenAIResponsesLLMService(
+            settings=OpenAIResponsesLLMService.Settings(model="gpt-4.1")
+        )
+        service._client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.output_text = '{"answer": "no"}'
+        service._client.responses.create = AsyncMock(return_value=mock_response)
+
+        result = await service.run_inference(
+            LLMContext(messages=[{"role": "user", "content": "Is fire cold?"}]),
+            response_schema=RESPONSE_SCHEMA,
+        )
+
+        assert result == '{"answer": "no"}'
+        call_kwargs = service._client.responses.create.call_args.kwargs
+        assert call_kwargs["text"] == {
+            "format": {
+                "type": "json_schema",
+                "name": "response",
+                "schema": RESPONSE_SCHEMA,
+                "strict": True,
+            }
+        }
+
+
+@pytest.mark.asyncio
+async def test_anthropic_run_inference_response_schema():
+    """A response schema goes to Anthropic as a json_schema output format."""
+    service = AnthropicLLMService(
+        api_key="test-key", settings=AnthropicLLMService.Settings(model="claude-haiku-4-5")
+    )
+    service._client = AsyncMock()
+    mock_adapter = _mock_adapter()
+    mock_adapter.get_llm_invocation_params = AsyncMock(return_value=AnthropicLLMInvocationParams(
+        messages=[{"role": "user", "content": "Is water wet?"}], system="Answer.", tools=[]
+    ))
+    service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock()]
+    mock_response.content[0].text = '{"answer": "yes"}'
+    service._client.beta.messages.create.return_value = mock_response
+
+    result = await service.run_inference(
+        MagicMock(spec=LLMContext), response_schema=RESPONSE_SCHEMA
+    )
+
+    assert result == '{"answer": "yes"}'
+    call_kwargs = service._client.beta.messages.create.call_args.kwargs
+    assert call_kwargs["output_config"] == {
+        "format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}
+    }
+
+
+@pytest.mark.asyncio
+async def test_google_run_inference_response_schema():
+    """A response schema goes to Gemini as a JSON mime type and a response JSON schema."""
+    service = GoogleLLMService(
+        api_key="test-key", settings=GoogleLLMService.Settings(model="gemini-2.5-flash")
+    )
+    service._client = AsyncMock()
+    mock_adapter = _mock_adapter()
+    mock_adapter.get_llm_invocation_params = AsyncMock(return_value=GeminiLLMInvocationParams(
+        messages=[{"role": "user", "content": "Is water wet?"}],
+        system_instruction="Answer.",
+        tools=NotGiven(),
+    ))
+    service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+    mock_response = MagicMock()
+    mock_response.candidates = [MagicMock()]
+    mock_response.candidates[0].content.parts = [MagicMock()]
+    mock_response.candidates[0].content.parts[0].text = '{"answer": "yes"}'
+    service._client.aio = AsyncMock()
+    service._client.aio.models = AsyncMock()
+    service._client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+    result = await service.run_inference(
+        MagicMock(spec=LLMContext), response_schema=RESPONSE_SCHEMA
+    )
+
+    assert result == '{"answer": "yes"}'
+    config = service._client.aio.models.generate_content.call_args.kwargs["config"]
+    assert config.response_mime_type == "application/json"
+    assert config.response_json_schema == RESPONSE_SCHEMA
+
+
+@pytest.mark.asyncio
+async def test_aws_bedrock_run_inference_ignores_response_schema():
+    """Bedrock has no reply schema, so the request goes out without one."""
+    service = AWSBedrockLLMService(
+        settings=AWSBedrockLLMService.Settings(model="anthropic.claude-3-sonnet-20240229-v1:0")
+    )
+    mock_adapter = _mock_adapter()
+    mock_adapter.get_llm_invocation_params = AsyncMock(return_value=AWSBedrockLLMInvocationParams(
+        messages=[{"role": "user", "content": [{"text": "Is water wet?"}]}],
+        system=[{"text": "Answer."}],
+        tools=[],
+        tool_choice=None,
+    ))
+    service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+    mock_client = AsyncMock()
+    mock_client.converse.return_value = {"output": {"message": {"content": [{"text": "yes"}]}}}
+    mock_context_manager = AsyncMock()
+    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
+    with patch.object(service._aws_session, "create_client", return_value=mock_context_manager):
+        result = await service.run_inference(
+            MagicMock(spec=LLMContext), response_schema=RESPONSE_SCHEMA
+        )
+
+    assert result == "yes"
+    assert "toolConfig" not in mock_client.converse.call_args.kwargs
+
+
+@pytest.mark.parametrize(
+    "model, supported",
+    [
+        ("gpt-4o-mini", True),
+        ("gpt-4o-2024-08-06", True),
+        ("gpt-4.1", True),
+        ("gpt-5-mini", True),
+        ("o3", True),
+        ("gpt-4o-2024-05-13", False),
+        ("gpt-4-turbo", False),
+        ("gpt-4", False),
+        ("gpt-3.5-turbo", False),
+        ("o1-mini", False),
+    ],
+)
+def test_openai_supports_response_schema(model, supported):
+    assert OpenAILLMService.supports_response_schema is True
+    assert OpenAILLMService.model_supports_response_schema(model) is supported
+    assert OpenAIResponsesLLMService.supports_response_schema is True
+    assert OpenAIResponsesLLMService.model_supports_response_schema(model) is supported
+
+
+@pytest.mark.parametrize(
+    "model, supported",
+    [
+        ("claude-haiku-4-5", True),
+        ("claude-sonnet-4-5-20250929", True),
+        ("claude-opus-4-6", True),
+        ("claude-fable-5-1", True),
+        ("claude-mythos-preview", True),
+        ("claude-opus-4-1-20250805", False),
+        ("claude-sonnet-4-20250514", False),
+        ("claude-3-7-sonnet-20250219", False),
+        ("claude-3-5-haiku-20241022", False),
+    ],
+)
+def test_anthropic_supports_response_schema(model, supported):
+    assert AnthropicLLMService.supports_response_schema is True
+    assert AnthropicLLMService.model_supports_response_schema(model) is supported
+
+
+@pytest.mark.parametrize(
+    "model, supported",
+    [
+        ("gemini-2.5-flash", True),
+        ("gemini-3.6-flash", True),
+        ("gemini-3.1-pro-preview", True),
+        ("gemini-flash-latest", True),
+        ("gemini-2.0-flash-001", False),
+        ("gemini-1.5-pro", False),
+    ],
+)
+def test_google_supports_response_schema(model, supported):
+    assert GoogleLLMService.supports_response_schema is True
+    assert GoogleLLMService.model_supports_response_schema(model) is supported
+
+
+def test_services_without_response_schema():
+    """Bedrock's Converse API and DeepSeek's chat API have no reply schema."""
+    assert AWSBedrockLLMService.supports_response_schema is False
+    assert DeepSeekLLMService.supports_response_schema is False
+
+
+@pytest.mark.asyncio
+async def test_openai_run_inference_response_schema_ignored_on_legacy_model():
+    """A model without schema support gets no response format, and a warning says so."""
+    from loguru import logger
+
+    warnings_seen = []
+    handler = logger.add(lambda message: warnings_seen.append(message), level="WARNING")
+    try:
+        with patch.object(OpenAILLMService, "create_client"):
+            service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4-turbo"))
+            service._client = AsyncMock()
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock()]
+            mock_response.choices[0].message.content = "yes"
+            service._client.chat.completions.create.return_value = mock_response
+
+            result = await service.run_inference(
+                LLMContext(messages=[{"role": "user", "content": "?"}]),
+                response_schema=RESPONSE_SCHEMA,
+            )
+    finally:
+        logger.remove(handler)
+
+    assert result == "yes"
+    assert "response_format" not in service._client.chat.completions.create.call_args.kwargs
+    assert any(
+        "response_schema is not supported by model gpt-4-turbo" in str(m) for m in warnings_seen
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_run_inference_response_schema_ignored_on_legacy_model():
+    service = AnthropicLLMService(
+        api_key="test-key", settings=AnthropicLLMService.Settings(model="claude-3-5-haiku-20241022")
+    )
+    service._client = AsyncMock()
+    mock_adapter = _mock_adapter()
+    mock_adapter.get_llm_invocation_params = AsyncMock(return_value=AnthropicLLMInvocationParams(
+        messages=[{"role": "user", "content": "Is water wet?"}], system="Answer.", tools=[]
+    ))
+    service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock()]
+    mock_response.content[0].text = "yes"
+    service._client.beta.messages.create.return_value = mock_response
+
+    result = await service.run_inference(
+        MagicMock(spec=LLMContext), response_schema=RESPONSE_SCHEMA
+    )
+
+    assert result == "yes"
+    call_kwargs = service._client.beta.messages.create.call_args.kwargs
+    assert "output_config" not in call_kwargs
+
+
+@pytest.mark.asyncio
+async def test_google_run_inference_response_schema_ignored_on_legacy_model():
+    service = GoogleLLMService(
+        api_key="test-key", settings=GoogleLLMService.Settings(model="gemini-2.0-flash")
+    )
+    service._client = AsyncMock()
+    mock_adapter = _mock_adapter()
+    mock_adapter.get_llm_invocation_params = AsyncMock(return_value=GeminiLLMInvocationParams(
+        messages=[{"role": "user", "content": "Is water wet?"}],
+        system_instruction="Answer.",
+        tools=NotGiven(),
+    ))
+    service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+    mock_response = MagicMock()
+    mock_response.candidates = [MagicMock()]
+    mock_response.candidates[0].content.parts = [MagicMock()]
+    mock_response.candidates[0].content.parts[0].text = "yes"
+    service._client.aio = AsyncMock()
+    service._client.aio.models = AsyncMock()
+    service._client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+    result = await service.run_inference(
+        MagicMock(spec=LLMContext), response_schema=RESPONSE_SCHEMA
+    )
+
+    assert result == "yes"
+    config = service._client.aio.models.generate_content.call_args.kwargs["config"]
+    assert config.response_mime_type is None
+    assert config.response_json_schema is None

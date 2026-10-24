@@ -16,7 +16,7 @@ import inspect
 import json
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from loguru import logger
 
@@ -149,8 +149,9 @@ def _get_system_instruction(service, context) -> str | None:
     Returns:
         The system instruction text, or None if none is present.
     """
-    if hasattr(service, "_settings") and getattr(service._settings, "system_instruction", None):
-        return service._settings.system_instruction
+    system_instruction = getattr(getattr(service, "settings", None), "system_instruction", None)
+    if system_instruction:
+        return system_instruction
 
     if not context:
         return None
@@ -429,7 +430,7 @@ def traced_tts(func: Callable | None = None, *, name: str | None = None) -> Call
                 if not isinstance(frame, MetricsFrame):
                     return
                 try:
-                    playing_id = getattr(service, "_playing_context_id", None)
+                    playing_id = service._audio_context_manager.playing_context_id
                     if playing_id is None:
                         return
                     entry = service._tts_spans.get(playing_id)
@@ -458,7 +459,7 @@ def traced_tts(func: Callable | None = None, *, name: str | None = None) -> Call
                 return await orig_completed(context_id)
 
             def traced_reset_active_audio_context():
-                playing_id = getattr(service, "_playing_context_id", None)
+                playing_id = service._audio_context_manager.playing_context_id
                 if playing_id is not None:
                     end_tts_span(service, playing_id, interrupted=True)
                 return orig_reset_active()
@@ -1431,16 +1432,16 @@ def traced_gemini_live(operation: str) -> Callable:
                                 usage = msg.usage_metadata
                                 operation_attrs["gen_ai.usage.input_tokens"] = (
                                     usage.prompt_token_count or 0
-                                )
+                                ) + (usage.tool_use_prompt_token_count or 0)
                                 operation_attrs["gen_ai.usage.output_tokens"] = (
                                     usage.response_token_count or 0
-                                )
+                                ) + (usage.thoughts_token_count or 0)
                                 if usage.cached_content_token_count is not None:
                                     operation_attrs["gen_ai.usage.cache_read.input_tokens"] = (
                                         usage.cached_content_token_count
                                     )
                                 if usage.thoughts_token_count is not None:
-                                    operation_attrs["gen_ai.usage.reasoning_tokens"] = (
+                                    operation_attrs["gen_ai.usage.reasoning.output_tokens"] = (
                                         usage.thoughts_token_count
                                     )
                                 input_audio_tokens = _gemini_audio_modality_tokens(

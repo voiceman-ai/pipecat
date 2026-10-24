@@ -14,23 +14,25 @@ import base64
 import json
 import time
 import urllib.parse
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from typing import Any, Literal
+from typing import Any, Literal, Self, cast
 
 from loguru import logger
 from typing_extensions import override
 from websockets.asyncio.client import connect as websocket_connect
 
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.adapters.services.inworld_realtime_adapter import InworldRealtimeLLMAdapter
+from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
+from pipecat.adapters.llm.services.inworld_realtime_adapter import InworldRealtimeLLMAdapter
 from pipecat.frames.frames import (
-    AggregationType,
     BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
     Frame,
+    FunctionCallCancelFrame,
+    FunctionCallResultFrame,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
@@ -43,7 +45,7 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     ProposedUserStartedSpeakingFrame,
     ProposedUserStoppedSpeakingFrame,
-    StartFrame,
+    TextType,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -55,8 +57,8 @@ from pipecat.frames.frames import (
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators import async_tool_messages
 from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMessage
-from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.services.llm_service import FunctionCallFromLLM, LLMService, LLMWithBackendRole
 from pipecat.services.settings import LLMSettings
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.time import time_now_iso8601
@@ -114,7 +116,7 @@ class InworldRealtimeLLMSettings(LLMSettings):
 
     # -- apply_update override -----------------------------------------------
 
-    def apply_update(self, delta: "InworldRealtimeLLMService.Settings") -> dict[str, Any]:
+    def apply_update(self, delta: Self) -> dict[str, Any]:
         """Merge a delta, keeping ``model``/``system_instruction`` in sync with SP.
 
         When the delta contains ``session_properties``, it **replaces** the
@@ -210,7 +212,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
 
         llm = InworldRealtimeLLMService(
             api_key=os.getenv("INWORLD_API_KEY"),
-            llm_model="openai/gpt-4.1-nano",
+            llm_model="openai/gpt-4.1-mini",
             voice="Sarah",
             tts_model="inworld-tts-2",
         )
@@ -224,7 +226,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
             api_key=os.getenv("INWORLD_API_KEY"),
             settings=InworldRealtimeLLMService.Settings(
                 session_properties=SessionProperties(
-                    model="openai/gpt-4.1-nano",
+                    model="openai/gpt-4.1-mini",
                     temperature=0.7,
                     audio=AudioConfiguration(
                         input=AudioInput(
@@ -271,7 +273,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
 
         Args:
             api_key: Inworld API key for authentication.
-            llm_model: LLM model to use (e.g. "openai/gpt-4.1-nano").
+            llm_model: LLM model to use (e.g. "openai/gpt-4.1-mini").
                 Shorthand for ``session_properties.model``.
             voice: Voice ID for TTS output (e.g. "Sarah", "Clive").
                 Shorthand for ``session_properties.audio.output.voice``.
@@ -352,7 +354,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         self._interim_transcription_text = ""
         self._websocket = None
         self._receive_task = None
-        self._context: LLMContext = None
+        self._context: LLMContext | None = None
         self._last_context_message_count = 0
 
         self._llm_needs_conversation_setup = True
@@ -369,6 +371,17 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         self._pending_function_calls = {}
         self._completed_tool_calls = set()
         self._async_tool_warning_logged: bool = False
+        # Calls the API is waiting on, by call_id: only these can be answered
+        # with a function_call_output. Cleared on disconnect, since a reconnect
+        # replays the conversation as text and the API no longer knows the ids.
+        self._open_function_calls: set[str] = set()
+        # Something was delivered that no response has taken in yet. A response
+        # starting clears it; an inference request while it stands creates one.
+        self._results_awaiting_response = False
+        # A response was asked for while one was already running, and is owed
+        # once that one is done.
+        self._response_create_owed = False
+        self._response_active = False
 
         self._register_event_handler("on_conversation_item_created")
         self._register_event_handler("on_conversation_item_updated")
@@ -393,6 +406,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
 
         Returns:
             Configured sample rate or None if not manually configured.
+            For PCMU/PCMA formats, returns 8000 Hz (G.711 standard).
         """
         session_properties = assert_given(self._settings.session_properties)
         if not session_properties.audio:
@@ -405,8 +419,10 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         )
 
         if audio_config and audio_config.format:
-            if hasattr(audio_config.format, "rate"):
+            # PCM format has configurable rate
+            if isinstance(audio_config.format, events.PCMAudioFormat):
                 return audio_config.format.rate
+            # PCMU/PCMA formats are fixed at 8000 Hz (G.711 standard)
             elif audio_config.format.type in ("audio/pcmu", "audio/pcma"):
                 return 8000
 
@@ -432,6 +448,27 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
             and session_properties.audio.input.turn_detection is None
         )
 
+    def llm_with_backend_role_objection(self, role: LLMWithBackendRole) -> str | None:
+        """Decline the frontend role: the model calls a tool again when told a result beside it."""
+        if role == "frontend":
+            return (
+                "InworldRealtimeLLMService cannot be an LLMWithBackend frontend: given a "
+                "message beside an open tool call, its model calls the tool again instead of "
+                "taking the message in"
+            )
+        return None
+
+    @property
+    def accepts_intermediate_function_call_results(self) -> bool:
+        """Intermediate results don't reach the model here.
+
+        The API takes one output per function call, and the model behind it
+        does not act on a result put in beside the call: given one it calls the
+        tool again rather than telling the user about it. This is the same
+        model that makes ``cancel_on_interruption=False`` unreliable here.
+        """
+        return False
+
     def service_metadata_frame(self) -> LLMServiceMetadataFrame:
         """Realtime service; recommends external turn strategies when server-side VAD is active."""
         # In manual mode the server doesn't emit VAD events, so there are no turn frames.
@@ -446,11 +483,18 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
     async def _handle_interruption(self):
         """Handle user interruption of assistant speech.
 
-        Inworld's server-side VAD handles response cancellation and buffer
-        cleanup automatically, so we only need to clean up local state.
+        Server-side VAD handles response cancellation and buffer cleanup
+        automatically; in manual mode the client must send the cancel
+        and clear events explicitly.
         """
+        if self._is_manual_turn_detection():
+            await self.send_client_event(events.InputAudioBufferClearEvent())
+            await self.send_client_event(events.ResponseCancelEvent())
         await self._truncate_current_audio_response()
         await self.stop_all_metrics()
+        # Whatever the interrupted response was going to say is moot, and so is
+        # a response owed behind it: the user's turn makes one of its own.
+        self._response_create_owed = False
 
         if self._current_assistant_response:
             await self.push_frame(LLMFullResponseEndFrame())
@@ -463,10 +507,16 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
     async def _handle_user_stopped_speaking(self, frame):
         """Handle user stopped speaking event.
 
-        Inworld's server-side VAD handles commit and response creation,
-        so this is a no-op. Metrics are started in _handle_evt_speech_stopped.
+        Server-side VAD handles commit and response creation
+        automatically; in manual mode the client must send them
+        explicitly. Metrics are started in _handle_evt_speech_stopped
+        in the server-VAD path.
         """
-        pass
+        if self._is_manual_turn_detection():
+            await self.start_ttfb_metrics()
+            await self.start_processing_metrics()
+            await self.send_client_event(events.InputAudioBufferCommitEvent())
+            await self.send_client_event(events.ResponseCreateEvent())
 
     async def _handle_bot_stopped_speaking(self):
         """Handle bot stopped speaking event."""
@@ -484,8 +534,9 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         """Ensure session_properties.audio has input and output configs.
 
         Preserves Inworld-specific fields (turn_detection, voice, model) and
-        syncs the format sample rates with the transport's actual rates so
-        Inworld knows the correct input/output sample rates.
+        syncs the PCM format sample rates with the transport's actual rates so
+        Inworld knows the correct input/output sample rates. The G.711 formats
+        are fixed at 8000 Hz and carry no rate to sync.
 
         Args:
             input_sample_rate: Sample rate for audio input (Hz).
@@ -504,14 +555,25 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
             props.audio.input.format = events.PCMAudioFormat()
         if not props.audio.output.format:
             props.audio.output.format = events.PCMAudioFormat()
-        props.audio.input.format.rate = input_sample_rate
-        props.audio.output.format.rate = output_sample_rate
+        if isinstance(props.audio.input.format, events.PCMAudioFormat):
+            props.audio.input.format.rate = cast(events.SUPPORTED_SAMPLE_RATES, input_sample_rate)
+        if isinstance(props.audio.output.format, events.PCMAudioFormat):
+            props.audio.output.format.rate = cast(events.SUPPORTED_SAMPLE_RATES, output_sample_rate)
 
-    async def start(self, frame: StartFrame):
-        """Start the service and establish WebSocket connection."""
-        await super().start(frame)
-        self._ensure_audio_config(frame.audio_in_sample_rate, frame.audio_out_sample_rate)
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service and connect.
+
+        Args:
+            setup: Configuration object containing setup parameters.
+        """
+        await super().setup(setup)
+        self._ensure_audio_config(setup.audio_in_sample_rate, setup.audio_out_sample_rate)
         await self._connect()
+
+    async def cleanup(self):
+        """Release resources on teardown."""
+        await super().cleanup()
+        await self._disconnect()
 
     async def stop(self, frame: EndFrame):
         """Stop the service and close WebSocket connection."""
@@ -521,11 +583,6 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
     async def cancel(self, frame: CancelFrame):
         """Cancel the service and close WebSocket connection."""
         await super().cancel(frame)
-        await self._disconnect()
-
-    async def cleanup(self):
-        """Release resources on teardown."""
-        await super().cleanup()
         await self._disconnect()
 
     #
@@ -544,7 +601,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         if isinstance(frame, TranscriptionFrame):
             pass
         elif isinstance(frame, LLMContextFrame):
-            await self._handle_context(frame.context)
+            await self._handle_context(frame.context, direction)
         elif isinstance(frame, InputAudioRawFrame):
             if not self._audio_input_paused:
                 await self._send_user_audio(frame)
@@ -567,7 +624,70 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
 
         await self.push_frame(frame, direction)
 
-    async def _handle_context(self, context: LLMContext):
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Push a frame, delivering function call outcomes to the API on the way.
+
+        Function call results and cancellations are broadcast by the base
+        service; the downstream copy is observed here and sent to the API as it
+        is produced, intermediate results included. The frames travel on to the
+        assistant aggregator, which records them in the context and decides when
+        inference should run.
+
+        Args:
+            frame: The frame to push.
+            direction: The direction of frame pushing.
+        """
+        if direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, FunctionCallResultFrame):
+                await self._handle_function_call_result(frame)
+            elif isinstance(frame, FunctionCallCancelFrame):
+                await self._handle_function_call_cancel(frame)
+        await super().push_frame(frame, direction)
+
+    async def _handle_function_call_result(self, frame: FunctionCallResultFrame):
+        """Send one function call result to the API as it is produced.
+
+        An intermediate result can't go through the tool-result channel — the
+        API takes one output per call — so it goes in as a message carrying the
+        same envelope a text LLM would read from the context. A final result
+        answers the call, unless a reconnect has left the API without the id to
+        answer, in which case it goes in as a message too.
+        """
+        result = json.dumps(frame.result, ensure_ascii=False) if frame.result else "COMPLETED"
+        is_final = frame.properties.is_final if frame.properties else True
+
+        if not is_final:
+            logger.warning(
+                f"{self}: Inworld Realtime does not act on a tool's intermediate results; "
+                f"dropping the one for {frame.function_name}"
+            )
+            return
+        if frame.tool_call_id in self._open_function_calls:
+            await self._send_tool_result(frame.tool_call_id, result)
+        else:
+            message = async_tool_messages.build_final_result_message(frame.tool_call_id, result)
+            await self._send_message_item(cast(str, message.get("content", "")))
+
+        self._completed_tool_calls.add(frame.tool_call_id)
+        self._results_awaiting_response = True
+
+    async def _handle_function_call_cancel(self, frame: FunctionCallCancelFrame):
+        """Settle a cancelled call, so the API isn't left waiting on it."""
+        if frame.tool_call_id not in self._open_function_calls:
+            return
+        await self._send_tool_result(frame.tool_call_id, "CANCELLED")
+        self._completed_tool_calls.add(frame.tool_call_id)
+
+    async def _send_message_item(self, text: str):
+        """Put text into the conversation, for a result the API can no longer take as an output."""
+        item = events.ConversationItem(
+            type="message",
+            role="user",
+            content=[events.ItemContent(type="input_text", text=text)],
+        )
+        await self.send_client_event(events.ConversationItemCreateEvent(item=item))
+
+    async def _handle_context(self, context: LLMContext, direction: FrameDirection):
         """Handle LLM context updates."""
         if not self._context:
             self._context = context
@@ -577,6 +697,11 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         else:
             self._context = context
             await self._process_completed_function_calls(send_new_results=True)
+            # A context frame travelling upstream comes from the assistant
+            # aggregator, which is asking the model to respond to what was
+            # delivered since its last response.
+            if direction == FrameDirection.UPSTREAM and self._results_awaiting_response:
+                await self._create_response()
 
             # Check for new user messages (e.g. from text input).
             # The context is a shared mutable object, so we track the last
@@ -584,32 +709,49 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
             messages = self._context.get_messages()
             current_count = len(messages)
             if current_count > self._last_context_message_count:
+                new_messages = messages[self._last_context_message_count :]
                 last_msg = messages[-1]
                 self._last_context_message_count = current_count
 
+                # LLMSpecificMessages are opaque provider-specific payloads, not
+                # standard user messages — skip them.
+                if isinstance(last_msg, LLMSpecificMessage):
+                    return
+
+                if last_msg.get("role") != "user":
+                    # A tool result or any other message the aggregator wrote.
+                    # Only a user message needs sending, and only a user message
+                    # settles the server-VAD turn below.
+                    return
+
                 # When server-side VAD handled this turn, the server already
-                # has the user's audio and auto-created a response.  Skip
-                # sending a duplicate text item + response.create.
-                if self._server_vad_handled_turn:
+                # has the user's audio and auto-created a response. Skip the
+                # corresponding context message, but do not consume this marker
+                # for assistant/tool updates that can arrive before the deferred
+                # realtime transcript.
+                server_user_message_added = any(
+                    isinstance(message, Mapping) and message.get("role") == "user"
+                    for message in new_messages
+                )
+                if self._server_vad_handled_turn and server_user_message_added:
                     self._server_vad_handled_turn = False
                     return
 
-                if last_msg.get("role") == "user":
-                    content = last_msg.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(
-                            c.get("text", "") for c in content if c.get("type") == "text"
-                        )
-                    if content:
-                        item = events.ConversationItem(
-                            role="user",
-                            type="message",
-                            content=[events.ItemContent(type="input_text", text=content)],
-                        )
-                        await self.send_client_event(events.ConversationItemCreateEvent(item=item))
-                        await self.start_processing_metrics()
-                        await self.start_ttfb_metrics()
-                        await self.send_client_event(events.ResponseCreateEvent())
+                content = cast("str | list[dict[str, Any]]", last_msg.get("content", ""))
+                if isinstance(content, list):
+                    content = " ".join(
+                        c.get("text", "") for c in content if c.get("type") == "text"
+                    )
+                if content:
+                    item = events.ConversationItem(
+                        role="user",
+                        type="message",
+                        content=[events.ItemContent(type="input_text", text=content)],
+                    )
+                    await self.send_client_event(events.ConversationItemCreateEvent(item=item))
+                    await self.start_processing_metrics()
+                    await self.start_ttfb_metrics()
+                    await self.send_client_event(events.ResponseCreateEvent())
 
     async def _handle_messages_append(self, frame):
         """Handle appending messages to the context (not yet supported)."""
@@ -625,7 +767,10 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         Args:
             event: The client event to send.
         """
-        await self._ws_send(event.model_dump(exclude_none=True))
+        message = event.model_dump(exclude_none=True, by_alias=True)
+        if isinstance(event, events.SessionUpdateEvent):
+            logger.debug(f"{self} sending session.update: {json.dumps(message)}")
+        await self._ws_send(message)
 
     async def _connect(self):
         """Establish WebSocket connection to Inworld."""
@@ -639,7 +784,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
                 auth_header = f"Basic {self.api_key}"
 
             # Inworld requires key and protocol query parameters
-            session_key = f"pipecat-realtime-{int(time.time() * 1000)}"
+            session_key = f"pipecat-realtime-{uuid.uuid4().hex}"
             params = urllib.parse.urlencode({"key": session_key, "protocol": "realtime"})
             separator = "&" if "?" in self.base_url else "?"
             uri = f"{self.base_url}{separator}{params}"
@@ -671,6 +816,11 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
                 self._receive_task = None
 
             self._completed_tool_calls = set()
+            # A new session knows none of the old call ids, and no response is
+            # running in it.
+            self._open_function_calls = set()
+            self._response_active = False
+            self._response_create_owed = False
             self._async_tool_warning_logged = False
             self._audio_buffer = b""
             self._interim_transcription_text = ""
@@ -698,7 +848,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         if "session_properties" in changed and input_rate and output_rate:
             self._ensure_audio_config(input_rate, output_rate)
 
-        handled = {"session_properties", "system_instruction", "model"}
+        handled = {"session_properties", "system_instruction", "model", "temperature"}
         if changed.keys() & handled:
             await self._send_session_update()
         self._warn_unhandled_updated_settings(changed.keys() - handled)
@@ -712,25 +862,34 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         adapter = self.get_llm_adapter()
 
         if self._context:
-            llm_invocation_params = adapter.get_llm_invocation_params(
+            llm_invocation_params = await adapter.get_llm_invocation_params(
                 self._context,
                 system_instruction=assert_given(self._settings.system_instruction),
+                service_tools=settings.tools,
             )
-
-            # tools given in the context override the tools in the session properties
-            if llm_invocation_params["tools"]:
-                settings.tools = llm_invocation_params["tools"]
 
             # The adapter resolves conflicts between init-provided and
             # context-provided system instructions (preferring init-provided).
             if llm_invocation_params["system_instruction"]:
                 settings.instructions = llm_invocation_params["system_instruction"]
 
-        # Convert ToolsSchema to list of dicts if needed
-        if settings.tools and isinstance(settings.tools, ToolsSchema):
-            settings.tools = adapter.from_standard_tools(settings.tools)
+            # The adapter settles the tools too: the context's own when it has
+            # any, else the init-provided ones; built-in tools ride along either way.
+            settings.tools = cast(list[events.InworldTool], llm_invocation_params["tools"])
+        else:
+            # No context yet: the init-provided tools; built-in tools ride along.
+            settings.tools = cast(
+                list[events.InworldTool], adapter.from_standard_tools(settings.tools)
+            )
 
-        settings.provider_data = {"metadata": {"sdk": "pipecat-realtime"}}
+        provider_data = dict(settings.provider_data or {})
+        metadata = dict(provider_data.get("metadata") or {})
+        metadata["sdk"] = "pipecat-realtime"
+        provider_data["metadata"] = metadata
+        provider_data["auto_tool_response"] = (
+            False  # Set to false because Pipecat creates a tool response from client
+        )
+        settings.provider_data = provider_data
 
         await self.send_client_event(events.SessionUpdateEvent(session=settings))
 
@@ -740,6 +899,8 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
 
     async def _receive_task_handler(self):
         """Handle incoming WebSocket messages."""
+        assert self._websocket is not None
+
         async for message in self._websocket:
             try:
                 raw = json.loads(message)
@@ -767,7 +928,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
             elif evt.type == "session.updated":
                 await self._handle_evt_session_updated(evt)
             elif evt.type == "response.created":
-                pass
+                await self._handle_evt_response_created(evt)
             elif evt.type == "response.output_audio.delta":
                 await self._handle_evt_audio_delta(evt)
             elif evt.type == "response.output_audio.done":
@@ -895,6 +1056,14 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
 
     async def _handle_evt_response_done(self, evt):
         """Handle response.done event."""
+        self._response_active = False
+        # A response asked for while this one was running is owed now, unless
+        # this one took in what it was for.
+        if self._response_create_owed:
+            self._response_create_owed = False
+            if self._results_awaiting_response:
+                await self._create_response()
+
         usage = evt.usage or evt.response.usage
         if usage and usage.total_tokens:
             tokens = LLMTokenUsage(
@@ -931,7 +1100,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         await self.push_frame(llm_text_frame)
 
         # Push TTSTextFrame for output aggregation
-        tts_text_frame = TTSTextFrame(text, aggregated_by=AggregationType.SENTENCE)
+        tts_text_frame = TTSTextFrame(text, text_type=TextType.SENTENCE)
         tts_text_frame.includes_inter_frame_spaces = True
         await self.push_frame(tts_text_frame)
 
@@ -943,6 +1112,10 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
             function_call_item = self._pending_function_calls.get(evt.call_id)
             if function_call_item:
                 del self._pending_function_calls[evt.call_id]
+
+                # The API is waiting on this call now, so its id can be answered
+                # with a function_call_output.
+                self._open_function_calls.add(evt.call_id)
 
                 # Inworld may omit `name` from the done event — resolve from
                 # the tracked function call item.
@@ -968,13 +1141,27 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         except Exception as e:
             logger.error(f"Failed to process function call arguments: {e}")
 
+    async def _handle_evt_response_created(self, evt):
+        """Note the response, which takes in everything delivered before it."""
+        self._response_active = True
+        self._results_awaiting_response = False
+
     async def _handle_evt_speech_started(self, evt):
         """Handle speech started event from server-side VAD."""
+        if self._is_manual_turn_detection():
+            # In manual mode, the client is responsible for broadcasting user turn frames
+            return
+
+        self._response_create_owed = False
         await self._truncate_current_audio_response()
         await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
 
     async def _handle_evt_speech_stopped(self, evt):
         """Handle speech stopped event from server-side VAD."""
+        if self._is_manual_turn_detection():
+            # In manual mode, the client is responsible for broadcasting user turn frames
+            return
+
         # Mark that the server is handling this turn (and will auto-create a
         # response when create_response=True).  This prevents _handle_context
         # from sending a duplicate ResponseCreateEvent when the user aggregator
@@ -1012,15 +1199,21 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
             self._run_llm_when_api_session_ready = True
             return
 
+        if self._response_active:
+            # The API refuses a second response while one is running. Hold this
+            # one for response.done rather than losing it to that error.
+            logger.debug("Response already active — holding the next one until it is done")
+            self._response_create_owed = True
+            return
+
+        assert self._context is not None
+
         adapter = self.get_llm_adapter()
 
         if self._llm_needs_conversation_setup:
-            logger.debug(
-                f"Setting up Inworld conversation with initial messages: "
-                f"{adapter.get_messages_for_logging(self._context)}"
-            )
+            self._log_llm_conversation_setup(self._context)
 
-            llm_invocation_params = adapter.get_llm_invocation_params(
+            llm_invocation_params = await adapter.get_llm_invocation_params(
                 self._context,
                 system_instruction=assert_given(self._settings.system_instruction),
             )
@@ -1049,6 +1242,8 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
 
     async def _process_completed_function_calls(self, send_new_results: bool):
         """Process completed function calls and send results to the service."""
+        assert self._context is not None
+
         # If the user registered a function with cancel_on_interruption=False,
         # the aggregator emits async-tool-style messages into the context. As
         # of this writing, Inworld Realtime doesn't appear to handle the
@@ -1076,8 +1271,6 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
                     self._async_tool_warning_logged = True
                     break
 
-        sent_new_result = False
-
         for message in self._context.get_messages():
             # LLMSpecificMessages are opaque provider-specific payloads, not
             # standard tool-result messages — skip them.
@@ -1096,22 +1289,14 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
                     # awaits a result; nothing to send for the started marker.
                     continue
                 if async_payload.kind == "intermediate":
-                    logger.error(
-                        f"{self}: Inworld Realtime does not support streamed async "
-                        f"tool results; dropping intermediate result for "
-                        f"tool_call_id={async_payload.tool_call_id}. Consider "
-                        f"another LLM service if your tool needs to stream "
-                        f"intermediate results."
-                    )
-                    await self.push_error(
-                        error_msg="Inworld Realtime does not support streamed async tool results.",
-                    )
+                    # Sent as a message when it was produced; the call stays
+                    # open for the final result.
                     continue
                 if async_payload.kind == "final":
                     # Deliver via the formal tool-result channel — same path
                     # as a synchronous tool result, just delayed.
                     if send_new_results:
-                        sent_new_result = True
+                        self._results_awaiting_response = True
                         await self._send_tool_result(
                             async_payload.tool_call_id, async_payload.result
                         )
@@ -1127,14 +1312,14 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
                 tool_call_id = message.get("tool_call_id")
                 if tool_call_id and tool_call_id not in self._completed_tool_calls:
                     if send_new_results:
-                        sent_new_result = True
-                        await self._send_tool_result(tool_call_id, message.get("content"))
+                        self._results_awaiting_response = True
+                        await self._send_tool_result(
+                            tool_call_id, cast(str | None, message.get("content"))
+                        )
                     self._completed_tool_calls.add(tool_call_id)
 
         # If we reported any new tool call results to the service, trigger
         # another response
-        if sent_new_result:
-            await self._create_response()
 
     async def _send_user_audio(self, frame):
         """Send user audio to Inworld, buffered to ~60ms chunks."""
@@ -1159,8 +1344,9 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
             payload = base64.b64encode(chunk).decode("utf-8")
             await self.send_client_event(events.InputAudioBufferAppendEvent(audio=payload))
 
-    async def _send_tool_result(self, tool_call_id: str, result: str):
+    async def _send_tool_result(self, tool_call_id: str, result: str | None):
         """Send a tool call result to Inworld."""
+        self._open_function_calls.discard(tool_call_id)
         item = events.ConversationItem(
             type="function_call_output",
             call_id=tool_call_id,

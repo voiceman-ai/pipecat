@@ -17,7 +17,16 @@ progresses:
   intermediate result is reported via
   ``result_callback(..., FunctionCallResultProperties(is_final=False))``.
 - A ``final`` message (``role="developer"``) is appended when the task
-  finishes.
+  finishes. A task that is cancelled instead of finishing settles the same
+  way, carrying a cancellation notice in place of a result.
+
+The ``final`` message exists so a result that arrives after the LLM has
+moved on still reaches it. When the result arrives first, before any model
+response or any new user or assistant message, there is nothing to catch up
+on: the ``started`` message is overwritten with the result, as for a
+synchronous call, and no ``final`` message is written. A cancellation always
+gets a ``final`` message, because it has to tell the LLM the task did not
+complete.
 
 This module is the single source of truth for the on-the-wire payload shape:
 
@@ -78,9 +87,24 @@ _INTERMEDIATE_DESCRIPTION = (
     "call this tool again and do not treat this as the final answer."
 )
 
+# Result shipped on the message that settles a cancelled task. It names the tool
+# call as the thing that was cancelled: a bare "CANCELLED" reads as a statement
+# about whatever the tool looks up, and a model relaying it will tell the user
+# their flight, order, or booking was cancelled.
+_CANCELLED_RESULT = "CANCELLED: this tool call was cancelled before it returned a result"
+
+# Description shipped on the message that settles a cancelled task.
+_CANCELLED_DESCRIPTION = (
+    "The asynchronous task associated with this tool_call_id was cancelled "
+    "before it produced a result, either because it ran past its deadline or "
+    "because cancellation was requested. No further results will arrive for "
+    "this tool_call_id. If the user is still waiting on it, tell them it did "
+    "not complete rather than leaving it unanswered."
+)
+
 # Standing guidance composed into the system instruction whenever an async tool is
 # registered. The per-result message says the same thing, but it arrives buried in a
-# context whose most recent turn is the user asking for something else; a model
+# context whose most recent turn may be the user asking for something else; a model
 # weighing the two follows the nearer, louder request. This states the policy before
 # any result exists, so it is in force when one arrives.
 ASYNC_TOOL_INSTRUCTIONS = """ASYNC TOOLS:
@@ -88,22 +112,24 @@ Some of your tools keep running after you have replied. Their results arrive lat
 messages in the conversation, on whatever turn happens to be in progress by then.
 
 A result that has arrived is owed to the user, whatever the conversation has moved on to. \
-Answer what the user just said first, then add the result at the end of that same reply — \
-never before your answer, and never as a reply of its own. State a short result outright; \
-for a long one, say what came back and offer the details. Say it once, and do not repeat \
-it in later replies."""
+If the user has said something you have not answered yet, answer that first, then add the \
+result at the end of that same reply — never before your answer. If you have already \
+answered everything the user said, deliver just the result — do not repeat or rephrase \
+your earlier reply. State a short result outright; for a long one, say what came back and \
+offer the details. Say it once, and do not repeat it in later replies."""
 
 # Description shipped on the final-result message.
 _FINAL_DESCRIPTION = (
     "This is the final result for the asynchronous task associated with this "
     "tool_call_id. The task has completed. No further results will arrive for "
     "this tool_call_id. You must convey this result to the user, even if the "
-    "conversation has moved on. Never leave it unsaid. First finish responding "
-    "to whatever the user is talking about now, then deliver the result at the "
-    "end of your response. How you deliver it depends on its size: if the "
-    "result is short, simply state it; if it is long or complex, name what has "
-    "come back and offer the details. Convey it once; do not repeat it in "
-    "later responses."
+    "conversation has moved on. Never leave it unsaid. If the user has said "
+    "something you have not answered yet, first finish responding to that, "
+    "then deliver the result at the end of your response; if you have already "
+    "answered, deliver just the result and do not repeat your earlier reply. "
+    "How you deliver it depends on its size: if the result is short, simply "
+    "state it; if it is long or complex, name what has come back and offer "
+    "the details. Convey it once; do not repeat it in later responses."
 )
 
 
@@ -147,7 +173,7 @@ def _payload_to_json(payload: AsyncToolMessagePayload) -> str:
     }
     if payload.result is not None:
         obj["result"] = payload.result
-    return json.dumps(obj)
+    return json.dumps(obj, ensure_ascii=False)
 
 
 def _payload_to_message(payload: AsyncToolMessagePayload) -> LLMStandardMessage:
@@ -249,6 +275,31 @@ def build_final_result_message(tool_call_id: str, result: str) -> LLMStandardMes
             status=_STATUS_FINISHED,
             description=_FINAL_DESCRIPTION,
             result=result,
+        )
+    )
+
+
+def build_cancelled_message(tool_call_id: str) -> LLMStandardMessage:
+    """Build a message settling a cancelled async-tool call in an LLM context.
+
+    Append the returned message to the LLM context when an async function call
+    is cancelled — by a timeout or at the model's request — instead of running
+    to completion. It settles the ``tool_call_id`` the same way a final result
+    does, carrying a cancellation notice in place of a result.
+
+    Args:
+        tool_call_id: The id of the tool invocation that was cancelled.
+
+    Returns:
+        A message ready to pass to ``LLMContext.add_message``.
+    """
+    return _payload_to_message(
+        AsyncToolMessagePayload(
+            kind="final",
+            tool_call_id=tool_call_id,
+            status=_STATUS_FINISHED,
+            description=_CANCELLED_DESCRIPTION,
+            result=_CANCELLED_RESULT,
         )
     )
 

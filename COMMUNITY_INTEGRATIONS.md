@@ -140,11 +140,11 @@ Keep your service page lightweight: it should point readers to your repository a
 
 - **`_process_context(self, context: LLMContext)`** — The main method that processes an LLM context and generates a response. Each LLM service overrides `process_frame` to extract context from `LLMContextFrame` and calls `_process_context`.
 
-- **`adapter_class`** — Class attribute pointing to a `BaseLLMAdapter` subclass. Defaults to `OpenAILLMAdapter`. Non-OpenAI services must implement their own adapter (see `src/pipecat/adapters/base_llm_adapter.py`) with methods:
+- **`adapter_class`** — Class attribute pointing to a `BaseLLMAdapter` subclass. Defaults to `OpenAILLMAdapter`. Non-OpenAI services must implement their own adapter (see `src/pipecat/adapters/llm/base_llm_adapter.py`) with methods:
   - `get_llm_invocation_params(context)` — Extract provider-specific params from universal context
   - `to_provider_tools_format(tools_schema)` — Convert standard tools to provider format
   - `get_messages_for_logging(context)` — Format messages for logging
-  - Reference adapters: `src/pipecat/adapters/services/` (anthropic, gemini, bedrock, etc.)
+  - Reference adapters: `src/pipecat/adapters/llm/services/` (anthropic, gemini, bedrock, etc.)
 
 - **Frame sequence:** Output must follow this frame sequence pattern:
   - `LLMFullResponseStartFrame` — Signals the start of an LLM response
@@ -292,6 +292,7 @@ from dataclasses import dataclass, field
 
 from pipecat.services.settings import TTSSettings, NOT_GIVEN
 
+
 @dataclass
 class MyTTSSettings(TTSSettings):
     """Settings for MyTTS service.
@@ -322,6 +323,7 @@ Add a `Settings` **class attribute** that points to your settings dataclass. Thi
 
 ```python
 from typing import Optional
+
 
 class MyTTSService(TTSService):
     Settings = MyTTSSettings
@@ -429,6 +431,7 @@ The base `STTService` and `LLMService` already return a sensible frame, so most 
 ```python
 from pipecat.frames.frames import STTMetadataFrame
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
+
 
 def service_metadata_frame(self) -> STTMetadataFrame:
     # This service defines turn boundaries server-side and emits

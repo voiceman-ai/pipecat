@@ -70,6 +70,7 @@ class TavusVideoService(AIService):
         replica_id: str,
         persona_id: str = "pipecat0",
         session: aiohttp.ClientSession,
+        initial_receive_bitrate: int | None = None,
         settings: Settings | None = None,
         **kwargs,
     ) -> None:
@@ -83,6 +84,10 @@ class TavusVideoService(AIService):
                 of a Tavus persona voice, and to expect audio over the
                 `conversation.echo` app message API.
             session: Async HTTP session used for communication with Tavus.
+            initial_receive_bitrate: Expected download bandwidth from the Tavus
+                room, in bits per second. The SFU starts its estimate of what it
+                can send the bot from this value, so the replica's video reaches
+                full quality sooner. ``None`` keeps Daily's default of 1 Mbps.
             settings: Runtime-updatable settings. Tavus has no model concept, so this
                 is primarily used for the ``extra`` dict.
             **kwargs: Additional arguments passed to the parent AIService class.
@@ -96,6 +101,7 @@ class TavusVideoService(AIService):
         self._session = session
         self._replica_id = replica_id
         self._persona_id = persona_id
+        self._initial_receive_bitrate = initial_receive_bitrate
 
         self._other_participant_has_joined = False
         self._client: TavusTransportClient | None = None
@@ -124,9 +130,11 @@ class TavusVideoService(AIService):
                 audio_in_enabled=True,
                 video_in_enabled=True,
                 audio_out_faster_than_realtime=True,
+                initial_receive_bitrate=self._initial_receive_bitrate,
             ),
         )
         await self._client.setup(setup)
+        await self._client.join()
 
     async def cleanup(self):
         """Release resources at teardown."""
@@ -148,6 +156,9 @@ class TavusVideoService(AIService):
         """Handle participant joining the session."""
         participant_id = participant["id"]
         logger.info(f"Participant joined {participant_id}")
+        if not self._client:
+            return
+
         if not self._other_participant_has_joined:
             self._other_participant_has_joined = True
             await self._client.capture_participant_video(
@@ -199,6 +210,8 @@ class TavusVideoService(AIService):
         Returns:
             The persona name from the Tavus client.
         """
+        # The client is built in setup(), before any caller can reach this.
+        assert self._client is not None
         return await self._client.get_persona_name()
 
     async def start(self, frame: StartFrame):
@@ -208,7 +221,9 @@ class TavusVideoService(AIService):
             frame: The start frame containing initialization parameters.
         """
         await super().start(frame)
-        await self._client.start(frame)
+        if not self._client:
+            return
+
         await self._client.start_send_task()
 
     async def stop(self, frame: EndFrame):
@@ -242,9 +257,11 @@ class TavusVideoService(AIService):
             await self._handle_interruptions()
             await self.push_frame(frame, direction)
         elif isinstance(frame, TTSAudioRawFrame):
-            await self._client.queue_tts_frame(frame)
+            if self._client:
+                await self._client.queue_tts_frame(frame)
         elif isinstance(frame, TTSStoppedFrame):
-            await self._client.queue_tts_frame(frame)
+            if self._client:
+                await self._client.queue_tts_frame(frame)
         elif isinstance(frame, OutputTransportReadyFrame):
             self._transport_ready = True
             await self.push_frame(frame, direction)
@@ -260,6 +277,9 @@ class TavusVideoService(AIService):
 
     async def _handle_interruptions(self):
         """Handle interruption events by resetting send tasks and notifying client."""
+        if not self._client:
+            return
+
         await self._client.cancel_send_task()
         await self._client.send_interrupt_message()
         await self._client.start_send_task()
@@ -267,9 +287,11 @@ class TavusVideoService(AIService):
     async def _teardown(self):
         """Gracefully ends the Tavus conversation and cancels the send task."""
         await self._end_conversation()
-        await self._client.cancel_send_task()
+        if self._client:
+            await self._client.cancel_send_task()
 
     async def _end_conversation(self):
         """End the current conversation and reset state."""
-        await self._client.stop()
+        if self._client:
+            await self._client.stop()
         self._other_participant_has_joined = False

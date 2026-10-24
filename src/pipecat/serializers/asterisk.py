@@ -9,7 +9,6 @@
 import json
 from typing import Any, Dict
 
-from loguru import logger
 
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (

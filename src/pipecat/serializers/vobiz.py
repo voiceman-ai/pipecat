@@ -8,7 +8,6 @@
 
 import base64
 import json
-from typing import Optional
 
 from loguru import logger
 from pydantic import BaseModel

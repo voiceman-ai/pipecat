@@ -31,6 +31,7 @@ from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_controller import UserTurnController
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
+from tests.frame_processor_helpers import frame_processor_setup
 
 # Short enough to keep the suite fast, long enough that a deferral cannot expire
 # between two consecutive awaits on a loaded CI box.
@@ -366,7 +367,7 @@ class TestVADUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
         await strategy.process_frame(VADUserStartedSpeakingFrame())
         self.assertIsNotNone(strategy._deferred_at)
 
-        await strategy.reset()
+        await strategy.handle_user_turn_started()
 
         self.assertTrue(strategy._bot_speaking)
         self.assertIsNone(strategy._deferred_at)
@@ -437,7 +438,7 @@ class TestDeferredBargeInReachesMinWords(unittest.IsolatedAsyncioTestCase):
                 stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=NEVER)],
             )
         )
-        await controller.setup(self.task_manager)
+        await controller.setup(frame_processor_setup(self.task_manager))
 
         starts = []
 
@@ -667,7 +668,7 @@ class TestMinWordsTurnStartPreservesBotState(unittest.IsolatedAsyncioTestCase):
                 stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=NEVER)],
             )
         )
-        await controller.setup(TaskManager())
+        await controller.setup(frame_processor_setup(TaskManager()))
 
         starts = []
 
@@ -787,7 +788,7 @@ class TestBargeInDebounce(unittest.IsolatedAsyncioTestCase):
 
         await strategy.process_frame(BotStartedSpeakingFrame())
         await strategy.process_frame(VADUserStartedSpeakingFrame())
-        await strategy.reset()
+        await strategy.handle_user_turn_started()
 
         self.assertIsNone(strategy._debounce_at)
         self.assertTrue(strategy._bot_speaking)

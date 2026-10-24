@@ -73,12 +73,10 @@ class BaseSmartTurn(BaseTurnAnalyzer):
         self._speech_triggered = False
         self._silence_ms = 0
         self._speech_start_time = 0
-        # Thread executor that will run the model. We only need one thread per
-        # analyzer because one analyzer just handles one audio stream. The
-        # thread is only reclaimed when the executor is garbage collected, and
-        # analyzers are held in the pipeline's reference cycles, so `cleanup()`
-        # releases it (and the ONNX session it keeps alive) deterministically.
-        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=1)
+        # Thread that will run the model, built on demand by `_model_executor`.
+        # One thread per analyzer is enough, since one analyzer handles one
+        # audio stream.
+        self._executor: ThreadPoolExecutor | None = None
         self._vad_start_secs: float = 0.0
 
     @property
@@ -160,26 +158,14 @@ class BaseSmartTurn(BaseTurnAnalyzer):
             Tuple containing the end-of-turn state and optional metrics data
             from the ML model analysis.
         """
-        executor = self._executor
-        if executor is None:
-            # Shut down: the analyzer is torn down but audio is still arriving.
-            # Report an incomplete turn rather than raising into the pipeline.
-            return EndOfTurnState.INCOMPLETE, None
         loop = asyncio.get_running_loop()
         state, result = await loop.run_in_executor(
-            executor, self._process_speech_segment, self._audio_buffer
+            self._model_executor, self._process_speech_segment, self._audio_buffer
         )
         if state == EndOfTurnState.COMPLETE:
             self._clear(state)
         logger.debug(f"End of Turn result: {state}")
         return state, result
-
-    async def cleanup(self):
-        """Release the analyzer's worker thread. Idempotent."""
-        await super().cleanup()
-        executor, self._executor = self._executor, None
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
 
     def update_vad_start_secs(self, vad_start_secs: float):
         """Store the new vad_start_secs value."""
@@ -188,6 +174,27 @@ class BaseSmartTurn(BaseTurnAnalyzer):
     def clear(self):
         """Reset the turn analyzer to its initial state."""
         self._clear(EndOfTurnState.COMPLETE)
+
+    @property
+    def _model_executor(self) -> ThreadPoolExecutor:
+        """The thread the model runs on, started the first time it is needed."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1)
+        return self._executor
+
+    async def cleanup(self):
+        """Release the analyzer's resources, including the thread the model runs on.
+
+        The analyzer stays usable: cleaning up is not only teardown here, since
+        a turn strategy is cleaned up and re-applied whenever the strategies are
+        updated, so the thread is started again when the next turn needs it.
+        """
+        try:
+            await super().cleanup()
+        finally:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
+                self._executor = None
 
     def _clear(self, turn_state: EndOfTurnState):
         """Clear internal state based on turn completion status."""
