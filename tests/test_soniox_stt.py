@@ -601,6 +601,8 @@ async def test_finalize_ack_hook_fires_on_fin_token(monkeypatch):
     await service._receive_messages()
 
     assert acks == [True]
+
+
 def _connected_service():
     """Build a service holding an open fake socket, without touching the network."""
     service = SonioxSTTService(api_key="test-key")

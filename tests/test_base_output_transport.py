@@ -7,8 +7,8 @@
 """Tests for interruption handling in :class:`BaseOutputTransport`."""
 
 import asyncio
-import time
 import hashlib
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -22,12 +22,12 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
-    HeartbeatFrame,
     EndFrame,
     FilterControlFrame,
     FilterEnableFrame,
     FilterUpdateSettingsFrame,
     FunctionCallInProgressFrame,
+    HeartbeatFrame,
     InterruptionFrame,
     MixerControlFrame,
     OutputAudioRawFrame,

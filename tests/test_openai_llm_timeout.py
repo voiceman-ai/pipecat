@@ -730,6 +730,8 @@ async def test_run_inference_timeout_is_overridable():
     await service.run_inference(LLMContext(messages=[{"role": "user", "content": "Hi"}]))
 
     assert captured["timeout"] == 42.0
+
+
 @pytest.mark.asyncio
 async def test_openai_llm_rejected_api_key_misconfigures_the_service():
     """Test that a rejected API key marks the service as misconfigured."""

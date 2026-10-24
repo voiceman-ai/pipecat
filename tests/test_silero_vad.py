@@ -10,9 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from loguru import logger
 import soundfile as sf
 import soxr
+from loguru import logger
 
 from pipecat.audio.vad.silero import (
     _VAD_MAX_CONSECUTIVE_ERRORS,
@@ -146,6 +146,8 @@ class TestSileroVADErrorReporting(unittest.TestCase):
         analyzer._model = _HealthyModel()
         self.assertAlmostEqual(analyzer.voice_confidence(buffer), 0.42)
         self.assertEqual(analyzer._consecutive_errors, 0)
+
+
 class TestSileroVADLongStreams(unittest.IsolatedAsyncioTestCase):
     """Silero VAD over long streams, where the model's recurrent state persists.
 

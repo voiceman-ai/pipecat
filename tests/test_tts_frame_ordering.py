@@ -34,9 +34,8 @@ Also covers the interruption-during-pause deadlock scenario (see test_no_deadloc
 import asyncio
 import unittest
 from collections.abc import AsyncGenerator, Sequence
-from dataclasses import dataclass
-from types import SimpleNamespace
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,8 +55,8 @@ from pipecat.frames.frames import (
     LLMAssistantPushAggregationFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
-    StartFrame,
     LLMTextFrame,
+    StartFrame,
     TextFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -66,10 +65,10 @@ from pipecat.frames.frames import (
     TTSTextFrame,
     VADUserStartedSpeakingFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMAssistantAggregator
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.tts_service import TextAggregationMode, TTSService
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.utils.asyncio.task_manager import TaskManager

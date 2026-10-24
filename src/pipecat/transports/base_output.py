@@ -1176,7 +1176,9 @@ class BaseOutputTransport(FrameProcessor):
                         # Send bot stopped speaking frame
                         await self._bot_stopped_speaking()
 
-                        await self._transport.push_frame(CancelWorkerFrame(), FrameDirection.UPSTREAM)
+                        await self._transport.push_frame(
+                            CancelWorkerFrame(), FrameDirection.UPSTREAM
+                        )
                         break
 
                     # Sleep before retrying

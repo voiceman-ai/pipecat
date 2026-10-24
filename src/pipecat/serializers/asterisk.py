@@ -9,7 +9,6 @@
 import json
 from typing import Any, Dict
 
-
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     CancelFrame,
