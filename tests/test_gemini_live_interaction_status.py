@@ -80,7 +80,8 @@ class _FakeServerMessage:
 def _make_service(
     *, model: str = "models/gemini-3.8-live-extended-thinking"
 ) -> GeminiLiveLLMService:
-    """Construct a service with a captured frame sink. ``__init__`` does no I/O."""
+    """Construct a service with a captured frame sink. ``__init__`` does no I/O
+    (``setup`` would — :func:`_setup_service` keeps it offline)."""
     service = GeminiLiveLLMService(
         api_key="test-key",
         settings=GeminiLiveLLMService.Settings(model=model),
@@ -97,7 +98,26 @@ def _make_service(
 
 
 async def _setup_service(service: GeminiLiveLLMService) -> None:
-    """Give the service a task manager so it can start the deferral watchdog."""
+    """Give the service a task manager so it can start the deferral watchdog.
+
+    OFFLINE. ``setup()`` connects by default (``_should_connect_on_start``), and
+    with the fake key Google answers ``1007 API key not valid``. That failure
+    runs on the service's own task — ``_handle_connection_error`` →
+    ``_reconnect`` → ``_disconnect`` → ``_discard_deferred_turn`` — which
+    cancels the very watchdog these tests await and drops the held turn they
+    assert on. Whether it landed inside a test was a race with the network: it
+    cancelled release run 40086462275 (voiceman-ai/voice-platform, 2026-10-24)
+    when Google rejected the handshake within the 50 ms watchdog, and passed
+    everywhere slower. So nothing here dials, and an attempt to is recorded
+    (``service.connect_attempts``) instead of reaching Google.
+    """
+    service.connect_attempts = []  # type: ignore[attr-defined]
+
+    async def _no_connect(session_resumption_handle=None):
+        service.connect_attempts.append(session_resumption_handle)  # type: ignore[attr-defined]
+
+    service._should_connect_on_start = lambda: False  # type: ignore[method-assign]
+    service._connect = _no_connect  # type: ignore[method-assign]
     await service.setup(
         FrameProcessorSetup(
             clock=SystemClock(),
@@ -109,6 +129,18 @@ async def _setup_service(service: GeminiLiveLLMService) -> None:
 
 def _frame_types(service) -> list[type]:
     return [type(f) for f in service.pushed_frames]
+
+
+@pytest.mark.asyncio
+async def test_the_helpers_never_dial_gemini():
+    """The guard for everything below: a set-up service has no session, no
+    connection task and no connect attempt, so no network event can reach
+    the turn state a test is asserting on."""
+    service = _make_service()
+    await _start_bot_turn(service)
+    assert service.connect_attempts == []
+    assert service._session is None
+    assert service._connection_task is None
 
 
 async def _start_bot_turn(service):
