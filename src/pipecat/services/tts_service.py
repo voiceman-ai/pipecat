@@ -2370,10 +2370,14 @@ class TTSService(AIService):
         # should carry.
         if not self._push_text_frames or self._is_streaming_tokens:
             return
+        # voiceman fork: the context records the spoken text, which the text
+        # filters decided (see _transform_text), so a sentence a filter removed
+        # from the audio is not recorded as said. Only expressive conversation,
+        # whose tags the spoken text leaves out, records the LLM's text.
         frame = TTSTextFrame(
             text,
             text_type=src_frame.text_type,
-            raw_text=src_frame.raw_text,
+            raw_text=src_frame.raw_text if self._expression_formatter else None,
             segment_id=src_frame.id,
         )
         frame.will_be_spoken = True

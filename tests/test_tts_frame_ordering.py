@@ -1097,9 +1097,17 @@ async def test_skipped_frame_follows_the_text_frame_spoken_before_it():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("service", [MockHttpPushTextTTSService, _MockWordTimestampHttpTTSService])
-async def test_the_context_records_the_text_as_the_llm_wrote_it(service):
-    """A filter changes what is spoken, not what the context records, whatever the service."""
+@pytest.mark.parametrize(
+    "service,recorded",
+    [
+        # voiceman fork: a service that reports its spoken text records what
+        # its filters left (see test_filtered_text_is_what_the_service_reports_as_spoken).
+        (MockHttpPushTextTTSService, "It's fixed now."),
+        (_MockWordTimestampHttpTTSService, "It's **fixed** now."),
+    ],
+)
+async def test_the_context_records_the_text_as_the_llm_wrote_it(service, recorded):
+    """A word-timestamp service's context keeps the LLM's text; a push-text one, the spoken text."""
     context = LLMContext()
     await run_test(
         Pipeline([service(text_filters=[MarkdownTextFilter()]), LLMAssistantAggregator(context)]),
@@ -1110,7 +1118,7 @@ async def test_the_context_records_the_text_as_the_llm_wrote_it(service):
         ],
     )
 
-    assert context.messages[-1]["content"] == "It's **fixed** now."
+    assert context.messages[-1]["content"] == recorded
 
 
 # ---------------------------------------------------------------------------

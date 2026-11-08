@@ -26,6 +26,7 @@ import time
 import unittest
 from collections.abc import Callable
 from typing import Any
+from unittest import mock
 
 from google.genai import errors
 from google.genai.types import (
@@ -52,6 +53,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineWorker, ProcessorUnusablePolicy, WorkerParams
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.google.gemini_live import llm as gemini_live_llm
 from pipecat.services.google.gemini_live.llm import MAX_CONSECUTIVE_FAILURES, GeminiLiveLLMService
 from pipecat.utils.asyncio.task_manager import TaskManager
 
@@ -193,6 +195,11 @@ class _PipelineTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.collector = _FrameCollector()
         self.unusable: list[ErrorFrame] = []
+        # voiceman fork: reconnects back off (about 5 s in all before giving
+        # up); these tests reconnect back to back.
+        patcher = mock.patch.object(gemini_live_llm, "_RECONNECT_BACKOFF_S", (0.0,))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def make_worker(self, script: Callable[[int], _FakeSession | Exception]):
         self.live = _FakeLive(script)
