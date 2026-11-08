@@ -1,0 +1,1 @@
+- `SonioxSTTService` splits agent text over 1,000 UTF-8 bytes into several `agent_text` messages, closing the segment only on the last. Soniox ends the stream with a 400 on a longer message, and a whole reply in Hebrew, Russian or Arabic reaches the limit at about 500 characters.
