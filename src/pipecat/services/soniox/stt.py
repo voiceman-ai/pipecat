@@ -61,6 +61,11 @@ _VERSIONED_MODEL = re.compile(r"stt-rt-v(\d+)")
 # The first real-time model version that accepts agent text input.
 _AGENT_TEXT_INPUT_MIN_VERSION = 6
 
+# The largest ``agent_text`` message Soniox accepts, in UTF-8 bytes. A longer
+# one is refused with a 400 that ends the stream, and a whole reply sent as one
+# message reaches it easily: 500 Hebrew or Cyrillic letters are 1,000 bytes.
+AGENT_TEXT_MAX_BYTES = 1000
+
 
 class SonioxContextGeneralItem(BaseModel):
     """Represents a key-value pair for structured general context information."""
@@ -667,15 +672,32 @@ class SonioxSTTService(WebsocketSTTService):
         return enabled and _supports_agent_text_input(s.model)
 
     async def _send_agent_text(self, text: str, end_of_segment: bool = True):
-        """Send text the bot is speaking, which Soniox places by its position in the audio."""
+        """Send text the bot is speaking, which Soniox places by its position in the audio.
+
+        Text over ``AGENT_TEXT_MAX_BYTES`` goes out as several messages, since
+        Soniox ends the stream on a longer one. Soniox joins the pieces, and
+        only the last one closes the segment.
+        """
         if not self._agent_text_input_enabled():
             return
         if self._websocket and self._websocket.state is State.OPEN:
-            message = {"type": "agent_text", "text": text, "end_of_segment": end_of_segment}
-            try:
-                await self._websocket.send(json.dumps(message))
-            except Exception as e:
-                logger.warning(f"{self}: agent text send failed: {e}")
+            pieces = split_agent_text(text, AGENT_TEXT_MAX_BYTES)
+            if len(pieces) > 1:
+                logger.warning(
+                    f"{self}: agent text of {len(text.encode())} bytes is over Soniox's "
+                    f"{AGENT_TEXT_MAX_BYTES}-byte message limit; sending it in {len(pieces)} pieces"
+                )
+            for i, piece in enumerate(pieces):
+                message = {
+                    "type": "agent_text",
+                    "text": piece,
+                    "end_of_segment": end_of_segment and i == len(pieces) - 1,
+                }
+                try:
+                    await self._websocket.send(json.dumps(message))
+                except Exception as e:
+                    logger.warning(f"{self}: agent text send failed: {e}")
+                    return
 
     async def _update_agent_text_observer(self):
         """Observe the bot's speech while echo cancellation is on."""
@@ -1049,6 +1071,48 @@ class SonioxSTTService(WebsocketSTTService):
             logger.warning(f"{self}: websocket unavailable, skipping keepalive")
             return
         await self._websocket.send(KEEPALIVE_MESSAGE)
+
+
+def split_agent_text(text: str, max_bytes: int = AGENT_TEXT_MAX_BYTES) -> list[str]:
+    """Split text into pieces of at most ``max_bytes`` UTF-8 bytes, losslessly.
+
+    Joined, the pieces are the text exactly: Soniox joins agent text pieces as
+    they come, spaces included. A piece ends after the last whitespace that
+    fits, so words stay whole, and mid-word only when one word is longer than
+    a whole piece. Text within the limit, including empty text, is one piece.
+
+    Args:
+        text: The text to split.
+        max_bytes: The largest piece, in UTF-8 bytes.
+
+    Returns:
+        The pieces, in order.
+    """
+    if len(text.encode()) <= max_bytes:
+        return [text]
+    pieces: list[str] = []
+    current: list[str] = []
+    size = 0
+    # Index in `current` just past its last whitespace, where a cut keeps words whole.
+    cut = 0
+    for ch in text:
+        n = len(ch.encode())
+        if size + n > max_bytes:
+            if 0 < cut < len(current):
+                pieces.append("".join(current[:cut]))
+                current = current[cut:]
+            else:
+                pieces.append("".join(current))
+                current = []
+            size = sum(len(c.encode()) for c in current)
+            cut = 0
+        current.append(ch)
+        size += n
+        if ch.isspace():
+            cut = len(current)
+    if current:
+        pieces.append("".join(current))
+    return pieces
 
 
 def _supports_agent_text_input(model: str | None | NotGiven) -> bool:
