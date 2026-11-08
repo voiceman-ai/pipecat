@@ -12,6 +12,7 @@ the main pipeline execution.
 """
 
 import asyncio
+import traceback
 import weakref
 from typing import Any
 
@@ -327,7 +328,20 @@ class WorkerObserver(BaseObserver):
         while True:
             data = await queue.get()
 
-            await self._dispatch(observer, data)
+            # A failing observer must not end this task, or it would get
+            # nothing more while its queue keeps growing.
+            try:
+                await self._dispatch(observer, data)
+            except Exception as e:
+                # Cancellation still ends the task, even when the observer turns it into an error.
+                if (task := asyncio.current_task()) and task.cancelling():
+                    raise
+                tb = traceback.extract_tb(e.__traceback__)
+                last = tb[-1]
+                logger.error(
+                    f"{self}: uncaught exception in observer {observer} "
+                    f"({last.filename}:{last.lineno}): {e}"
+                )
 
             queue.task_done()
 

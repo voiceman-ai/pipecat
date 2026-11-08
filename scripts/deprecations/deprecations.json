@@ -300,6 +300,50 @@
       "location": "pipecat/bus/bridge_processor.py"
     },
     {
+      "subject": "BaseClassifier.ask.images",
+      "module": "pipecat.classifiers.base_classifier",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "inputs",
+      "message": "Use ``inputs`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/classifiers/base_classifier.py"
+    },
+    {
+      "subject": "BaseClassifier.choice.images",
+      "module": "pipecat.classifiers.base_classifier",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "inputs",
+      "message": "Use ``inputs`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/classifiers/base_classifier.py"
+    },
+    {
+      "subject": "BaseClassifier.score.images",
+      "module": "pipecat.classifiers.base_classifier",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "inputs",
+      "message": "Use ``inputs`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/classifiers/base_classifier.py"
+    },
+    {
+      "subject": "BaseClassifier.yes_no.images",
+      "module": "pipecat.classifiers.base_classifier",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "inputs",
+      "message": "Use ``inputs`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/classifiers/base_classifier.py"
+    },
+    {
       "subject": "pipecat.classifiers.jev.classifier",
       "module": "pipecat.classifiers.jev.classifier",
       "kind": "module",
@@ -924,6 +968,17 @@
       "relation": "use_existing",
       "replacement": "CancelWorkerFrame",
       "message": "`CancelTaskFrame` is deprecated since 1.4.0 and will be removed in 2.0.0. Use `CancelWorkerFrame` instead.",
+      "location": "pipecat/frames/frames.py"
+    },
+    {
+      "subject": "EagerEndOfTurnCancelFrame",
+      "module": "pipecat.frames.frames",
+      "kind": "class",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "UserTurnResponseCancelFrame",
+      "message": "`EagerEndOfTurnCancelFrame` is deprecated since 1.15.0 and will be removed in 2.0.0. Use `UserTurnResponseCancelFrame` instead.",
       "location": "pipecat/frames/frames.py"
     },
     {
@@ -1629,6 +1684,171 @@
       "replacement": "TransportParams.video_in_sources",
       "message": "`maybe_capture_participant_screen` is deprecated since 1.13.0 and will be removed in 2.0.0. Use `TransportParams.video_in_sources` or `BaseTransport.capture_participant_video()` instead.",
       "location": "pipecat/runner/utils.py"
+    },
+    {
+      "subject": "FrameSerializer.InputParams.resampler_clear_after_secs",
+      "module": "pipecat.serializers.base_serializer",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "none",
+      "replacement": null,
+      "message": "No replacement. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/base_serializer.py"
+    },
+    {
+      "subject": "ExotelFrameSerializer.InputParams.exotel_sample_rate",
+      "module": "pipecat.serializers.exotel",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "audio_in_sample_rate",
+      "message": "Use ``audio_in_sample_rate`` and ``audio_out_sample_rate`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/exotel.py"
+    },
+    {
+      "subject": "ExotelFrameSerializer.InputParams.sample_rate",
+      "module": "pipecat.serializers.exotel",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate",
+      "message": "Use :attr:`~pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/exotel.py"
+    },
+    {
+      "subject": "GenesysAudioHookSerializer.InputParams.genesys_sample_rate",
+      "module": "pipecat.serializers.genesys",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "audio_in_sample_rate",
+      "message": "Use ``audio_in_sample_rate`` and ``audio_out_sample_rate`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/genesys.py"
+    },
+    {
+      "subject": "GenesysAudioHookSerializer.InputParams.sample_rate",
+      "module": "pipecat.serializers.genesys",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate",
+      "message": "Use :attr:`~pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/genesys.py"
+    },
+    {
+      "subject": "GenesysAudioHookSerializer.create_resumed_response",
+      "module": "pipecat.serializers.genesys",
+      "kind": "method",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "GenesysAudioHookSerializer.create_resume_request",
+      "message": "`GenesysAudioHookSerializer.create_resumed_response` is deprecated since 1.16.0 and will be removed in 2.0.0. Use `GenesysAudioHookSerializer.create_resume_request` instead.",
+      "location": "pipecat/serializers/genesys.py"
+    },
+    {
+      "subject": "GenesysAudioHookSerializer.on_pause",
+      "module": "pipecat.serializers.genesys",
+      "kind": "event",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "on_paused",
+      "message": "Use ``on_paused`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/genesys.py"
+    },
+    {
+      "subject": "PlivoFrameSerializer.InputParams.plivo_sample_rate",
+      "module": "pipecat.serializers.plivo",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "audio_in_sample_rate",
+      "message": "Use ``audio_in_sample_rate`` and ``audio_out_sample_rate`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/plivo.py"
+    },
+    {
+      "subject": "PlivoFrameSerializer.InputParams.sample_rate",
+      "module": "pipecat.serializers.plivo",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate",
+      "message": "Use :attr:`~pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/plivo.py"
+    },
+    {
+      "subject": "TelnyxFrameSerializer.InputParams.sample_rate",
+      "module": "pipecat.serializers.telnyx",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate",
+      "message": "Use :attr:`~pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/telnyx.py"
+    },
+    {
+      "subject": "TelnyxFrameSerializer.InputParams.telnyx_sample_rate",
+      "module": "pipecat.serializers.telnyx",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "audio_in_sample_rate",
+      "message": "Use ``audio_in_sample_rate`` and ``audio_out_sample_rate`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/telnyx.py"
+    },
+    {
+      "subject": "TwilioFrameSerializer.InputParams.sample_rate",
+      "module": "pipecat.serializers.twilio",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate",
+      "message": "Use :attr:`~pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/twilio.py"
+    },
+    {
+      "subject": "TwilioFrameSerializer.InputParams.twilio_sample_rate",
+      "module": "pipecat.serializers.twilio",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "audio_in_sample_rate",
+      "message": "Use ``audio_in_sample_rate`` and ``audio_out_sample_rate`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/twilio.py"
+    },
+    {
+      "subject": "VonageFrameSerializer.InputParams.sample_rate",
+      "module": "pipecat.serializers.vonage",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate",
+      "message": "Use :attr:`~pipecat.pipeline.worker.PipelineParams.audio_in_sample_rate` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/vonage.py"
+    },
+    {
+      "subject": "VonageFrameSerializer.InputParams.vonage_sample_rate",
+      "module": "pipecat.serializers.vonage",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "audio_in_sample_rate",
+      "message": "Use ``audio_in_sample_rate`` and ``audio_out_sample_rate`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/serializers/vonage.py"
     },
     {
       "subject": "AnthropicLLMService.InputParams",
@@ -3259,6 +3479,17 @@
       "location": "pipecat/services/groq/tts.py"
     },
     {
+      "subject": "HumeTTSService",
+      "module": "pipecat.services.hume.tts",
+      "kind": "class",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "none",
+      "replacement": null,
+      "message": "`HumeTTSService` is deprecated since 1.16.0 and will be removed in 2.0.0. No replacement. Hume shuts down its TTS API on November 13, 2026.",
+      "location": "pipecat/services/hume/tts.py"
+    },
+    {
       "subject": "HumeTTSService.InputParams",
       "module": "pipecat.services.hume.tts",
       "kind": "class",
@@ -4491,6 +4722,17 @@
       "location": "pipecat/services/simli/video.py"
     },
     {
+      "subject": "SimliVideoService.is_trinity_avatar",
+      "module": "pipecat.services.simli.video",
+      "kind": "parameter",
+      "deprecated_in": "1.16.0",
+      "removed_in": "2.0.0",
+      "relation": "none",
+      "replacement": null,
+      "message": "No replacement. Will be removed in 2.0.0.",
+      "location": "pipecat/services/simli/video.py"
+    },
+    {
       "subject": "SimliVideoService.params",
       "module": "pipecat.services.simli.video",
       "kind": "parameter",
@@ -5096,14 +5338,25 @@
       "location": "pipecat/transports/whatsapp/client.py"
     },
     {
+      "subject": "ProcessFrameResult",
+      "module": "pipecat.turns.types",
+      "kind": "class",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "pipecat.turns.user_turn_strategies.StrategyMode",
+      "message": "Use :class:`~pipecat.turns.user_turn_strategies.StrategyMode` instead. Every strategy sees every frame, and a list whose strategies all have to agree, such as a wake phrase next to VAD, is ``StrategyMode.ALL``. Will be removed in 2.0.0.",
+      "location": "pipecat/turns/types.py"
+    },
+    {
       "subject": "BaseUserTurnStartStrategy.enable_user_speaking_frames",
       "module": "pipecat.turns.user_start.base_user_turn_start_strategy",
       "kind": "parameter",
       "deprecated_in": "1.8.0",
       "removed_in": "2.0.0",
       "relation": "use_existing",
-      "replacement": "trigger_user_turn_started",
-      "message": "Use :meth:`trigger_user_turn_started`'s ``enable_user_speaking_frames`` argument instead. Will be removed in 2.0.0.",
+      "replacement": "report_user_turn_started",
+      "message": "Use :meth:`report_user_turn_started`'s ``enable_user_speaking_frames`` argument instead. Will be removed in 2.0.0.",
       "location": "pipecat/turns/user_start/base_user_turn_start_strategy.py"
     },
     {
@@ -5118,14 +5371,25 @@
       "location": "pipecat/turns/user_start/base_user_turn_start_strategy.py"
     },
     {
+      "subject": "BaseUserTurnStartStrategy.trigger_user_turn_started",
+      "module": "pipecat.turns.user_start.base_user_turn_start_strategy",
+      "kind": "method",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "report_user_turn_started",
+      "message": "`BaseUserTurnStartStrategy.trigger_user_turn_started` is deprecated since 1.15.0 and will be removed in 2.0.0. Use `report_user_turn_started` instead.",
+      "location": "pipecat/turns/user_start/base_user_turn_start_strategy.py"
+    },
+    {
       "subject": "BaseUserTurnStopStrategy.enable_user_speaking_frames",
       "module": "pipecat.turns.user_stop.base_user_turn_stop_strategy",
       "kind": "parameter",
       "deprecated_in": "1.8.0",
       "removed_in": "2.0.0",
       "relation": "use_existing",
-      "replacement": "trigger_user_turn_stopped",
-      "message": "Use :meth:`trigger_user_turn_stopped`'s ``enable_user_speaking_frames`` argument instead. Will be removed in 2.0.0.",
+      "replacement": "report_user_turn_stopped",
+      "message": "Use :meth:`report_user_turn_stopped`'s ``enable_user_speaking_frames`` argument instead. Will be removed in 2.0.0.",
       "location": "pipecat/turns/user_stop/base_user_turn_stop_strategy.py"
     },
     {
@@ -5138,6 +5402,83 @@
       "replacement": "handle_user_turn_started",
       "message": "Use :meth:`handle_user_turn_started` and :meth:`handle_user_turn_stopped` instead. Will be removed in 2.0.0.",
       "location": "pipecat/turns/user_stop/base_user_turn_stop_strategy.py"
+    },
+    {
+      "subject": "BaseUserTurnStopStrategy.trigger_user_turn_finalized",
+      "module": "pipecat.turns.user_stop.base_user_turn_stop_strategy",
+      "kind": "method",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "report_user_turn_stopped",
+      "message": "`BaseUserTurnStopStrategy.trigger_user_turn_finalized` is deprecated since 1.15.0 and will be removed in 2.0.0. Use `report_user_turn_stopped` instead.",
+      "location": "pipecat/turns/user_stop/base_user_turn_stop_strategy.py"
+    },
+    {
+      "subject": "BaseUserTurnStopStrategy.trigger_user_turn_inference_triggered",
+      "module": "pipecat.turns.user_stop.base_user_turn_stop_strategy",
+      "kind": "method",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "start_user_turn_speculation",
+      "message": "`BaseUserTurnStopStrategy.trigger_user_turn_inference_triggered` is deprecated since 1.15.0 and will be removed in 2.0.0. Use `start_user_turn_speculation` instead.",
+      "location": "pipecat/turns/user_stop/base_user_turn_stop_strategy.py"
+    },
+    {
+      "subject": "BaseUserTurnStopStrategy.trigger_user_turn_speculation_cancelled",
+      "module": "pipecat.turns.user_stop.base_user_turn_stop_strategy",
+      "kind": "method",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "cancel_user_turn_speculation",
+      "message": "`BaseUserTurnStopStrategy.trigger_user_turn_speculation_cancelled` is deprecated since 1.15.0 and will be removed in 2.0.0. Use `cancel_user_turn_speculation` instead.",
+      "location": "pipecat/turns/user_stop/base_user_turn_stop_strategy.py"
+    },
+    {
+      "subject": "BaseUserTurnStopStrategy.trigger_user_turn_stopped",
+      "module": "pipecat.turns.user_stop.base_user_turn_stop_strategy",
+      "kind": "method",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "report_user_turn_stopped",
+      "message": "`BaseUserTurnStopStrategy.trigger_user_turn_stopped` is deprecated since 1.15.0 and will be removed in 2.0.0. Use `report_user_turn_stopped` instead.",
+      "location": "pipecat/turns/user_stop/base_user_turn_stop_strategy.py"
+    },
+    {
+      "subject": "DeferredUserTurnStopStrategy",
+      "module": "pipecat.turns.user_stop.deferred_user_turn_stop_strategy",
+      "kind": "class",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "none",
+      "replacement": null,
+      "message": "`DeferredUserTurnStopStrategy` is deprecated since 1.15.0 and will be removed in 2.0.0. No replacement.",
+      "location": "pipecat/turns/user_stop/deferred_user_turn_stop_strategy.py"
+    },
+    {
+      "subject": "deferred",
+      "module": "pipecat.turns.user_stop.deferred_user_turn_stop_strategy",
+      "kind": "function",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "none",
+      "replacement": null,
+      "message": "`deferred` is deprecated since 1.15.0 and will be removed in 2.0.0. No replacement.",
+      "location": "pipecat/turns/user_stop/deferred_user_turn_stop_strategy.py"
+    },
+    {
+      "subject": "ExternalUserTurnCompletionStopStrategy",
+      "module": "pipecat.turns.user_stop.external_user_turn_completion_stop_strategy",
+      "kind": "class",
+      "deprecated_in": "1.15.0",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "ExternalUserTurnStopStrategy",
+      "message": "`ExternalUserTurnCompletionStopStrategy` is deprecated since 1.15.0 and will be removed in 2.0.0. Use `ExternalUserTurnStopStrategy` instead.",
+      "location": "pipecat/turns/user_stop/external_user_turn_completion_stop_strategy.py"
     },
     {
       "subject": "TaskManager.setup",

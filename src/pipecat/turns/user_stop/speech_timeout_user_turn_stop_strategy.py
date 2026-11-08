@@ -22,7 +22,6 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessorSetup
-from pipecat.turns.types import ProcessFrameResult
 from pipecat.turns.user_stop.base_user_turn_stop_strategy import BaseUserTurnStopStrategy
 
 
@@ -168,7 +167,7 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
         await super().cleanup()
         await self._cancel_all_tasks()
 
-    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
+    async def process_frame(self, frame: Frame):
         """Process an incoming frame to update strategy state.
 
         Updates internal transcription text and VAD state. The user end turn
@@ -176,9 +175,6 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
 
         Args:
             frame: The frame to be analyzed.
-
-        Returns:
-            Always returns CONTINUE so subsequent stop strategies are evaluated.
         """
         if isinstance(frame, STTMetadataFrame):
             self._stt_timeout = frame.ttfs_p99_latency
@@ -203,8 +199,6 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
             # on silences shorter than the VAD stop_secs — e.g. an aggressive
             # STT endpoint or a manually raised stop_secs.
             self._transcript_finalized = False
-
-        return ProcessFrameResult.CONTINUE
 
     async def _handle_vad_user_started_speaking(self, _: VADUserStartedSpeakingFrame):
         """Handle when the VAD indicates the user is speaking."""
@@ -275,7 +269,7 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
         # If both waits are already done, the turn was waiting on text —
         # trigger now.
         if self._user_speech_wait_done and self._stt_wait_done:
-            await self._maybe_trigger_user_turn_stopped()
+            await self._maybe_report_user_turn_stopped()
             return
 
         # Fallback: transcript arrived without a VAD stop. Measure inactivity
@@ -311,7 +305,7 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
             self._user_speech_timeout_task = None
 
         self._user_speech_wait_done = True
-        await self._maybe_trigger_user_turn_stopped()
+        await self._maybe_report_user_turn_stopped()
 
     async def _stt_timeout_handler(self, timeout: float):
         """Wait stt_timeout then attempt to trigger user turn stopped.
@@ -327,9 +321,9 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
             self._stt_timeout_task = None
 
         self._stt_wait_done = True
-        await self._maybe_trigger_user_turn_stopped()
+        await self._maybe_report_user_turn_stopped()
 
-    async def _maybe_trigger_user_turn_stopped(self):
+    async def _maybe_report_user_turn_stopped(self):
         """Trigger user turn stopped if all required conditions are met.
 
         Both timers must be done (stt is marked done immediately on the
@@ -362,7 +356,7 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
                     f"{self}::_user_speech_timeout_handler",
                 )
                 return
-            await self.trigger_user_turn_stopped()
+            await self.report_user_turn_stopped()
 
     # Trailing marks that never end a finished utterance (comma/colon/dash),
     # vs. terminal punctuation stripped before the word-boundary match.

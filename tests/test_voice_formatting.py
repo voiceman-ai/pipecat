@@ -43,6 +43,21 @@ class TestStripMarkdown(unittest.IsolatedAsyncioTestCase):
         result = await strip_markdown("`code`", "*")
         self.assertEqual(result, "code")
 
+    async def test_inline_code_content_kept(self):
+        cases = {
+            "call `__init__` please": "call __init__ please",
+            "`*args`": "*args",
+            "`# comment`": "# comment",
+            "`> quoted`": "> quoted",
+            "`- item`": "- item",
+            "**bold `__x__`** end": "bold __x__ end",
+            "- `*x*` item": "*x* item",
+            "`a_b` and `c*d`": "a_b and c*d",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(await strip_markdown(text, "*"), expected)
+
     async def test_alnum_preserving(self):
         text = "**Hello** and _world_"
         result = await strip_markdown(text, "*")
@@ -96,6 +111,12 @@ class TestStripMarkdown(unittest.IsolatedAsyncioTestCase):
             "Go to [example.com](https://example.com).": "Go to example.com.",
             "Visit https://example.com today": "Visit https://example.com today",
             "[**bold** link](x)": "bold link",
+            "See [Python (language)](https://en.wikipedia.org/wiki/Python_(language)) now.": (
+                "See Python (language) now."
+            ),
+            '![chart](c.png "Q3 (draft)")': "chart",
+            "Read [the [beta] guide](https://example.com/guide).": "Read the [beta] guide.",
+            "Open [the page](https://example.com/a_(b) now.": "Open the page now.",
         }
         for text, expected in cases.items():
             self.assertEqual(await strip_markdown(text, "*"), expected, text)
@@ -296,6 +317,17 @@ class TestExpandUnits(unittest.IsolatedAsyncioTestCase):
         result = await expand_units("1 g of something", "*")
         self.assertNotIn("grams", result)
 
+    async def test_ambiguous_uppercase_not_expanded(self):
+        """Uppercase 'M' and 'G' after a number are not meters or grams."""
+        self.assertEqual(await expand_units("We raised $5M", "*"), "We raised $5M")
+        self.assertEqual(await expand_units("10M downloads", "*"), "10M downloads")
+        self.assertEqual(await expand_units("Works on 5G networks", "*"), "Works on 5G networks")
+
+    async def test_ambiguous_lowercase_and_liter_symbol_expanded(self):
+        self.assertEqual(await expand_units("Run 5m", "*"), "Run 5 meters")
+        self.assertEqual(await expand_units("Add 200g of flour", "*"), "Add 200 grams of flour")
+        self.assertEqual(await expand_units("Buy 2L of milk", "*"), "Buy 2 liters of milk")
+
 
 class TestExpandUnitsSingular(unittest.IsolatedAsyncioTestCase):
     """A quantity of exactly one takes the singular form of the unit."""
@@ -494,6 +526,22 @@ class TestExpandCurrency(unittest.IsolatedAsyncioTestCase):
         # Sub-cent precision is dropped (read like a 2-digit amount), not spoken.
         self.assertEqual(await expand_currency("$3.567", "*"), "three dollars and fifty-six cents")
         self.assertEqual(await expand_currency("£1.999", "*"), "one pound and ninety-nine pence")
+
+    async def test_scale_word_after_amount(self):
+        # "$2.5 billion" is two and a half billion dollars, not two dollars and
+        # fifty cents followed by a stray "billion".
+        self.assertEqual(
+            await expand_currency("Revenue hit $2.5 billion last year", "*"),
+            "Revenue hit two point five billion dollars last year",
+        )
+        self.assertEqual(
+            await expand_currency("We raised $5 million", "*"), "We raised five million dollars"
+        )
+        self.assertEqual(await expand_currency("$1 million", "*"), "one million dollars")
+        self.assertEqual(
+            await expand_currency("€3.25 Trillion", "*"), "three point two five trillion euros"
+        )
+        self.assertEqual(await expand_currency("¥40 thousand", "*"), "forty thousand yen")
 
 
 class TestNormalizeDates(unittest.IsolatedAsyncioTestCase):

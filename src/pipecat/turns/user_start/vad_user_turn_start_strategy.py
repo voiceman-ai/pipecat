@@ -128,9 +128,6 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
 
         Args:
             frame: The frame to be analyzed.
-
-        Returns:
-            STOP if the user started speaking, CONTINUE otherwise.
         """
         if isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
@@ -211,7 +208,7 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
 
         self._deferred_at = None
         self._debounce_at = None
-        await self.trigger_user_turn_started()
+        await self.report_user_turn_started()
         return ProcessFrameResult.STOP
 
     async def _handle_bot_stopped_speaking(self) -> ProcessFrameResult:
@@ -226,7 +223,7 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
             # would have created.
             self._deferred_at = None
             self._debounce_at = None
-            await self.trigger_user_turn_started()
+            await self.report_user_turn_started()
 
         # Always CONTINUE, even after triggering. BotStoppedSpeakingFrame is
         # load-bearing for the start strategies behind us — MinWords lowers its
@@ -260,7 +257,7 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
         # The gate is no longer sure it was somebody else. Fail open and let the
         # turn start, at most defer_max_secs late.
         logger.debug(f"{self} releasing deferred barge-in: onset no longer reported far-field")
-        await self.trigger_user_turn_started()
+        await self.report_user_turn_started()
 
         # CONTINUE rather than STOP: the turn is already open, and this frame is
         # not ours to consume — it is whatever ordinary frame happened to tick
@@ -280,7 +277,7 @@ class VADUserTurnStartStrategy(BaseUserTurnStartStrategy):
 
         self._debounce_at = None
         logger.debug(f"{self} releasing barge-in: onset sustained past the hold")
-        await self.trigger_user_turn_started()
+        await self.report_user_turn_started()
 
         # CONTINUE rather than STOP: the frame that ticked the clock is not
         # ours to consume (same as deferral resolution above).
