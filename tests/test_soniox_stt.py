@@ -33,12 +33,14 @@ from pipecat.processors.filters.identity_filter import IdentityFilter
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import STTSettings
 from pipecat.services.soniox.stt import (
+    AGENT_TEXT_MAX_BYTES,
     DEFAULT_AGENT_TEXT_LEAD_MS,
     END_TOKEN,
     FINALIZED_TOKEN,
     SonioxSTTService,
     _language_from_tokens,
     language_to_soniox_language,
+    split_agent_text,
 )
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_output import BaseOutputTransport
@@ -1318,3 +1320,47 @@ async def test_setup_does_not_observe_the_pipeline_for_a_model_without_agent_tex
     await service.setup(frame_processor_setup(TaskManager(), pipeline_worker=worker))
 
     assert not worker.add_observer.called
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "Hi.",
+        "x" * AGENT_TEXT_MAX_BYTES,
+        "שלום " * 400,
+        "é" * 600,
+        "a" * 2500,
+        "ok " + "ב" * 900,
+    ],
+)
+def test_split_agent_text_is_lossless_and_within_the_limit(text):
+    pieces = split_agent_text(text)
+
+    assert "".join(pieces) == text
+    assert all(len(p.encode()) <= AGENT_TEXT_MAX_BYTES for p in pieces)
+    assert all(pieces[:-1])  # no empty piece mid-way
+
+
+def test_split_agent_text_keeps_words_whole():
+    text = "שלום " * 400  # 4,000 bytes
+
+    pieces = split_agent_text(text)
+
+    assert len(pieces) > 1
+    # Every piece but the last ends on the space after a whole word.
+    assert all(p.endswith(" ") for p in pieces[:-1])
+
+
+@pytest.mark.asyncio
+async def test_a_reply_over_the_message_limit_is_sent_in_pieces_closing_the_segment_once():
+    service, websocket = _connected_service()
+    reply = "אני מבין, תודה רבה. " * 60  # Hebrew, about 2,000 bytes
+
+    await service._process_assistant_turn(reply)
+
+    sent = [json.loads(p) for p in _sent_payloads(websocket)]
+    assert len(sent) > 1
+    assert "".join(m["text"] for m in sent) == reply
+    assert all(len(m["text"].encode()) <= AGENT_TEXT_MAX_BYTES for m in sent)
+    assert [m["end_of_segment"] for m in sent] == [False] * (len(sent) - 1) + [True]
