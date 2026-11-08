@@ -705,13 +705,21 @@ class SonioxSTTService(WebsocketSTTService):
             return
         if self._settings.enable_echo_cancellation and self._agent_text_input_enabled():
             if not self._agent_text_observer:
-                observer = BotSpeechObserver()
+                observer = self._create_agent_text_observer()
                 observer.add_event_handler("on_bot_text", self._on_bot_text)
                 observer.add_event_handler("on_bot_speech_ended", self._on_bot_speech_ended)
                 self.pipeline_worker.add_observer(observer)
                 self._agent_text_observer = observer
         else:
             await self._stop_agent_text_observer()
+
+    def _create_agent_text_observer(self) -> BotSpeechObserver:
+        """Create the observer that reports the bot's speech for echo cancellation.
+
+        Subclasses override it to report the bot's text differently, e.g. text
+        without word timestamps once the transport has played it.
+        """
+        return BotSpeechObserver()
 
     async def _stop_agent_text_observer(self):
         observer, self._agent_text_observer = self._agent_text_observer, None
