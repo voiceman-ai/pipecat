@@ -77,18 +77,17 @@ class TestRawAudioTrackTransmitTap(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([pts for _, _, pts, _ in tap.calls], [10_000_000])
 
     async def test_discarded_audio_never_reaches_the_tap(self):
-        """Audio cleared at connection close was never sent, so it is never reported.
+        """Audio the track drops when it stops was never sent, so it is never reported.
 
-        This is the teardown lie the tap exists to kill: the post-write frame
-        push fires for these bytes (their futures resolve as done), but no
-        listener ever heard them.
+        This is the teardown lie the tap exists to kill: the writes waiting on
+        these bytes are ended, but no listener ever heard them.
         """
         track = RawAudioTrack(sample_rate=RATE)
         tap = _TapRecorder()
         track.set_transmit_tap(tap)
 
         future = track.add_audio_bytes(b"\x01\x02" * (BYTES_PER_10MS // 2) * 4)
-        track.mark_pending_futures_done()
+        track.stop()
 
         self.assertTrue(future.done())
         await track.recv()  # queue is empty now -> auto silence
